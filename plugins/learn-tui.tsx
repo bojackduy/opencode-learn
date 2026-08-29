@@ -30,7 +30,14 @@ type AskPending = {
   multiSelect?: boolean
   timestamp: number
 }
-type Pending = QuizPending | AskPending
+type QuizBatchPending = {
+  id: string
+  type: "quiz_batch"
+  quizzes: Array<{ question: string; details?: string; options: Array<{ label: string; value: string; description?: string; index: number }>; correctIndices: number[]; explanation: string; multiSelect?: boolean }>
+  sessionID?: string
+  timestamp: number
+}
+type Pending = QuizPending | AskPending | QuizBatchPending
 
 function prevent(e: any) { try { e.preventDefault?.(); e.stopPropagation?.() } catch {} }
 
@@ -263,6 +270,107 @@ function QuizDialog(props: {
           </box>
         </Show>
       </box>
+  )
+}
+
+function QuizBatchDialog(props: {
+  api: Parameters<TuiPlugin>[0]
+  request: QuizBatchPending
+  onSubmit: (result: { results: Array<{ answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string; correct: boolean }> }) => void
+  onCancel: () => void
+}) {
+  const theme = () => props.api.theme.current
+  const dims = useTerminalDimensions()
+  const popupWidth = () => Math.max(68, Math.min(dims().width - 4, 96))
+  const [idx, setIdx] = createSignal(0)
+  const cur = () => props.request.quizzes[idx()] ?? props.request.quizzes[0]
+  const [phase, setPhase] = createSignal<"select" | "feedback">("select")
+  const [feedback, setFeedback] = createSignal<{ correct: boolean; selectedIndices: number[] } | null>(null)
+  const [dontKnow, setDontKnow] = createSignal(false)
+  const [selected, setSelected] = createSignal<Map<string, any>>(new Map())
+  const [note, setNote] = createSignal("")
+  const [focused, setFocused] = createSignal<"options" | "note">("options")
+  const [optionIndex, setOptionIndex] = createSignal(0)
+  const [results, setResults] = createSignal<Array<{ answers: any[]; dontKnow: boolean; note?: string; correct: boolean }>>([])
+  const isMulti = () => !!(cur()?.multiSelect)
+  const dontKnowIdx = () => (cur()?.options ?? []).length
+  const submitIdx = () => isMulti() ? (cur()?.options ?? []).length + 1 : -1
+  let noteEl: any
+  createEffect(() => { if (focused()==="note" && noteEl) try{noteEl.focus()}catch{} })
+  const toggle = (i:number) => {
+    const o = (cur()?.options ?? [])[i]; if(!o) return
+    const m = new Map(selected()); const k=`opt:${i}`
+    if (dontKnow()) setDontKnow(false)
+    if (m.has(k)) m.delete(k); else m.set(k,{label:o.label,value:o.value,index:i+1})
+    setSelected(m)
+  }
+  const goNext = () => {
+    const sel = Array.from(selected().values())
+    const dk = dontKnow()
+    const correctSet = new Set((cur()?.correctIndices ?? []))
+    const si = sel.map((a:any)=>a.index)
+    const ok = !dk && si.length===(cur()?.correctIndices ?? []).length && si.every((i:number)=>correctSet.has(i))
+    const entry = { answers: dk?[]:sel, dontKnow: dk, note: note().trim()||undefined, correct: ok }
+    const nextResults = [...results(), entry]
+    setResults(nextResults)
+    if (idx() + 1 < props.request.quizzes.length) {
+      setIdx(i=>i+1); setSelected(new Map()); setDontKnow(false); setNote(""); setOptionIndex(0); setFocused("options"); setPhase("select"); setFeedback(null)
+    } else {
+      props.onSubmit({ results: nextResults })
+    }
+  }
+  const submitSelect = () => {
+    const m = selected()
+    if (!isMulti() && m.size===0 && !dontKnow()) return
+    if (isMulti() && m.size===0 && !dontKnow()) return
+    const sel = Array.from(m.values())
+    const dk = dontKnow()
+    const correctSet = new Set((cur()?.correctIndices ?? []))
+    const si = sel.map((a:any)=>a.index)
+    const ok = !dk && si.length===(cur()?.correctIndices ?? []).length && si.every((i:number)=>correctSet.has(i))
+    setFeedback({ correct: ok, selectedIndices: si })
+    setPhase("feedback")
+  }
+  useKeyboard((evt:any)=>{
+    const k=evt.name||evt.sequence||evt.raw||""; const seq=evt.sequence||""
+    if(phase()==="feedback"){ if(k==="enter"||seq==="\r"||k==="escape"||k==="esc"){ prevent(evt); goNext() } return }
+    if(focused()==="note"){ if(k==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return} if(k==="escape"){prevent(evt); setFocused("options"); return} return }
+    if(k==="up"||k==="k"||seq==="\x1b[A"){prevent(evt); setOptionIndex(i=>Math.max(0,i-1)); return}
+    if(k==="down"||k==="j"||seq==="\x1b[B"){prevent(evt); setOptionIndex(i=>Math.min(isMulti()?submitIdx():dontKnowIdx(),i+1)); return}
+    if(k==="tab"||seq==="\t"){prevent(evt); setFocused("note"); return}
+    if(k==="escape"||k==="esc"){prevent(evt); props.onCancel(); return}
+    if(k==="space"||seq===" "){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ setDontKnow(v=>!v); if(!dontKnow()) setSelected(new Map()); else setDontKnow(true); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=(cur()?.options ?? [])[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
+    if(k==="enter"||seq==="\r"){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ setDontKnow(v=>!v); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=(cur()?.options ?? [])[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
+    if(seq==="ctrl+j"){prevent(evt); submitSelect(); return}
+  })
+  return (
+    <box flexDirection="column" width={popupWidth()} border={true} borderColor={phase()==="feedback"?(feedback()?.correct?theme().success:theme().error):theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
+      <box flexDirection="row" justifyContent="space-between" backgroundColor={theme().accent} paddingLeft={1} paddingRight={1} height={1}>
+        <text fg={theme().background} bold> decks.quiz batch  {idx()+1}/{props.request.quizzes.length} {phase()==="feedback"?(feedback()?.correct?"✓":"✗"):""}</text>
+        <text fg={theme().background} dim>learn</text>
+      </box>
+      <text fg={theme().text} bold wrapMode="wrap">{(cur()?.question ?? "")}</text>
+      <Show when={cur()?.details}><text fg={theme().textMuted} wrapMode="wrap">{cur()?.details}</text></Show>
+      <Show when={phase()==="select"}>
+        <box flexDirection="column" gap={0} padding={1} border={true} borderColor={theme().borderSubtle} backgroundColor={theme().background}>
+          <For each={(cur()?.options ?? [])}>{(opt:any,i:any)=>{const id=i(); const foc=()=>focused()==="options"&&optionIndex()===id; const sel=()=>selected().has(`opt:${id}`); return <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={foc()?theme().backgroundElement:undefined}><box width={2}><text fg={foc()?theme().accent:theme().textMuted}>{foc()?"▸":" "}</text></box><box width={2}><text fg={isMulti()?(sel()?theme().success:theme().textMuted):(sel()?theme().accent:theme().textMuted)}>{isMulti()?(sel()?"☑":"☐"):(sel()?"⬢":"○")}</text></box><box flexGrow={1}><text fg={sel()?theme().text:theme().textMuted} bold={foc()} wrapMode="wrap">{id+1}. {opt.label}</text></box></box>}}</For>
+          <box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(20,popupWidth()-8))}</text></box>
+          <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().backgroundElement:undefined}><box width={2}><text fg={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===dontKnowIdx()?"▸":" "}</text></box><box width={2}><text fg={dontKnow()?theme().warning:theme().textMuted}>{dontKnow()?"☑":"☐"}</text></box><box flexGrow={1}><text fg={dontKnow()?theme().warning:theme().textMuted} italic>I don't know</text></box></box>
+          <box flexDirection="column" paddingTop={1}><text fg={focused()==="note"?theme().accent:theme().textMuted}>✎ Note</text><box border={true} borderColor={focused()==="note"?theme().accent:theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}><Show when={focused()==="note"} fallback={<text fg={theme().textMuted}>{note()||"Tab to edit"}</text>}><input ref={(el:any)=>noteEl=el} value={note()} onInput={(v:any)=>setNote(typeof v==="string"?v:v?.target?.value??"")} onSubmit={()=>setFocused("options")} placeholder="note" /></Show></box></box>
+          <box flexDirection="row" justifyContent="space-between" paddingTop={1}><text fg={theme().textMuted}>Space toggle · Enter select · Tab note</text><text fg={theme().textMuted}>{idx()+1}/{props.request.quizzes.length}</text></box>
+          <Show when={isMulti()}><box justifyContent="center" paddingTop={1}><box flexDirection="row" gap={1} border={true} borderColor={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().borderSubtle} backgroundColor={focused()==="options"&&optionIndex()===submitIdx()?theme().backgroundElement:theme().background} paddingLeft={2} paddingRight={2}><text fg={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===submitIdx()?"▸":" "}</text><text bold>↳ Submit</text></box></box></Show>
+        </box>
+      </Show>
+      <Show when={phase()==="feedback"}>
+        <box flexDirection="column" gap={1} padding={1} border={true} borderColor={feedback()?.correct?theme().success:theme().error} backgroundColor={theme().background}>
+          <For each={(cur()?.options ?? [])}>{(opt:any,i:any)=>{const id=i()+1; const sel=()=>feedback()?.selectedIndices.includes(id)??false; const ok=()=>new Set((cur()?.correctIndices ?? [])).has(id); let ic=" "; let fg=theme().textMuted; if(dontKnow()){ic=ok()?"✓":" "; fg=ok()?theme().success:theme().textMuted} else if(sel()&&ok()){ic="✓"; fg=theme().success} else if(sel()&&!ok()){ic="✗"; fg=theme().error} else if(!sel()&&ok()){ic="✓"; fg=theme().success} return <box flexDirection="row" gap={1} paddingLeft={1}><box width={2}><text fg={fg} bold>{ic}</text></box><box flexGrow={1}><text fg={fg} wrapMode="wrap">{id}. {opt.label}</text></box></box>}}</For>
+          <text fg={feedback()?.correct?theme().success:theme().error} bold>{feedback()?.correct?"✓ Correct":"✗ Incorrect"}</text>
+          <text fg={theme().textMuted}>Correct: {(cur()?.correctIndices ?? []).map((i:number)=>`${i}. ${(cur()?.options ?? [])[i-1]?.label}`).join(", ")}</text>
+          <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><text fg={theme().text} wrapMode="wrap">{(cur()?.explanation ?? "")}</text></box>
+          <box justifyContent="center"><text fg={theme().textMuted}>Enter → next ({idx()+1}/{props.request.quizzes.length})</text></box>
+        </box>
+      </Show>
+    </box>
   )
 }
 
@@ -534,6 +642,7 @@ export const tui: TuiPlugin = async (api) => {
       setTimeout(processPending, 150)
     }
     if (data.type === "quiz") api.ui.dialog.replace(() => <QuizDialog api={api} request={data as QuizPending} onSubmit={done} onCancel={cancel} />)
+    else if (data.type === "quiz_batch") api.ui.dialog.replace(() => <QuizBatchDialog api={api} request={data as QuizBatchPending} onSubmit={done} onCancel={cancel} />)
     else api.ui.dialog.replace(() => <AskDialog api={api} request={data as AskPending} onSubmit={done} onCancel={cancel} />)
     try { api.ui.dialog.setSize("large") } catch {}
   }

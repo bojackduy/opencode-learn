@@ -486,6 +486,62 @@ const server: Plugin = async ({ client, directory }) => {
         },
       }),
 
+      // ── quiz_batch: optional deck — quiz 1/3 → 2/3 → 3/3 in one dialog, one inject
+      quiz_batch: tool({
+        description: "Batch version of quiz — shows 2-5 graded questions as a deck (Quiz 1/3 → 2/3 → 3/3) in one beautiful TUI, then one combined inject. Use when you want multiple probes without separate tool calls. Each entry has same schema as quiz.",
+        args: {
+          quizzes: tool.schema.array(tool.schema.object({
+            question: tool.schema.string(),
+            details: tool.schema.string().optional(),
+            options: tool.schema.array(tool.schema.object({
+              label: tool.schema.string(),
+              value: tool.schema.string().optional(),
+              description: tool.schema.string().optional(),
+            })).min(2),
+            correctAnswer: tool.schema.union([tool.schema.string(), tool.schema.array(tool.schema.string())]),
+            explanation: tool.schema.string(),
+            multiSelect: tool.schema.boolean().optional(),
+            shuffle: tool.schema.boolean().optional(),
+          })).min(2).max(8).describe("2-8 quizzes for the deck"),
+        },
+        async execute(args, ctx) {
+          const pendingDirPath = pendingDir(ctx.directory)
+          const isAlive = isTuiAlive(ctx.directory)
+          // Normalize each quiz like single quiz does
+          const normalized: any[] = []
+          for (const q of (args.quizzes as any[])) {
+            let opts: any
+            try { opts = normalizeQuizOptions(q.options) } catch (e) { return `quiz_batch error: ${(e as Error).message} in "${q.question}"` }
+            if (q.shuffle !== false) opts = shuffleOptions(opts)
+            const { indices, error } = resolveCorrect(q.correctAnswer as any, opts)
+            if (error) return `quiz_batch error: ${error} in "${q.question}"`
+            if (opts.length < 2) return `quiz_batch error: need 2+ options in "${q.question}"`
+            normalized.push({ question: q.question, details: q.details, options: opts, correctIndices: indices, explanation: q.explanation, multiSelect: !!q.multiSelect })
+          }
+          if (isAlive) {
+            try { require("node:fs").mkdirSync(pendingDirPath, { recursive: true }) } catch {}
+            const id = randomId()
+            const payload = { id, type: "quiz_batch" as const, quizzes: normalized, sessionID: (ctx as any).sessionID, timestamp: Date.now() }
+            try { require("node:fs").writeFileSync(require("node:path").join(pendingDirPath, `quiz_batch-${id}.json`), JSON.stringify(payload), "utf8") } catch {}
+            try { await (ctx as any).metadata?.({ title: `Quiz batch ${normalized.length}`, metadata: { pendingId: id } }) } catch {}
+            watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+              const results = r?.results || []
+              const lines = results.map((x: any, i: number) => {
+                const q = normalized[i]
+                const cs = (q.correctIndices||[]).map((idx:number)=>`${idx}. ${q.options[idx-1]?.label}`).join(", ")
+                const sel = x?.dontKnow ? "I don't know" : (x?.answers||[]).map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
+                const ok = x?.correct ? "CORRECT" : x?.dontKnow ? "GAP" : "INCORRECT"
+                return `Q${i+1}: "${q.question}" -> ${sel} = ${ok}. Correct: ${cs}`
+              }).join("\n")
+              return `[quiz_batch answered] ${normalized.length} quizzes\n` + lines
+            })
+            return `[quiz batch displayed in TUI — ${normalized.length} quizzes as deck Quiz 1/${normalized.length} → ${normalized.length}/${normalized.length}. Answer all, then one combined inject.]`
+          }
+          // Fallback: instruct LLM to call single quizzes sequentially
+          return `[quiz_batch fallback — TUI not alive, call single quiz ${normalized.length} times sequentially]`
+        },
+      }),
+
       // ── ask_user_question: ungraded, single/multi, with Other ─────────
       ask_user_question: tool({
         description: "Ask the user a single non-graded question and pause until they answer. Use for ambiguous requirements, preferences, decisions that affect implementation. One question per call. For graded questions with correct answer use `quiz`. Users can always select Other to type custom answer when options provided.",
