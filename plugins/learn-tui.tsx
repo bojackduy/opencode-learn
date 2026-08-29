@@ -47,6 +47,7 @@ function QuizDialog(props: {
   const correctSet = new Set(props.request.correctIndices)
   const isMulti = () => !!props.request.multiSelect
   const dontKnowIdx = () => options().length
+  const submitIdx = () => isMulti() ? options().length + 1 : -1
 
   const [focused, setFocused] = createSignal<"options" | "note">("options")
   const [optionIndex, setOptionIndex] = createSignal(0)
@@ -121,7 +122,7 @@ function QuizDialog(props: {
     }
     // Options focused
     if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(evt); setOptionIndex(i => Math.max(0, i - 1)); return }
-    if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(evt); setOptionIndex(i => Math.min(dontKnowIdx(), i + 1)); return }
+    if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(evt); setOptionIndex(i => Math.min(isMulti() ? submitIdx() : dontKnowIdx(), i + 1)); return }
     if (key === "tab" || seq === "\t") { prevent(evt); setFocused("note"); return }
     if (key === "escape" || key === "esc") { prevent(evt); props.onCancel(); return }
     if (key === "space" || seq === " ") {
@@ -141,18 +142,17 @@ function QuizDialog(props: {
       prevent(evt)
       const idx = optionIndex()
       if (idx === dontKnowIdx()) handleDontKnow()
+      else if (isMulti() && idx === submitIdx()) submitSelect()
       else {
-        if (isMulti()) {
-          // In multi, Enter on option toggles, but if on last option and wants submit, allow
-          toggleOption(idx)
-        } else {
+        if (isMulti()) toggleOption(idx)
+        else {
           const opt = options()[idx]
           if (opt) { setSelected(new Map([[`opt:${idx}`, { label: opt.label, value: opt.value, index: idx + 1 }]])); setDontKnow(false); submitSelect() }
         }
       }
       return
     }
-    if ((key === "enter" && isMulti()) || seq === "ctrl+j") {
+    if (seq === "ctrl+j" || (key === "enter" && (evt as any).ctrl)) {
       prevent(evt); submitSelect(); return
     }
   })
@@ -220,8 +220,9 @@ function QuizDialog(props: {
             </box>
             <Show when={isMulti()}>
               <box justifyContent="center" paddingTop={1}>
-                <box border={true} borderColor={selected().size > 0 || dontKnow() ? theme().success : theme().borderSubtle} backgroundColor={selected().size > 0 || dontKnow() ? theme().success : theme().background} paddingLeft={2} paddingRight={2}>
-                  <text fg={selected().size > 0 || dontKnow() ? theme().background : theme().textMuted} bold>↳  Submit {isMulti() ? `(Enter)` : ""}</text>
+                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() ? theme().success : theme().borderSubtle)} backgroundColor={focused() === "options" && optionIndex() === submitIdx() ? theme().backgroundElement : (selected().size > 0 || dontKnow() ? theme().success : theme().background)} paddingLeft={2} paddingRight={2}>
+                  <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() ? theme().background : theme().textMuted)}>{focused() === "options" && optionIndex() === submitIdx() ? "▸" : " "}</text>
+                  <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() ? theme().background : theme().textMuted)} bold>↳  Submit</text>
                 </box>
               </box>
             </Show>
@@ -433,6 +434,17 @@ export const tui: TuiPlugin = async (api) => {
     let data: Pending | null = null
     try { data = JSON.parse(fs.readFileSync(full, "utf8")) as Pending } catch { try { fs.unlinkSync(full) } catch {}; return }
     if (!data || !data.id) { try { fs.unlinkSync(full) } catch {}; return }
+    // If pending was from a previous session that no longer exists, rebind to current session so inject still wakes you (like loop guardLoopOwnedUserMessage)
+    try {
+      const cur = (api.route as any)?.current
+      const curSid = cur?.params?.sessionID || cur?.sessionID
+      if (curSid && (data as any).sessionID && (data as any).sessionID !== curSid) {
+        // Check if old session still exists
+        const anyState: any = api.state as any
+        const exists = anyState.session?.get ? anyState.session.get((data as any).sessionID) : undefined
+        if (!exists) (data as any).sessionID = curSid
+      }
+    } catch {}
     current = { id: data.id, type: data.type }
     const done = async (result: any) => {
       const respPath = path.join(pendingDir, `response-${data!.id}.json`)

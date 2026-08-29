@@ -305,6 +305,36 @@ const server: Plugin = async ({ client, directory }) => {
   let mermaidSession: { workDir: string; bodyPath: string } | null = null
   let svgSession: { workDir: string; bodyPath: string } | null = null
 
+  // Durability: on (re)start, re-watch any pending quizzes left from a crash/exit
+  try {
+    const dir = pendingDir(directory)
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir).filter(x => x.endsWith(".json") && !x.startsWith("response-") && !x.startsWith("."))) {
+        try {
+          const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
+          if (j?.id && j?.sessionID) {
+            watchAndInject(client, directory, j.id, j.sessionID, (r: any) => {
+              if (j.type === "quiz") {
+                const cs = new Set(j.correctIndices || [])
+                const si = (r?.answers || []).map((a:any)=>a.index)
+                const sel = (r?.answers || []).map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
+                const cstr = (j.correctIndices||[]).map((i:number)=>`${i}. ${j.options[i-1]?.label}`).join(", ")
+                const dk = !!r?.dontKnow
+                const ok = !dk && si.length === (j.correctIndices||[]).length && si.every((i:number)=>cs.has(i))
+                const note = r?.note ? `\nNote: ${r.note}` : ""
+                return dk ? `[quiz answered] "${j.question}" -> I don't know.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}` : `[quiz answered] "${j.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}`
+              } else {
+                const arr = Array.isArray(r) ? r : (r?.answers || [])
+                const txt = arr.map((a:any)=> a.type==="other"?`Other: ${a.label}`: a.index?`${a.index}. ${a.label}`:a.label).join(", ") || "(no answer)"
+                return `[question answered] "${j.question}" -> ${txt}`
+              }
+            })
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
   return {
     // Inject agents if not already present via config hook
     config: async (output) => {
