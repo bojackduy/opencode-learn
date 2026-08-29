@@ -159,6 +159,8 @@ function stripSkillBlocks(text: string) {
 
 // ── Pending IPC for beautiful TUI (server ↔ tui) ─────────────────────────
 const PENDING_DIRNAME = ".opencode/learn-pending"
+const SERVER_LOG = path.join(tmpdir(), "learn-server.log")
+function slog(...a: any[]) { try { const line = `[${new Date().toISOString()}] ${a.map(x=> typeof x==="string"? x : JSON.stringify(x)).join(" ")}\n`; fs.appendFileSync(SERVER_LOG, line) } catch {} }
 function pendingDir(directory: string) { return path.join(directory, PENDING_DIRNAME) }
 function isTuiAlive(directory: string): boolean {
   try {
@@ -239,7 +241,8 @@ async function waitForResponse(directory: string, id: string, abort: AbortSignal
 // Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
 const activeWatchers = new Map<string, fs.FSWatcher>()
 function watchAndInject(client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
-  if (!sessionID) return
+  slog("watchAndInject start", id, sessionID)
+  if (!sessionID) { slog("watchAndInject no sessionID", id); return }
   const dir = pendingDir(directory)
   const respPath = path.join(dir, `response-${id}.json`)
   const fire = async () => {
@@ -247,6 +250,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     try { data = JSON.parse(fs.readFileSync(respPath, "utf8")) } catch { return }
     try { fs.unlinkSync(respPath) } catch {}
     const w = activeWatchers.get(id); if (w) { try { w.close() } catch {}; activeWatchers.delete(id) }
+    slog("watchAndInject fire", id, JSON.stringify(data).slice(0,400))
     const text = data?.cancelled ? `[cancelled] user dismissed the popup for ${id}` : buildText(data.result)
     // opencode-loop sdk.js:24 — SDK returns {data,error}, it does NOT throw. Must inspect .error.
     const sdkCall = async (method: any, ...argsList: any[]) => {
@@ -268,6 +272,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
       { path: { sessionID }, body: { parts } },
       { sessionID, parts },
     ]
+    slog("watchAndInject injecting", id, sessionID, text.slice(0,300))
     let ok = false
     // loopd host-adapter.ts:100 — promptAsync wakes the session (fire-and-forget turn)
     if (client?.session?.promptAsync) {
@@ -280,7 +285,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
       await client.app.log({ body: { service: "learn", level: ok ? "info" : "error", message: ok ? `injected into ${sessionID}` : `inject FAILED for ${sessionID}`, extra: { id } } })
     } catch {}
   }
-  if (fs.existsSync(respPath)) { void fire(); return }
+  if (fs.existsSync(respPath)) { slog("watchAndInject fast-path", id); void fire(); return }
   try {
     const w = fs.watch(dir, (_e, filename) => { if (filename === `response-${id}.json` && fs.existsSync(respPath)) void fire() })
     w.on("error", () => {})
@@ -488,7 +493,7 @@ const server: Plugin = async ({ client, directory }) => {
 
       // ── quiz_batch: optional deck — quiz 1/3 → 2/3 → 3/3 in one dialog, one inject
       quiz_batch: tool({
-        description: "Batch version of quiz — shows 2-5 graded questions as a deck (Quiz 1/3 → 2/3 → 3/3) in one beautiful TUI, then one combined inject. Use when you want multiple probes without separate tool calls. Each entry has same schema as quiz.",
+        description: "Batch version of quiz — shows 2-8 graded questions as a deck (Quiz 1/3 → 2/3 → 3/3) in one beautiful TUI, then one combined inject. Use when you want multiple probes without separate tool calls. Each entry has same schema as quiz.",
         args: {
           quizzes: tool.schema.array(tool.schema.object({
             question: tool.schema.string(),
@@ -505,24 +510,27 @@ const server: Plugin = async ({ client, directory }) => {
           })).min(2).max(8).describe("2-8 quizzes for the deck"),
         },
         async execute(args, ctx) {
+          slog("quiz_batch called", JSON.stringify(args.quizzes).slice(0,500))
           const pendingDirPath = pendingDir(ctx.directory)
           const isAlive = isTuiAlive(ctx.directory)
-          // Normalize each quiz like single quiz does
+          slog("quiz_batch isAlive", isAlive)
           const normalized: any[] = []
           for (const q of (args.quizzes as any[])) {
             let opts: any
-            try { opts = normalizeQuizOptions(q.options) } catch (e) { return `quiz_batch error: ${(e as Error).message} in "${q.question}"` }
+            try { opts = normalizeQuizOptions(q.options) } catch (e) { slog("quiz_batch normalize error", (e as Error).message); return `quiz_batch error: ${(e as Error).message} in "${q.question}"` }
             if (q.shuffle !== false) opts = shuffleOptions(opts)
             const { indices, error } = resolveCorrect(q.correctAnswer as any, opts)
-            if (error) return `quiz_batch error: ${error} in "${q.question}"`
+            if (error) { slog("quiz_batch resolveCorrect error", error); return `quiz_batch error: ${error} in "${q.question}"` }
             if (opts.length < 2) return `quiz_batch error: need 2+ options in "${q.question}"`
             normalized.push({ question: q.question, details: q.details, options: opts, correctIndices: indices, explanation: q.explanation, multiSelect: !!q.multiSelect })
           }
+          slog("quiz_batch normalized", normalized.length)
           if (isAlive) {
-            try { require("node:fs").mkdirSync(pendingDirPath, { recursive: true }) } catch {}
+            try { fs.mkdirSync(pendingDirPath, { recursive: true }) } catch {}
             const id = randomId()
             const payload = { id, type: "quiz_batch" as const, quizzes: normalized, sessionID: (ctx as any).sessionID, timestamp: Date.now() }
-            try { require("node:fs").writeFileSync(require("node:path").join(pendingDirPath, `quiz_batch-${id}.json`), JSON.stringify(payload), "utf8") } catch {}
+            const file = path.join(pendingDirPath, `quiz_batch-${id}.json`)
+            try { fs.writeFileSync(file, JSON.stringify(payload), "utf8"); slog("quiz_batch wrote", file) } catch (e) { slog("quiz_batch write failed", String(e)) }
             try { await (ctx as any).metadata?.({ title: `Quiz batch ${normalized.length}`, metadata: { pendingId: id } }) } catch {}
             watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
               const results = r?.results || []
@@ -535,9 +543,10 @@ const server: Plugin = async ({ client, directory }) => {
               }).join("\n")
               return `[quiz_batch answered] ${normalized.length} quizzes\n` + lines
             })
+            slog("quiz_batch watchAndInject armed", id)
             return `[quiz batch displayed in TUI — ${normalized.length} quizzes as deck Quiz 1/${normalized.length} → ${normalized.length}/${normalized.length}. Answer all, then one combined inject.]`
           }
-          // Fallback: instruct LLM to call single quizzes sequentially
+          slog("quiz_batch fallback, TUI not alive")
           return `[quiz_batch fallback — TUI not alive, call single quiz ${normalized.length} times sequentially]`
         },
       }),
