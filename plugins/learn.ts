@@ -236,6 +236,58 @@ async function waitForResponse(directory: string, id: string, abort: AbortSignal
   })
 }
 
+// Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
+const activeWatchers = new Map<string, fs.FSWatcher>()
+function watchAndInject(client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
+  if (!sessionID) return
+  const dir = pendingDir(directory)
+  const respPath = path.join(dir, `response-${id}.json`)
+  const fire = async () => {
+    let data: any
+    try { data = JSON.parse(fs.readFileSync(respPath, "utf8")) } catch { return }
+    try { fs.unlinkSync(respPath) } catch {}
+    const w = activeWatchers.get(id); if (w) { try { w.close() } catch {}; activeWatchers.delete(id) }
+    const text = data?.cancelled ? `[cancelled] user dismissed the popup for ${id}` : buildText(data.result)
+    // opencode-loop sdk.js:24 — SDK returns {data,error}, it does NOT throw. Must inspect .error.
+    const sdkCall = async (method: any, ...argsList: any[]) => {
+      let firstErr: any
+      for (const args of argsList) {
+        if (args === undefined) continue
+        try {
+          const res = await method(args)
+          const err = res && typeof res === "object" ? (res as any).error : undefined
+          if (!err) return res
+          firstErr = firstErr || err
+        } catch (e) { firstErr = firstErr || e }
+      }
+      throw firstErr || new Error("SDK call failed")
+    }
+    const parts = [{ type: "text", text }]
+    const shapes = [
+      { path: { id: sessionID }, body: { parts } },
+      { path: { sessionID }, body: { parts } },
+      { sessionID, parts },
+    ]
+    let ok = false
+    // loopd host-adapter.ts:100 — promptAsync wakes the session (fire-and-forget turn)
+    if (client?.session?.promptAsync) {
+      try { await sdkCall(client.session.promptAsync.bind(client.session), ...shapes); ok = true } catch {}
+    }
+    if (!ok && client?.session?.prompt) {
+      try { await sdkCall(client.session.prompt.bind(client.session), ...shapes); ok = true } catch {}
+    }
+    try {
+      await client.app.log({ body: { service: "learn", level: ok ? "info" : "error", message: ok ? `injected into ${sessionID}` : `inject FAILED for ${sessionID}`, extra: { id } } })
+    } catch {}
+  }
+  if (fs.existsSync(respPath)) { void fire(); return }
+  try {
+    const w = fs.watch(dir, (_e, filename) => { if (filename === `response-${id}.json` && fs.existsSync(respPath)) void fire() })
+    w.on("error", () => {})
+    activeWatchers.set(id, w)
+  } catch {}
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Plugin definition
 // ────────────────────────────────────────────────────────────────────────────
@@ -340,6 +392,17 @@ const server: Plugin = async ({ client, directory }) => {
             }
             try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8") } catch {}
             try { await (ctx as any).metadata?.({ title: `Quiz: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
+            watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+              const dk = !!r?.dontKnow
+              const sel = (r?.answers || []).map((a: any) => `${a.index}. ${a.label}`).join(", ") || "(none)"
+              const cs = new Set(correctIndices)
+              const si = (r?.answers || []).map((a: any) => a.index)
+              const ok = !dk && si.length === correctIndices.length && si.every((i: number) => cs.has(i))
+              const note = r?.note ? `\nNote: ${r.note}` : ""
+              return dk
+                ? `[quiz answered] "${args.question}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
+                : `[quiz answered] "${args.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
+            })
             if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Quiz", [args.question, ...(args.details ? [args.details] : []), "", ...options.map((o, i) => `${i + 1}. ${o.label}`)])))
             return `[quiz displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
           }
@@ -423,6 +486,11 @@ const server: Plugin = async ({ client, directory }) => {
             const payload = { id, type: "ask" as const, question: args.question, details: args.details, options, multiSelect: !!args.multiSelect, sessionID: (ctx as any).sessionID, timestamp: Date.now() }
             try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8") } catch {}
             try { await (ctx as any).metadata?.({ title: `Question: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
+            watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+              const arr = Array.isArray(r) ? r : (r?.answers || [])
+              const txt = arr.map((a: any) => a.type === "other" ? `Other: ${a.label}` : a.index ? `${a.index}. ${a.label}` : a.label).join(", ") || "(no answer)"
+              return `[question answered] "${args.question}" -> ${txt}`
+            })
             if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Question", [args.question, ...(args.details ? [args.details] : []), ...(options.length ? ["", ...options.map((o, i) => `${i + 1}. ${o.label}`)] : [])])))
             return `[question displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
           }

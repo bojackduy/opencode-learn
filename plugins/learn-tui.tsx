@@ -466,7 +466,7 @@ export const tui: TuiPlugin = async (api) => {
         }
         // Try v2 SDK then v1 fallback
         const anyClient = api.client as any
-        const sidToUse = sessionID || ""
+        const sidToUse = ""  // server (learn.ts watchAndInject) owns injection — loopd pattern
         if (sidToUse && injectText) {
           try { api.ui.toast({ message: `inject ${sidToUse.slice(0,6)}`, variant: "info", duration: 1200 }) } catch {}
           try {
