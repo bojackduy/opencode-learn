@@ -152,14 +152,11 @@ function QuizDialog(props: {
       prevent(evt)
       const idx = optionIndex()
       if (idx === dontKnowIdx()) handleDontKnow()
-      else if (isMulti() && idx === submitIdx()) submitSelect()
+      else if (isMulti()) submitSelect()
       else {
-        if (isMulti()) toggleOption(idx)
-        else {
           const opt = options()[idx]
           if (opt) { setSelected(new Map([[`opt:${idx}`, { label: opt.label, value: opt.value, index: idx + 1 }]])); setDontKnow(false); submitSelect() }
         }
-      }
       return
     }
     if (seq === "ctrl+j" || (key === "enter" && (evt as any).ctrl)) {
@@ -360,7 +357,7 @@ function QuizBatchDialog(props: {
       if(k==="tab"||seq==="\t"){prevent(evt); setFocused("note"); return}
       if(k==="escape"||k==="esc"){prevent(evt); props.onCancel(); return}
       if(k==="space"||seq===" "){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ setDontKnow(v=>!v); if(!dontKnow()) setSelected(new Map()); else setDontKnow(true); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
-      if(k==="enter"||seq==="\r"){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ setDontKnow(v=>!v); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
+      if(k==="enter"||seq==="\r"){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ setDontKnow(v=>!v); } else if(isMulti()) submitSelect(); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
       if(seq==="ctrl+j" || (k==="enter" && evt.ctrl)){prevent(evt); submitSelect(); return}
     } catch(e){ tlog("useKeyboard batch failed", String(e)) }
   })
@@ -578,7 +575,7 @@ export const tui: TuiPlugin = async (api) => {
     current = { id: data.id, type: data.type }
     const done = async (result: any) => {
       const respPath = path.join(pendingDir, `response-${data!.id}.json`)
-      try { fs.writeFileSync(respPath, JSON.stringify({ id: data!.id, type: data!.type, result, at: Date.now() }), "utf8") } catch {}
+      try { fs.writeFileSync(respPath, JSON.stringify({ id: data!.id, type: data!.type, result, sessionID: (data as any).sessionID, at: Date.now() }), "utf8") } catch {}
       // Non-blocking wake: inject answer as new user prompt so agent continues (no timeout, no polling waste)
       try {
         const sessionID = (data as any).sessionID
@@ -642,7 +639,7 @@ export const tui: TuiPlugin = async (api) => {
     }
     const cancel = async () => {
       const respPath = path.join(pendingDir, `response-${data!.id}.json`)
-      try { fs.writeFileSync(respPath, JSON.stringify({ id: data!.id, type: data!.type, cancelled: true, at: Date.now() }), "utf8") } catch {}
+      try { fs.writeFileSync(respPath, JSON.stringify({ id: data!.id, type: data!.type, cancelled: true, sessionID: (data as any).sessionID, at: Date.now() }), "utf8") } catch {}
       try {
         const sid = (data as any).sessionID
         if (sid) {

@@ -251,6 +251,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     try { fs.unlinkSync(respPath) } catch {}
     const w = activeWatchers.get(id); if (w) { try { w.close() } catch {}; activeWatchers.delete(id) }
     slog("watchAndInject fire", id, JSON.stringify(data).slice(0,400))
+    const effectiveSessionID = (data as any)?.sessionID || sessionID
     const text = data?.cancelled ? `[cancelled] user dismissed the popup for ${id}` : buildText(data.result)
     // opencode-loop sdk.js:24 — SDK returns {data,error}, it does NOT throw. Must inspect .error.
     const sdkCall = async (method: any, ...argsList: any[]) => {
@@ -268,11 +269,11 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     }
     const parts = [{ type: "text", text }]
     const shapes = [
-      { path: { id: sessionID }, body: { parts } },
-      { path: { sessionID }, body: { parts } },
-      { sessionID, parts },
+      { path: { id: effectiveSessionID }, body: { parts } },
+      { path: { sessionID: effectiveSessionID }, body: { parts } },
+      { sessionID: effectiveSessionID, parts },
     ]
-    slog("watchAndInject injecting", id, sessionID, text.slice(0,300))
+    slog("watchAndInject injecting", id, effectiveSessionID, text.slice(0,300))
     let ok = false
     // loopd host-adapter.ts:100 — promptAsync wakes the session (fire-and-forget turn)
     if (client?.session?.promptAsync) {
@@ -282,7 +283,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
       try { await sdkCall(client.session.prompt.bind(client.session), ...shapes); ok = true } catch {}
     }
     try {
-      await client.app.log({ body: { service: "learn", level: ok ? "info" : "error", message: ok ? `injected into ${sessionID}` : `inject FAILED for ${sessionID}`, extra: { id } } })
+      await client.app.log({ body: { service: "learn", level: ok ? "info" : "error", message: ok ? `injected into ${effectiveSessionID}` : `inject FAILED for ${effectiveSessionID} (orig ${sessionID})`, extra: { id } } })
     } catch {}
   }
   if (fs.existsSync(respPath)) { slog("watchAndInject fast-path", id); void fire(); return }
@@ -328,6 +329,16 @@ const server: Plugin = async ({ client, directory }) => {
                 const ok = !dk && si.length === (j.correctIndices||[]).length && si.every((i:number)=>cs.has(i))
                 const note = r?.note ? `\nNote: ${r.note}` : ""
                 return dk ? `[quiz answered] "${j.question}" -> I don't know.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}` : `[quiz answered] "${j.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}`
+              } else if (j.type === "quiz_batch") {
+                const results = (r as any)?.results || []
+                const lines = (j.quizzes || []).map((qq:any, i:number) => {
+                  const x = results[i] || {}
+                  const cs = (qq.correctIndices||[]).map((idx:number)=>`${idx}. ${qq.options[idx-1]?.label}`).join(", ")
+                  const sel = x?.dontKnow ? "I don't know" : (x?.answers||[]).map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
+                  const ok = x?.correct ? "CORRECT" : x?.dontKnow ? "GAP" : "INCORRECT"
+                  return `Q${i+1}: "${qq.question}" -> ${sel} = ${ok}. Correct: ${cs}`
+                }).join("\n")
+                return `[quiz_batch answered] ${(j.quizzes||[]).length} quizzes\n` + lines
               } else {
                 const arr = Array.isArray(r) ? r : (r?.answers || [])
                 const txt = arr.map((a:any)=> a.type==="other"?`Other: ${a.label}`: a.index?`${a.index}. ${a.label}`:a.label).join(", ") || "(no answer)"
