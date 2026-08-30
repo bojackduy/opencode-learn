@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@bojackduy/opencode-learn",
+  "version": "0.1.2",
+  "description": "Pi learn system for OpenCode — Socratic teaching, graded quiz, Obsidian md_log, and visual makers. Port of amosblomqvist/learn (video: How I Use AI to Learn Things) to OpenCode.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bojackduy/opencode-learn.git"
+  },
+  "homepage": "https://github.com/bojackduy/opencode-learn#readme",
+  "bugs": {
+    "url": "https://github.com/bojackduy/opencode-learn/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "learn",
+    "teach",
+    "quiz",
+    "md-log",
+    "obsidian",
+    "socratic",
+    "3blue1brown",
+    "mermaid",
+    "visual",
+    "tui",
+    "opentui"
+  ],
+  "bin": {
+    "opencode-learn": "./scripts/install.mjs"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "agents",
+    "skills",
+    "commands",
+    "plugins",
+    "assets",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/server.js"
+    },
+    "./server": {
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "import": "./dist/tui.js"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:server": "bun build plugins/learn.ts --outfile dist/server.js --target bun --external @opencode-ai/plugin --external @opencode-ai/plugin/tool",
+    "build:tui": "bun scripts/build-tui.ts",
+    "build": "bun run build:server && bun run build:tui",
+    "clean": "rm -rf dist",
+    "prepack": "bun run typecheck && bun run build",
+    "test": "echo \"no tests yet\" && exit 0",
+    "release:patch": "bun run typecheck && npm version patch -m \"chore: release %s\" && git push && git push --tags",
+    "release:minor": "bun run typecheck && npm version minor -m \"chore: release %s\" && git push && git push --tags",
+    "release:major": "bun run typecheck && npm version major -m \"chore: release %s\" && git push && git push --tags"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.0 <2",
+    "@opentui/core": "*",
+    "@opentui/solid": "*",
+    "solid-js": "*"
+  },
+  "dependencies": {
+    "@mermaid-js/mermaid-cli": "^11.4.2",
+    "@opencode-ai/plugin": "1.18.25",
+    "@opentui/core": "^0.5.9",
+    "@opentui/solid": "^0.5.9",
+    "solid-js": "^1.9.15"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "typescript": "^5.7.0"
+  }
+}

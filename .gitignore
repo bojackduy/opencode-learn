@@ -1,0 +1,6 @@
+node_modules/
+dist/
+learn-pending/
+learn-md-log.json
+loopd/
+.DS_Store
