@@ -8,6 +8,12 @@
 [![TUI](https://img.shields.io/badge/TUI-OpenTUI-purple?style=flat-square)](https://github.com/anomalyco/opentui)
 [![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
+![Quiz — multi-select with I don't know and note, durable TUI](assets/demo.png)
+
+*Quiz TUI — multi-select `Which of these are rare earth elements?` with `☐ 1.Cerium` → `☑`, `I don't know — genuine gap`, `Note (optional)` Tab-to-edit, `0 selected` → `↳ Submit` (`Space` toggle, `↓` to Submit → `Enter`). Durable `pendingDir` survives `kill`.*
+
+
+
 ## Why
 
 Two brains can hold the same facts — one as disconnected lone facts, the other as a dependency graph where every fact is derivable from a few core truths. Teaching here builds that graph: **nodes** (unconditional truths) → **edges** (motivated discovery, 3Blue1Brown-style `how could I have discovered this?`).
