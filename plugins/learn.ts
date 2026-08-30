@@ -216,7 +216,7 @@ async function backfillMdLog(client: any, sessionID: string, directory: string):
         for (const p of parts) {
           if (p.type !== "tool") continue
           const toolName = p.tool
-          if (toolName !== "quiz" && toolName !== "ask_user_question" && toolName !== "question") continue
+          if (toolName !== "quiz" && toolName !== "question" && toolName !== "ask_user_question") continue // keep ask for old sessions
           const st: any = p.state ?? {}
           const input = st.input ?? {}
           const output = st.output ?? ""
@@ -549,14 +549,10 @@ const server: Plugin = async ({ client, directory }) => {
           }
           await withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
           if (callID) loggedToolCallIds.add(`answer:${callID}`)
-        } else if (toolName === "ask_user_question" || toolName === "question") {
+        } else if (toolName === "question") {
           const meta: any = (output as any).metadata ?? {}
-          // Try to extract answers from output string or metadata
           let answers: any[] = meta.answers ?? []
-          if (!answers.length && (output as any).output) {
-            // Fallback: parse output text for answers if needed
-            answers = []
-          }
+          if (!answers.length && (output as any).output) answers = []
           const details: any = { answers, status: "completed" }
           await withMdLock(() => appendToMdLog(answerCalloutAsk(details)))
           if (callID) loggedToolCallIds.add(`answer:${callID}`)
@@ -596,7 +592,7 @@ const server: Plugin = async ({ client, directory }) => {
     tool: {
       // ── quiz: graded question ────────────────────────────────────────
       quiz: tool({
-        description: "Ask the user a GRADED question with a known correct answer, then grade and give feedback. Unlike question (which collects preferences with no right answer), quiz has a correct answer, marks selection right/wrong, reveals correct answer, and shows explanation. Use to assess understanding before teaching and for retrieval practice after. Options-only: single/multi-select plus auto 'I don't know'. No free-text. For non-graded questions use `question` or `ask_user_question`.",
+        description: "Ask the user a GRADED question with a known correct answer, then grade and give feedback. Unlike the native `question` tool (which collects preferences with no right answer), `quiz` has a correct answer, marks selection right/wrong, reveals correct answer, and shows explanation. Use to assess understanding before teaching and for retrieval practice after. Options-only: single/multi-select plus auto 'I don't know'. No free-text. For non-graded questions use the native `question` tool.",
         args: {
           question: tool.schema.string().describe("Single quiz question to ask. One per call."),
           details: tool.schema.string().optional().describe("Extra context shown under question."),
@@ -765,61 +761,6 @@ const server: Plugin = async ({ client, directory }) => {
             if (isAlive) return `[quiz batch displayed in TUI — ${normalized.length} quizzes as deck Quiz 1/${normalized.length} → ${normalized.length}/${normalized.length}. Answer all, then one combined inject.]`
             else return `[quiz batch displayed durably — TUI not alive yet, will appear on restart. Answer all, then one combined inject.]`
           }
-      }),
-
-      // ── ask_user_question: ungraded, single/multi, with Other ─────────
-      ask_user_question: tool({
-        description: "Ask the user a single non-graded question and pause until they answer. Use for ambiguous requirements, preferences, decisions that affect implementation. One question per call. For graded questions with correct answer use `quiz`. Users can always select Other to type custom answer when options provided.",
-        args: {
-          question: tool.schema.string().describe("Single question to ask. One per call."),
-          details: tool.schema.string().optional().describe("Extra context shown under question."),
-          options: tool.schema.array(tool.schema.object({
-            label: tool.schema.string().describe("Display label; if recommending, put first and append (Recommended)"),
-            value: tool.schema.string().optional().describe("Machine value defaults to label"),
-            description: tool.schema.string().optional(),
-          })).optional().describe("Multiple-choice options; omit for free-form text. Other always added."),
-          multiSelect: tool.schema.boolean().optional().describe("Allow multiple answers."),
-        },
-        async execute(args, ctx) {
-          const options = (args.options ?? []).map(o => ({
-            label: o.label.trim(),
-            value: o.value?.trim() || o.label.trim(),
-            description: o.description?.trim() || undefined,
-          })).filter(o => o.label.length > 0)
-          const mode = options.length === 0 ? "text" : args.multiSelect ? "multi-select" : "single-select"
-
-          // ── Beautiful TUI path — non-blocking, inject prompt on answer ──
-          const pDir = pendingDir(directory)
-          if (isTuiAlive(directory)) {
-            try { fs.mkdirSync(pDir, { recursive: true }) } catch {}
-            const id = randomId()
-            const pendingPath = path.join(pDir, `ask-${id}.json`)
-            const payload = { id, type: "ask" as const, question: args.question, details: args.details, options, multiSelect: !!args.multiSelect, sessionID: (ctx as any).sessionID, timestamp: Date.now() }
-            try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8") } catch {}
-            try { await (ctx as any).metadata?.({ title: `Question: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
-            watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
-              const arr = Array.isArray(r) ? r : (r?.answers || [])
-              const txt = arr.map((a: any) => a.type === "other" ? `Other: ${a.label}` : a.index ? `${a.index}. ${a.label}` : a.label).join(", ") || "(no answer)"
-              return `[question answered] "${args.question}" -> ${txt}`
-            })
-            if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Question", [args.question, ...(args.details ? [args.details] : []), ...(options.length ? ["", ...options.map((o, i) => `${i + 1}. ${o.label}`)] : [])])))
-            return `[question displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
-          }
-
-          // Fallback to native question instruction
-          const optsStr = options.length ? options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`).join("\n") : "(free-form)"
-          const instr = [
-            `[ask_user_question ready — use built-in \`question\` tool]`,
-            `Question: ${args.question}`,
-            args.details ? `Details: ${args.details}` : null,
-            `Options:\n${optsStr}`,
-            `Mode: ${mode}`,
-            `INSTRUCTION FOR LLM: Call the built-in \`question\` tool with header, question, options, multiple, custom as needed, then proceed with user's answer.`,
-          ].filter(Boolean).join("\n")
-            ;(ctx as any).metadata?.({ title: `Question: ${args.question.slice(0, 40)}` })
-          if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Question", [args.question, ...(args.details ? [args.details] : []), ...(options.length ? ["", ...options.map((o, i) => `${i + 1}. ${o.label}`)] : [])])))
-          return instr
-        },
       }),
 
       // ── md_log: link a markdown file ───────────────────────────────────

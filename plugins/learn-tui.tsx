@@ -24,15 +24,6 @@ type QuizPending = {
   multiSelect?: boolean
   timestamp: number
 }
-type AskPending = {
-  id: string
-  type: "ask"
-  question: string
-  details?: string
-  options: Array<{ label: string; value: string; description?: string }>
-  multiSelect?: boolean
-  timestamp: number
-}
 type QuizBatchPending = {
   id: string
   type: "quiz_batch"
@@ -40,7 +31,7 @@ type QuizBatchPending = {
   sessionID?: string
   timestamp: number
 }
-type Pending = QuizPending | AskPending | QuizBatchPending
+type Pending = QuizPending | QuizBatchPending
 
 function prevent(e: any) { try { e.preventDefault?.(); e.stopPropagation?.() } catch {} }
 
@@ -608,15 +599,17 @@ export const tui: TuiPlugin = async (api) => {
           injectText = dontKnow
             ? `[quiz answer] You selected "I don't know" for: "${qp.question}" — genuine gap. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}`
             : `[quiz answer] Question: "${qp.question}" — You selected: ${selectedStr} — ${correct ? "Correct ✓" : "Incorrect ✗"}. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}`
-        } else {
-          const ap = data as AskPending
-          const r = result as { answers: Array<{ label: string; value: string; index?: number; type: string }>; customText?: string }
-          const answers = r.answers || []
-          let txt: string
-          if (answers.length === 0) txt = "(no answer)"
-          else if (answers.length === 1 && answers[0].type === "text") txt = answers[0].label
-          else txt = answers.map(a => a.type === "other" ? `Other: ${a.label}` : a.index ? `${a.index}. ${a.label}` : a.label).join(", ")
-          injectText = `[question answer] "${ap.question}" — You answered: ${txt}`
+        } else if ((data as any).type === "quiz_batch") {
+          const batch = data as QuizBatchPending
+          const results = (result as any).results ?? []
+          const lines = batch.quizzes.map((qq, i) => {
+            const x = results[i] || {}
+            const cs = (qq.correctIndices||[]).map((idx:number)=>`${idx}. ${qq.options[idx-1]?.label}`).join(", ")
+            const sel = x?.dontKnow ? "I don't know" : (x?.answers||[]).map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
+            const ok = x?.correct ? "CORRECT" : x?.dontKnow ? "GAP" : "INCORRECT"
+            return `Q${i+1}: "${qq.question}" -> ${sel} = ${ok}. Correct: ${cs}`
+          }).join("\n")
+          injectText = `[quiz_batch answered] ${batch.quizzes.length} quizzes\n` + lines
         }
         // Try v2 SDK then v1 fallback
         const anyClient = api.client as any
@@ -659,9 +652,9 @@ export const tui: TuiPlugin = async (api) => {
         const sid = (data as any).sessionID
         if (sid) {
           const anyClient = api.client as any
-          const injectText = data.type === "quiz"
-            ? `[quiz cancelled] Question: "${(data as QuizPending).question}" — user cancelled`
-            : `[question cancelled] "${(data as AskPending).question}" — user cancelled`
+          const injectText = (data as any).type === "quiz_batch"
+            ? `[quiz_batch cancelled] ${(data as QuizBatchPending).quizzes.length} quizzes — user cancelled`
+            : `[quiz cancelled] Question: "${(data as QuizPending).question}" — user cancelled`
           try {
             if (anyClient.session?.prompt) {
               try { await anyClient.session.prompt({ path: { sessionID: sid }, body: { prompt: { text: injectText } } }) }
@@ -677,7 +670,7 @@ export const tui: TuiPlugin = async (api) => {
     }
     if (data.type === "quiz") { tlog("processPending quiz", data.id); api.ui.dialog.replace(() => <QuizDialog api={api} request={data as QuizPending} onSubmit={done} onCancel={cancel} />) }
     else if (data.type === "quiz_batch") { tlog("processPending quiz_batch", data.id, (data as QuizBatchPending).quizzes.length); api.ui.dialog.replace(() => <QuizBatchDialog api={api} request={data as QuizBatchPending} onSubmit={done} onCancel={cancel} />) }
-    else { tlog("processPending ask", data.id); api.ui.dialog.replace(() => <AskDialog api={api} request={data as AskPending} onSubmit={done} onCancel={cancel} />) }
+    else { tlog("processPending unknown", (data as any).type, data.id); try { fs.unlinkSync(full) } catch {}; currentBySession.delete(curSid); return }
     try { api.ui.dialog.setSize("large") } catch {}
   }
 

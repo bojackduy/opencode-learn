@@ -3,7 +3,7 @@ name: teach
 description: Teach the user anything so it actually locks in and is understood, not just memorized. Use ANY time you're explaining or teaching him something — even a quick explanation. Based on two teaching principles he has personally verified to work for years.
 ---
 
-> **OpenCode port** — original pi skill. In OpenCode: use `quiz` for graded checks, `question` (or `ask_user_question` alias) for open forks, `task` with subagent_type `researcher` for verification, and `md_log`/`md_unlog` tools to mirror to Obsidian. The philosophy and probe→plan→teach loop are unchanged.
+> **OpenCode port** — original pi skill. In OpenCode: use `quiz` for graded checks, native `question` for open forks, `task` with `subagent_type: "researcher"` for verification, and `md_log`/`md_unlog` tools to mirror to Obsidian. The philosophy and probe→plan→teach loop are unchanged.
 
 # Teaching
 
@@ -61,7 +61,7 @@ Walk him through how he **could have discovered the thing himself**. Every step 
 ### Socratic vs expository — adaptive
 
 Choose per topic and per his apparent energy:
-- **Socratic** — pose the motivating problem and let him attempt the discovery before you reveal. More effortful, stronger locking-in. Default to this when he can plausibly reason his way there. "Let him attempt it" is about *who* speaks first, not about grading: if the question you pose has a definite right answer (even as an open-ended prompt he answers freely, which you then frame as multiple-choice), it's still gradable — use `quiz`, not `ask_user_question`. Reserve `ask_user_question` for genuine no-right-answer forks (preferences, direction, what he wants next).
+- **Socratic** — pose the motivating problem and let him attempt the discovery before you reveal. More effortful, stronger locking-in. Default to this when he can plausibly reason his way there. "Let him attempt it" is about *who* speaks first, not about grading: if the question you pose has a definite right answer (even as an open-ended prompt he answers freely, which you then frame as multiple-choice), it's still gradable — use `quiz`, not `question`. Reserve `question` for genuine no-right-answer forks (preferences, direction, what he wants next).
 - **Expository** — you narrate the motivated discovery path yourself (3B1B style), no back-and-forth needed. Use when the topic is beyond cold-reasoning reach, or when he's low-energy / wants it delivered.
 
 When unsure, lean Socratic for things he can clearly reason about; otherwise narrate.
@@ -100,7 +100,7 @@ Do not advance to Phase 2 until, for each goal-relevant strand, you can state co
 
 **Guardrail — one quiz at a time:** Call exactly **one** `quiz` per turn and wait for the user's answer (injected via the TUI) before the next probe. Never call `quiz_batch` or multiple `quiz` in parallel for Phase 1 — the next question must adapt to the last answer.
 
-**1b. His learning goal — use `ask_user_question` (or native `question`).** Find out what he actually wants taught. With a subject he doesn't know yet, the goal is often hard for him to articulate — "I want to understand LLMs" or "how the internet works" can mean ten different things, and which one it is completely changes what you teach. Interrogate the vision until it's concrete. This has no right answer, so it's `ask_user_question`/`question`, never `quiz`. Do not use `quiz` or `quiz_batch` for the goal — goal has no correct answer.
+**1b. His learning goal — use native `question`.** Find out what he actually wants taught. With a subject he doesn't know yet, the goal is often hard for him to articulate — "I want to understand LLMs" or "how the internet works" can mean ten different things, and which one it is completely changes what you teach. Interrogate the vision until it's concrete. This has no right answer, so it's `question`, never `quiz`. Do not use `quiz` or `quiz_batch` for the goal — goal has no correct answer.
 
 ### Phase 2 — Plan (think hard here)
 
@@ -132,7 +132,7 @@ For **every node** (each unconditional truth *and* each non-trivial reasoning st
 1. **Motivate.** Frame why we need this node right now — what problem it solves or what gap it closes. This applies to unconditional truths too: don't just assert one because it's true, motivate why *this* truth, *now*. "Why are we even bringing this in?"
 2. **Establish.** 
    - If it's a foundational unconditional truth: state it plainly, at face value, no caveats. Surface an atomic unit if one fits.
-   - If it's a derived step: build it up from what's already established via a motivated move (Socratic or expository), answering "how could I have discovered this?" When a Socratic step has a gradable right/wrong answer, pose it with `quiz` even though he's "attempting the discovery" — gradable-and-Socratic is normal, not a contradiction; only fall back to `ask_user_question` if there's genuinely no right answer.
+   - If it's a derived step: build it up from what's already established via a motivated move (Socratic or expository), answering "how could I have discovered this?" When a Socratic step has a gradable right/wrong answer, pose it with `quiz` even though he's "attempting the discovery" — gradable-and-Socratic is normal, not a contradiction; only fall back to native `question` if there's genuinely no right answer.
 3. **Connect.** Make the dependency edge explicit — show exactly how this new node hangs off the ones already in place, so it's understood, not memorized.
 4. **Quiz-check.** Confirm the node actually landed with a quick `quiz` — this applies to foundations just as much as derived steps. An unconfirmed unconditional truth is exactly as dangerous as an unconfirmed derived fact: if he misses it, that node isn't solid, so stop and fix it before building anything on top of it.
 
