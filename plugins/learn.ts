@@ -156,6 +156,117 @@ function stripSkillBlocks(text: string) {
     return `> [!note] SKILL loaded: ${name ?? "(unknown)"}`
   })
 }
+function userBlock(text: string) { return `> [!quote] YOU\n\n${text}` }
+function assistantBlock(text: string) { return `> [!abstract] PI\n\n${text}` }
+function optionsList(options: Array<{ label: string }>): string[] { return options.map((o, i) => `${i + 1}. ${o.label}`) }
+function questionCallout(label: string, question: string, context: string | undefined, options: Array<{ label: string }>): string {
+  const body: string[] = []
+  for (const line of question.split("\n")) body.push(line)
+  if (context) { body.push(""); for (const line of context.split("\n")) body.push(line) }
+  if (options.length > 0) { body.push(""); body.push(...optionsList(options)) }
+  return callout("question", label, body)
+}
+function answerCalloutQuiz(details: any): string {
+  const status = details?.status
+  if (status === "cancelled") return callout("warning", "Quiz — cancelled", ["(user skipped)"])
+  if (status === "unavailable") return callout("warning", "Quiz — unavailable", [details?.message || ""])
+  const dontKnow = details?.dontKnow === true
+  const correct = details?.correct === true
+  const type = dontKnow ? "question" : correct ? "success" : "failure"
+  const title = dontKnow ? "Quiz — I don't know" : correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗"
+  const body: string[] = []
+  if (dontKnow) body.push("Your answer: I don't know")
+  else { const answers: any[] = details?.answers || []; const sel = answers.map((a) => `${a.index}. ${a.label}`).join(", ") || "(none)"; body.push(`Your answer: ${sel}`) }
+  const correctIndices: number[] = details?.correctIndices || []
+  if (correctIndices.length) body.push(`Correct answer: ${correctIndices.map((i) => `${i}`).join(", ")}`)
+  if (details?.note) { body.push(""); const noteLines = String(details.note).split("\n"); body.push(`Note: ${noteLines[0]}`); for (let i = 1; i < noteLines.length; i++) body.push(noteLines[i]) }
+  if (details?.explanation) { body.push(""); for (const line of String(details.explanation).split("\n")) body.push(line) }
+  return callout(type, title, body)
+}
+function answerCalloutAsk(details: any): string {
+  const status = details?.status
+  if (status === "cancelled") return callout("warning", "Question — cancelled", ["(user skipped)"])
+  if (status === "unavailable") return callout("warning", "Question — unavailable", [details?.message || ""])
+  const answers: any[] = details?.answers || []
+  const body: string[] = answers.map((a) => { if (a.type === "other") return `Other: ${a.label}`; if (a.type === "text") return a.label; return `${a.index}. ${a.label}` })
+  if (body.length === 0) body.push("(no answer)")
+  return callout("example", "Answer", body)
+}
+async function backfillMdLog(client: any, sessionID: string, directory: string): Promise<number> {
+  if (!mdLogFile || !sessionID) return 0
+  try {
+    const res: any = await client.session.messages({ path: { id: sessionID }, query: { directory } })
+    const data: any = res?.data ?? res
+    const entries: any[] = Array.isArray(data) ? data : []
+    if (!entries.length) return 0
+    const blocks: string[] = []
+    for (const entry of entries) {
+      const info: any = entry.info
+      const parts: any[] = entry.parts ?? []
+      if (!info || !info.role) continue
+      if (info.role === "user") {
+        const text = parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n").trim()
+        const fallback = typeof info.content === "string" ? info.content : ""
+        const raw = text || fallback
+        const trimmed = stripSkillBlocks(raw.trim())
+        if (trimmed) blocks.push(userBlock(trimmed))
+      } else if (info.role === "assistant") {
+        const textParts = parts.filter((p: any) => p.type === "text" && !p.synthetic && !p.ignored).map((p: any) => (p.text || "").trim()).filter(Boolean)
+        if (textParts.length) blocks.push(assistantBlock(textParts.join("\n\n")))
+        for (const p of parts) {
+          if (p.type !== "tool") continue
+          const toolName = p.tool
+          if (toolName !== "quiz" && toolName !== "ask_user_question" && toolName !== "question") continue
+          const st: any = p.state ?? {}
+          const input = st.input ?? {}
+          const output = st.output ?? ""
+          const meta = st.metadata ?? {}
+          if (st.status === "pending" || st.status === "running") {
+            if (input.question) {
+              const opts = Array.isArray(input.options) ? input.options : []
+              const label = toolName === "quiz" ? "Quiz" : "Question"
+              blocks.push(questionCallout(label, input.question, input.details?.trim() || undefined, opts))
+            }
+          } else if (st.status === "completed") {
+            // Question (with true order if shuffled, fallback to input)
+            if (input.question) {
+              const opts = Array.isArray(input.options) ? input.options : []
+              const label = toolName === "quiz" ? "Quiz" : "Question"
+              // Only push question if not already pushed as pending (avoid duplicate)
+              // For backfill we push both Q and A together
+              if (!blocks.length || !blocks[blocks.length - 1].includes(input.question.slice(0, 20))) {
+                blocks.push(questionCallout(label, input.question, input.details?.trim() || undefined, opts))
+              }
+            }
+            if (toolName === "quiz") {
+              const details = { status: "completed", answers: meta.answers ?? [], correct: meta.correct, correctIndices: meta.correctIndices ?? [], explanation: meta.explanation ?? "", dontKnow: meta.dontKnow ?? false, note: meta.note }
+              blocks.push(answerCalloutQuiz(details))
+            } else {
+              const details = { answers: meta.answers ?? [], status: "completed" }
+              blocks.push(answerCalloutAsk(details))
+            }
+          }
+        }
+      }
+    }
+    if (blocks.length) {
+      let current = ""
+      try { if (fs.existsSync(mdLogFile)) current = fs.readFileSync(mdLogFile, "utf-8") } catch {}
+      // If file empty, overwrite; else append with separator (preserve user notes)
+      if (current.trim().length === 0) {
+        fs.writeFileSync(mdLogFile, blocks.join("\n\n") + "\n", "utf-8")
+      } else {
+        // Avoid duplicating if already contains same session text
+        const prefix = current.trim().length > 0 ? "\n\n" : ""
+        fs.writeFileSync(mdLogFile, current + prefix + blocks.join("\n\n") + "\n", "utf-8")
+      }
+    }
+    return blocks.length
+  } catch (e) {
+    slog("backfill failed", String(e))
+    return 0
+  }
+}
 
 // ── Pending IPC for beautiful TUI (server ↔ tui) ─────────────────────────
 const PENDING_DIRNAME = ".opencode/learn-pending"
@@ -311,6 +422,11 @@ const server: Plugin = async ({ client, directory }) => {
   let mermaidSession: { workDir: string; bodyPath: string } | null = null
   let svgSession: { workDir: string; bodyPath: string } | null = null
 
+  // md-log dedup state (per plugin instance, survives across sessions but mdLogFile is global)
+  const loggedTextPartIds = new Set<string>()
+  const loggedToolCallIds = new Set<string>()
+  const messageIdToRole = new Map<string, string>()
+
   // Durability: on (re)start, re-watch any pending quizzes left from a crash/exit
   try {
     const dir = pendingDir(directory)
@@ -368,22 +484,110 @@ const server: Plugin = async ({ client, directory }) => {
       await client.app.log({ body: { service: "learn", level: "info", message: "learn plugin initialized", extra: { directory } } })
     },
 
+    "chat.message": async (_input, output) => {
+      if (!mdLogFile) return
+      try {
+        const msg: any = (output as any).message
+        const parts: any[] = (output as any).parts ?? []
+        let text = ""
+        if (Array.isArray(parts) && parts.length) text = parts.filter((p) => p.type === "text").map((p) => p.text).join("\n").trim()
+        if (!text && typeof msg?.content === "string") text = msg.content
+        else if (!text && Array.isArray(msg?.content)) text = msg.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n")
+        text = stripSkillBlocks((text || "").trim())
+        if (!text) return
+        const mid = msg?.id ? `msg:${msg.id}` : `chat:${Date.now()}`
+        if (loggedTextPartIds.has(mid)) return
+        loggedTextPartIds.add(mid)
+        await withMdLock(() => appendToMdLog(userBlock(text)))
+      } catch {}
+    },
+    "experimental.text.complete": async (input, output) => {
+      if (!mdLogFile) return
+      try {
+        const text = (output as any).text?.trim()
+        if (!text) return
+        const partID = (input as any).partID
+        if (partID && loggedTextPartIds.has(partID)) return
+        if (partID) loggedTextPartIds.add(partID)
+        await withMdLock(() => appendToMdLog(assistantBlock(stripSkillBlocks(text))))
+      } catch {}
+    },
+    "tool.execute.before": async (input) => {
+      if (!mdLogFile) return
+      try {
+        const toolName = (input as any).tool
+        const args = (input as any).args ?? {}
+        // Built-in `question` tool is used as fallback when TUI not alive; mirror it.
+        // `ask_user_question` is already mirrored inside its own execute (with correct TUI handling), so skip to avoid duplicate.
+        if (toolName === "question") {
+          const q = args.question || args.header || ""
+          const ctx2 = args.details?.trim() || undefined
+          const opts = Array.isArray(args.options) ? args.options : []
+          const callID = (input as any).callID
+          if (callID && loggedToolCallIds.has(`q:${callID}`)) return
+          if (callID) loggedToolCallIds.add(`q:${callID}`)
+          if (q) await withMdLock(() => appendToMdLog(questionCallout("Question", q, ctx2, opts)))
+        }
+      } catch {}
+    },
+    "tool.execute.after": async (input, output) => {
+      if (!mdLogFile) return
+      try {
+        const toolName = (input as any).tool
+        const callID = (input as any).callID
+        if (callID && loggedToolCallIds.has(`answer:${callID}`)) return
+        if (toolName === "quiz") {
+          const meta: any = (output as any).metadata ?? {}
+          const details = {
+            status: "completed",
+            answers: meta.answers ?? [],
+            correct: meta.correct,
+            correctIndices: meta.correctIndices ?? [],
+            explanation: meta.explanation ?? "",
+            dontKnow: meta.dontKnow ?? false,
+            note: meta.note,
+          }
+          await withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+          if (callID) loggedToolCallIds.add(`answer:${callID}`)
+        } else if (toolName === "ask_user_question" || toolName === "question") {
+          const meta: any = (output as any).metadata ?? {}
+          // Try to extract answers from output string or metadata
+          let answers: any[] = meta.answers ?? []
+          if (!answers.length && (output as any).output) {
+            // Fallback: parse output text for answers if needed
+            answers = []
+          }
+          const details: any = { answers, status: "completed" }
+          await withMdLock(() => appendToMdLog(answerCalloutAsk(details)))
+          if (callID) loggedToolCallIds.add(`answer:${callID}`)
+        }
+      } catch {}
+    },
     // Mirror session to markdown file (best-effort, mirrors pi's md-log)
     event: async ({ event }) => {
       if (!mdLogFile) return
       const t = (event as any).type as string
       const props = (event as any).properties ?? {}
       try {
-        if (t === "session.created" || t === "session.updated") {
-          // ignore, status bar handled elsewhere
-        } else if (t.startsWith("message.")) {
-          // message.updated carries the full message; we append on idle to avoid duplicates
-        } else if (t === "tool.execute.after") {
-          const toolName = props.tool ?? (event as any).tool
-          if (toolName === "quiz" || toolName === "ask_user_question") {
-            // details are in output metadata; event props contain callID etc.
-            // We can't get full details here, but we log a marker
-            await withMdLock(() => appendToMdLog(callout("note", `Tool ${toolName} completed`, [`call: ${(event as any).properties?.callID ?? ""}`])))
+        if (t === "message.updated") {
+          const info: any = props.info
+          if (info?.id && info?.role) messageIdToRole.set(info.id, info.role)
+        } else if (t === "message.part.updated") {
+          const part: any = props.part
+          const delta: string | undefined = props.delta
+          if (!part || !part.id) return
+          if (part.type === "text") {
+            if (part.synthetic || part.ignored) return
+            const isFinal = !!(part.time?.end !== undefined) || delta === undefined
+            if (!isFinal) return
+            if (loggedTextPartIds.has(part.id)) return
+            const text = (part.text || "").trim()
+            if (!text) return
+            const role = messageIdToRole.get(part.messageID)
+            if (role === "user") return
+            // Fallback for assistant when experimental.text.complete not fired
+            loggedTextPartIds.add(part.id)
+            await withMdLock(() => appendToMdLog(assistantBlock(stripSkillBlocks(text))))
           }
         }
       } catch {}
@@ -418,8 +622,8 @@ const server: Plugin = async ({ client, directory }) => {
 
           // ── Beautiful TUI path — non-blocking, inject prompt on answer ──
           // Server frees immediately; TUI shows rich dialog and injects answer as new user prompt to wake agent.
-          const pDir = pendingDir(ctx.directory)
-          const tuiAlive = isTuiAlive(ctx.directory)
+          const pDir = pendingDir(directory)
+          const tuiAlive = isTuiAlive(directory)
           // Always write durably so exit → restart still shows it (like opencode-loop guardLoopOwnedUserMessage)
           try { fs.mkdirSync(pDir, { recursive: true }) } catch {}
           const id = randomId()
@@ -438,7 +642,7 @@ const server: Plugin = async ({ client, directory }) => {
           }
           try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8"); slog("quiz wrote durably", pendingPath, "alive", tuiAlive) } catch (e) { slog("quiz write failed", String(e)) }
           try { await (ctx as any).metadata?.({ title: `Quiz: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
-          watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+          watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
               const dk = !!r?.dontKnow
               const sel = (r?.answers || []).map((a: any) => `${a.index}. ${a.label}`).join(", ") || "(none)"
               const cs = new Set(correctIndices)
@@ -449,13 +653,18 @@ const server: Plugin = async ({ client, directory }) => {
                 ? `[quiz answered] "${args.question}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
                 : `[quiz answered] "${args.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
             })
+          // Always mirror question with TRUE shuffled order (pi: tool_execution_update)
+          if (mdLogFile) {
+            try { await withMdLock(() => appendToMdLog(questionCallout("Quiz", args.question, args.details?.trim() || undefined, options.map((o) => ({ label: o.label }))))) } catch {}
+          }
           if (tuiAlive) {
-            if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Quiz", [args.question, ...(args.details ? [args.details] : []), "", ...options.map((o, i) => `${i + 1}. ${o.label}`)])))
             return `[quiz displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
           }
-          // ── Fallback: console TTY          // ── Fallback: console TTY or instruction for LLM to use `question` ──
+          // ── Fallback: console TTY (NEVER inside opencode TUI — readline steals raw mode + mouse SGR `^[[<35;...M` and garbles alt-screen)
+          // Inside opencode `OPENCODE=1` is always set, so skip readline and use instruction fallback that works with native `question` tool.
           const isTTY = (process as any).stdin?.isTTY && (process as any).stdout?.isTTY
-          if (isTTY && !(process as any).env?.OPENCODE_TUI) {
+          const insideOpencode = !!(process as any).env?.OPENCODE || !!(process as any).env?.OPENCODE_TUI
+          if (isTTY && !insideOpencode) {
             const readline = await import("node:readline")
             const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
             const abortPromise = new Promise<null>((resolve) => ctx.abort.addEventListener("abort", () => { try { rl.close() } catch {}; resolve(null) }, { once: true }))
@@ -521,8 +730,8 @@ const server: Plugin = async ({ client, directory }) => {
         },
         async execute(args, ctx) {
           slog("quiz_batch called", JSON.stringify(args.quizzes).slice(0,500))
-          const pendingDirPath = pendingDir(ctx.directory)
-          const isAlive = isTuiAlive(ctx.directory)
+          const pendingDirPath = pendingDir(directory)
+          const isAlive = isTuiAlive(directory)
           slog("quiz_batch isAlive", isAlive)
           const normalized: any[] = []
           for (const q of (args.quizzes as any[])) {
@@ -541,7 +750,7 @@ const server: Plugin = async ({ client, directory }) => {
           const file = path.join(pendingDirPath, `quiz_batch-${id}.json`)
           try { fs.writeFileSync(file, JSON.stringify(payload), "utf8"); slog("quiz_batch wrote durably", file, "alive", isAlive) } catch (e) { slog("quiz_batch write failed", String(e)) }
           try { await (ctx as any).metadata?.({ title: `Quiz batch ${normalized.length}`, metadata: { pendingId: id } }) } catch {}
-          watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+          watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
               const results = r?.results || []
               const lines = results.map((x: any, i: number) => {
                 const q = normalized[i]
@@ -580,15 +789,15 @@ const server: Plugin = async ({ client, directory }) => {
           const mode = options.length === 0 ? "text" : args.multiSelect ? "multi-select" : "single-select"
 
           // ── Beautiful TUI path — non-blocking, inject prompt on answer ──
-          const pDir = pendingDir(ctx.directory)
-          if (isTuiAlive(ctx.directory)) {
+          const pDir = pendingDir(directory)
+          if (isTuiAlive(directory)) {
             try { fs.mkdirSync(pDir, { recursive: true }) } catch {}
             const id = randomId()
             const pendingPath = path.join(pDir, `ask-${id}.json`)
             const payload = { id, type: "ask" as const, question: args.question, details: args.details, options, multiSelect: !!args.multiSelect, sessionID: (ctx as any).sessionID, timestamp: Date.now() }
             try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8") } catch {}
             try { await (ctx as any).metadata?.({ title: `Question: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
-            watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+            watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
               const arr = Array.isArray(r) ? r : (r?.answers || [])
               const txt = arr.map((a: any) => a.type === "other" ? `Other: ${a.label}` : a.index ? `${a.index}. ${a.label}` : a.label).join(", ") || "(no answer)"
               return `[question answered] "${args.question}" -> ${txt}`
@@ -625,15 +834,14 @@ const server: Plugin = async ({ client, directory }) => {
           if (!fs.statSync(resolved).isFile()) return `Not a file: ${resolved}`
           mdLogFile = resolved
           try { fs.mkdirSync(path.dirname(markerPath), { recursive: true }); fs.writeFileSync(markerPath, JSON.stringify({ file: resolved }), "utf-8") } catch {}
-          // Backfill: try to fetch recent messages via SDK (best-effort)
-          try {
-            // @ts-ignore SDK shape varies; best-effort fetch
-            const anyClient = client as any
-            const sessions = await anyClient.session?.list?.()
-            // No reliable history API here; we just notify linked and rely on future events.
-          } catch {}
-          await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved } } })
-          return `Linked: ${resolved} — future messages will be mirrored. View it rendered in Obsidian for LaTeX/math.`
+          // Backfill history for this session (like pi: ctx.sessionManager.getEntries() parent chain)
+          let backfilled = 0
+          const sessionID = (ctx as any).sessionID as string | undefined
+          if (sessionID) {
+            try { backfilled = await backfillMdLog(client, sessionID, directory) } catch (e) { slog("backfill error", String(e)) }
+          }
+          await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved, backfilled } } })
+          return `Linked: ${resolved} — ${backfilled ? `${backfilled} entries backfilled — ` : ""}future messages will be mirrored. View it rendered in Obsidian for LaTeX/math.`
         },
       }),
 

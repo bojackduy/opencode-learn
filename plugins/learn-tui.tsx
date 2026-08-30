@@ -561,7 +561,7 @@ export const tui: TuiPlugin = async (api) => {
   const processPending = () => {
     const curSid = getCurrentSessionID()
     if (!curSid) return
-    const current = currentBySession.get(curSid)
+    let current = currentBySession.get(curSid) as { id: string; type: string } | undefined
     if (current) return
     if (api.ui.dialog.open) return
     let files: string[] = []
@@ -587,6 +587,7 @@ export const tui: TuiPlugin = async (api) => {
       }
     } catch {}
     current = { id: data.id, type: data.type }
+    currentBySession.set(curSid, current)
     const done = async (result: any) => {
       const respPath = path.join(pendingDir, `response-${data!.id}.json`)
       try { fs.writeFileSync(respPath, JSON.stringify({ id: data!.id, type: data!.type, result, sessionID: (data as any).sessionID, at: Date.now() }), "utf8") } catch {}
@@ -671,7 +672,7 @@ export const tui: TuiPlugin = async (api) => {
       } catch {}
       try { fs.unlinkSync(full) } catch {}
       api.ui.dialog.clear()
-      currentBySession.delete(curSidCancel)
+      currentBySession.delete(curSid)
       setTimeout(processPending, 150)
     }
     if (data.type === "quiz") { tlog("processPending quiz", data.id); api.ui.dialog.replace(() => <QuizDialog api={api} request={data as QuizPending} onSubmit={done} onCancel={cancel} />) }
