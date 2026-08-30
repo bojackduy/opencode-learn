@@ -9,7 +9,7 @@ import { spawn } from "node:child_process"
 // Helpers shared across visual-tools (ported from .pi/extensions/visual-tools)
 // ────────────────────────────────────────────────────────────────────────────
 const EXTRA_PATH = ["/opt/local/bin", "/usr/local/bin", "/opt/homebrew/bin"]
-const STAGING_ROOT = path.join(tmpdir(), "pi-visual-tools")
+const STAGING_ROOT = path.join(tmpdir(), "opencode-visual-tools")
 const FILES_DIRNAME = "viz"
 
 function findChrome(): string | undefined {
@@ -157,7 +157,7 @@ function stripSkillBlocks(text: string) {
   })
 }
 function userBlock(text: string) { return `> [!quote] YOU\n\n${text}` }
-function assistantBlock(text: string) { return `> [!abstract] PI\n\n${text}` }
+function assistantBlock(text: string) { return `> [!abstract] OPENCODE\n\n${text}` }
 function optionsList(options: Array<{ label: string }>): string[] { return options.map((o, i) => `${i + 1}. ${o.label}`) }
 function questionCallout(label: string, question: string, context: string | undefined, options: Array<{ label: string }>): string {
   const body: string[] = []
@@ -209,18 +209,45 @@ async function backfillMdLog(client: any, sessionID: string, directory: string):
         const fallback = typeof info.content === "string" ? info.content : ""
         const raw = text || fallback
         const trimmed = stripSkillBlocks(raw.trim())
-        if (trimmed) blocks.push(userBlock(trimmed))
+        if (!trimmed) continue
+        // Skip system-injected quiz/batch answer prompts — they are mirrored as beautiful callouts via watchAndInject, not as plain user quotes
+        if (/^\[(quiz|quiz_batch|question) (answered|cancelled)\]/i.test(trimmed) || trimmed.startsWith("[quiz answered]") || trimmed.startsWith("[quiz_batch answered]") || trimmed.startsWith("[question answered]")) continue
+        blocks.push(userBlock(trimmed))
       } else if (info.role === "assistant") {
         const textParts = parts.filter((p: any) => p.type === "text" && !p.synthetic && !p.ignored).map((p: any) => (p.text || "").trim()).filter(Boolean)
         if (textParts.length) blocks.push(assistantBlock(textParts.join("\n\n")))
         for (const p of parts) {
           if (p.type !== "tool") continue
           const toolName = p.tool
-          if (toolName !== "quiz" && toolName !== "question" && toolName !== "ask_user_question") continue // keep ask for old sessions
+          if (toolName !== "quiz" && toolName !== "question" && toolName !== "ask_user_question" && toolName !== "quiz_batch") continue // keep ask for old sessions
           const st: any = p.state ?? {}
           const input = st.input ?? {}
           const output = st.output ?? ""
           const meta = st.metadata ?? {}
+          if (toolName === "quiz_batch") {
+            const quizzes: any[] = input.quizzes ?? []
+            if (st.status === "pending" || st.status === "running") {
+              for (let i = 0; i < quizzes.length; i++) {
+                const qq = quizzes[i]
+                const label = `Quiz ${i + 1}/${quizzes.length}`
+                blocks.push(questionCallout(label, qq.question, qq.details?.trim() || undefined, qq.options ?? []))
+              }
+            } else if (st.status === "completed") {
+              for (let i = 0; i < quizzes.length; i++) {
+                const qq = quizzes[i]
+                const label = `Quiz ${i + 1}/${quizzes.length}`
+                blocks.push(questionCallout(label, qq.question, qq.details?.trim() || undefined, qq.options ?? []))
+                // Try to get per-quiz answer from meta.results if available (live path via watchAndInject will have beautiful logs anyway)
+                const results: any[] = meta.results ?? []
+                const x = results[i] || {}
+                if (x && (x.answers || x.correct !== undefined)) {
+                  const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note }
+                  blocks.push(answerCalloutQuiz(details))
+                }
+              }
+            }
+            continue
+          }
           if (st.status === "pending" || st.status === "running") {
             if (input.question) {
               const opts = Array.isArray(input.options) ? input.options : []
@@ -444,9 +471,21 @@ const server: Plugin = async ({ client, directory }) => {
                 const dk = !!r?.dontKnow
                 const ok = !dk && si.length === (j.correctIndices||[]).length && si.every((i:number)=>cs.has(i))
                 const note = r?.note ? `\nNote: ${r.note}` : ""
+                if (mdLogFile) {
+                  const details = { status: "completed" as const, answers: r?.answers || [], correct: ok, correctIndices: j.correctIndices || [], explanation: j.explanation, dontKnow: dk, note: r?.note }
+                  void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+                }
                 return dk ? `[quiz answered] "${j.question}" -> I don't know.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}` : `[quiz answered] "${j.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}`
               } else if (j.type === "quiz_batch") {
                 const results = (r as any)?.results || []
+                if (mdLogFile) {
+                  for (let i = 0; i < (j.quizzes||[]).length; i++) {
+                    const qq = j.quizzes[i]
+                    const x = results[i] || {}
+                    const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note }
+                    void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+                  }
+                }
                 const lines = (j.quizzes || []).map((qq:any, i:number) => {
                   const x = results[i] || {}
                   const cs = (qq.correctIndices||[]).map((idx:number)=>`${idx}. ${qq.options[idx-1]?.label}`).join(", ")
@@ -495,6 +534,8 @@ const server: Plugin = async ({ client, directory }) => {
         else if (!text && Array.isArray(msg?.content)) text = msg.content.filter((c: any) => c.type === "text").map((c: any) => c.text).join("\n")
         text = stripSkillBlocks((text || "").trim())
         if (!text) return
+        // Skip system-injected quiz/batch answer prompts — they are mirrored as beautiful callouts via watchAndInject, not as plain user quotes
+        if (/^\[(quiz|quiz_batch|question) (answered|cancelled)\]/i.test(text) || text.startsWith("[quiz answered]") || text.startsWith("[quiz_batch answered]") || text.startsWith("[question answered]")) return
         const mid = msg?.id ? `msg:${msg.id}` : `chat:${Date.now()}`
         if (loggedTextPartIds.has(mid)) return
         loggedTextPartIds.add(mid)
@@ -536,20 +577,7 @@ const server: Plugin = async ({ client, directory }) => {
         const toolName = (input as any).tool
         const callID = (input as any).callID
         if (callID && loggedToolCallIds.has(`answer:${callID}`)) return
-        if (toolName === "quiz") {
-          const meta: any = (output as any).metadata ?? {}
-          const details = {
-            status: "completed",
-            answers: meta.answers ?? [],
-            correct: meta.correct,
-            correctIndices: meta.correctIndices ?? [],
-            explanation: meta.explanation ?? "",
-            dontKnow: meta.dontKnow ?? false,
-            note: meta.note,
-          }
-          await withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
-          if (callID) loggedToolCallIds.add(`answer:${callID}`)
-        } else if (toolName === "question") {
+        if (toolName === "question") {
           const meta: any = (output as any).metadata ?? {}
           let answers: any[] = meta.answers ?? []
           if (!answers.length && (output as any).output) answers = []
@@ -645,6 +673,18 @@ const server: Plugin = async ({ client, directory }) => {
               const si = (r?.answers || []).map((a: any) => a.index)
               const ok = !dk && si.length === correctIndices.length && si.every((i: number) => cs.has(i))
               const note = r?.note ? `\nNote: ${r.note}` : ""
+              if (mdLogFile) {
+                const details = {
+                  status: "completed" as const,
+                  answers: r?.answers || [],
+                  correct: ok,
+                  correctIndices,
+                  explanation: args.explanation,
+                  dontKnow: dk,
+                  note: r?.note,
+                }
+                void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+              }
               return dk
                 ? `[quiz answered] "${args.question}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
                 : `[quiz answered] "${args.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
@@ -746,8 +786,38 @@ const server: Plugin = async ({ client, directory }) => {
           const file = path.join(pendingDirPath, `quiz_batch-${id}.json`)
           try { fs.writeFileSync(file, JSON.stringify(payload), "utf8"); slog("quiz_batch wrote durably", file, "alive", isAlive) } catch (e) { slog("quiz_batch write failed", String(e)) }
           try { await (ctx as any).metadata?.({ title: `Quiz batch ${normalized.length}`, metadata: { pendingId: id } }) } catch {}
+          // Mirror each question in batch as a beautiful callout (like single quiz)
+          if (mdLogFile) {
+            for (let i = 0; i < normalized.length; i++) {
+              const q = normalized[i]
+              const label = `Quiz ${i + 1}/${normalized.length}`
+              try { await withMdLock(() => appendToMdLog(questionCallout(label, q.question, q.details?.trim() || undefined, q.options.map((o: any) => ({ label: o.label })))) ) } catch {}
+            }
+          }
           watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
               const results = r?.results || []
+              // Mirror each answer as a beautiful callout (like single quiz) — not just plain text
+              if (mdLogFile) {
+                for (let i = 0; i < normalized.length; i++) {
+                  const q = normalized[i]
+                  const x = results[i] || {}
+                  const details = {
+                    status: "completed" as const,
+                    answers: x.answers || [],
+                    correct: !!x.correct,
+                    correctIndices: q.correctIndices || [],
+                    explanation: q.explanation || "",
+                    dontKnow: !!x.dontKnow,
+                    note: x.note,
+                  }
+                  const label = `Quiz ${i + 1}/${normalized.length}`
+                  // Use same callout helper as single quiz but with batch label context
+                  try {
+                    // withMdLock is async, but watchAndInject buildText is sync — queue without await and let it flush
+                    void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+                  } catch {}
+                }
+              }
               const lines = results.map((x: any, i: number) => {
                 const q = normalized[i]
                 const cs = (q.correctIndices||[]).map((idx:number)=>`${idx}. ${q.options[idx-1]?.label}`).join(", ")
