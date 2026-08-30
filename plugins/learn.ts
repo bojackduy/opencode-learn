@@ -420,25 +420,25 @@ const server: Plugin = async ({ client, directory }) => {
           // Server frees immediately; TUI shows rich dialog and injects answer as new user prompt to wake agent.
           const pDir = pendingDir(ctx.directory)
           const tuiAlive = isTuiAlive(ctx.directory)
-          if (tuiAlive) {
-            try { fs.mkdirSync(pDir, { recursive: true }) } catch {}
-            const id = randomId()
-            const pendingPath = path.join(pDir, `quiz-${id}.json`)
-            const payload = {
-              id,
-              type: "quiz" as const,
-              question: args.question,
-              details: args.details,
-              options: options.map((o, i) => ({ label: o.label, value: o.value, description: o.description, index: i + 1 })),
-              correctIndices,
-              explanation: args.explanation,
-              multiSelect: !!args.multiSelect,
-              sessionID: (ctx as any).sessionID,
-              timestamp: Date.now(),
-            }
-            try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8") } catch {}
-            try { await (ctx as any).metadata?.({ title: `Quiz: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
-            watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+          // Always write durably so exit → restart still shows it (like opencode-loop guardLoopOwnedUserMessage)
+          try { fs.mkdirSync(pDir, { recursive: true }) } catch {}
+          const id = randomId()
+          const pendingPath = path.join(pDir, `quiz-${id}.json`)
+          const payload = {
+            id,
+            type: "quiz" as const,
+            question: args.question,
+            details: args.details,
+            options: options.map((o, i) => ({ label: o.label, value: o.value, description: o.description, index: i + 1 })),
+            correctIndices,
+            explanation: args.explanation,
+            multiSelect: !!args.multiSelect,
+            sessionID: (ctx as any).sessionID,
+            timestamp: Date.now(),
+          }
+          try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8"); slog("quiz wrote durably", pendingPath, "alive", tuiAlive) } catch (e) { slog("quiz write failed", String(e)) }
+          try { await (ctx as any).metadata?.({ title: `Quiz: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
+          watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
               const dk = !!r?.dontKnow
               const sel = (r?.answers || []).map((a: any) => `${a.index}. ${a.label}`).join(", ") || "(none)"
               const cs = new Set(correctIndices)
@@ -449,11 +449,11 @@ const server: Plugin = async ({ client, directory }) => {
                 ? `[quiz answered] "${args.question}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
                 : `[quiz answered] "${args.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
             })
+          if (tuiAlive) {
             if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Quiz", [args.question, ...(args.details ? [args.details] : []), "", ...options.map((o, i) => `${i + 1}. ${o.label}`)])))
             return `[quiz displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
           }
-
-          // ── Fallback: console TTY or instruction for LLM to use `question` ──
+          // ── Fallback: console TTY          // ── Fallback: console TTY or instruction for LLM to use `question` ──
           const isTTY = (process as any).stdin?.isTTY && (process as any).stdout?.isTTY
           if (isTTY && !(process as any).env?.OPENCODE_TUI) {
             const readline = await import("node:readline")
@@ -497,7 +497,6 @@ const server: Plugin = async ({ client, directory }) => {
             `Then compare the user's selected labels to correct indices [${correctIndices.join(", ")}]. Grade as ${args.multiSelect ? "exact-set match" : "single match"}, show ✓/✗, reveal Correct: ${correctStr}, and Explanation. An 'I don't know' maps to dontKnow (genuine gap).`,
           ].filter(Boolean).join("\n")
             ;(ctx as any).metadata?.({ title: `Quiz: ${args.question.slice(0, 40)}`, metadata: { correctIndices, explanation: args.explanation, options: options.map((o, i) => ({ index: i + 1, label: o.label })) } })
-          if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Quiz", [args.question, ...(args.details ? [args.details] : []), "", ...options.map((o, i) => `${i + 1}. ${o.label}`)])))
           return instruction
         },
       }),
@@ -536,14 +535,13 @@ const server: Plugin = async ({ client, directory }) => {
             normalized.push({ question: q.question, details: q.details, options: opts, correctIndices: indices, explanation: q.explanation, multiSelect: !!q.multiSelect })
           }
           slog("quiz_batch normalized", normalized.length)
-          if (isAlive) {
-            try { fs.mkdirSync(pendingDirPath, { recursive: true }) } catch {}
-            const id = randomId()
-            const payload = { id, type: "quiz_batch" as const, quizzes: normalized, sessionID: (ctx as any).sessionID, timestamp: Date.now() }
-            const file = path.join(pendingDirPath, `quiz_batch-${id}.json`)
-            try { fs.writeFileSync(file, JSON.stringify(payload), "utf8"); slog("quiz_batch wrote", file) } catch (e) { slog("quiz_batch write failed", String(e)) }
-            try { await (ctx as any).metadata?.({ title: `Quiz batch ${normalized.length}`, metadata: { pendingId: id } }) } catch {}
-            watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
+          try { fs.mkdirSync(pendingDirPath, { recursive: true }) } catch {}
+          const id = randomId()
+          const payload = { id, type: "quiz_batch" as const, quizzes: normalized, sessionID: (ctx as any).sessionID, timestamp: Date.now() }
+          const file = path.join(pendingDirPath, `quiz_batch-${id}.json`)
+          try { fs.writeFileSync(file, JSON.stringify(payload), "utf8"); slog("quiz_batch wrote durably", file, "alive", isAlive) } catch (e) { slog("quiz_batch write failed", String(e)) }
+          try { await (ctx as any).metadata?.({ title: `Quiz batch ${normalized.length}`, metadata: { pendingId: id } }) } catch {}
+          watchAndInject(client, ctx.directory, id, (ctx as any).sessionID, (r: any) => {
               const results = r?.results || []
               const lines = results.map((x: any, i: number) => {
                 const q = normalized[i]
@@ -554,12 +552,10 @@ const server: Plugin = async ({ client, directory }) => {
               }).join("\n")
               return `[quiz_batch answered] ${normalized.length} quizzes\n` + lines
             })
-            slog("quiz_batch watchAndInject armed", id)
-            return `[quiz batch displayed in TUI — ${normalized.length} quizzes as deck Quiz 1/${normalized.length} → ${normalized.length}/${normalized.length}. Answer all, then one combined inject.]`
+            slog("quiz_batch watchAndInject armed", id, "alive", isAlive)
+            if (isAlive) return `[quiz batch displayed in TUI — ${normalized.length} quizzes as deck Quiz 1/${normalized.length} → ${normalized.length}/${normalized.length}. Answer all, then one combined inject.]`
+            else return `[quiz batch displayed durably — TUI not alive yet, will appear on restart. Answer all, then one combined inject.]`
           }
-          slog("quiz_batch fallback, TUI not alive")
-          return `[quiz_batch fallback — TUI not alive, call single quiz ${normalized.length} times sequentially]`
-        },
       }),
 
       // ── ask_user_question: ungraded, single/multi, with Other ─────────
