@@ -77,9 +77,12 @@ function QuizDialog(props: {
     setSelected(map)
   }
   const handleDontKnow = () => {
-    setDontKnow(v => !v)
-    if (!dontKnow()) setSelected(new Map())
-    else setDontKnow(false)
+    const willBe = !dontKnow()
+    setDontKnow(willBe)
+    if (willBe) setSelected(new Map())
+    else setSelected(new Map())
+    // For single-select, dontKnow is a final answer — submit immediately (no Submit button)
+    if (!isMulti() && willBe) setTimeout(() => submitSelect(), 0)
   }
   const submitSelect = () => {
     const selMap = selected()
@@ -347,8 +350,8 @@ function QuizBatchDialog(props: {
       if(k==="down"||k==="j"||seq==="\x1b[B"){prevent(evt); setOptionIndex(i=>Math.min(isMulti()?submitIdx():dontKnowIdx(),i+1)); return}
       if(k==="tab"||seq==="\t"){prevent(evt); setFocused("note"); return}
       if(k==="escape"||k==="esc"){prevent(evt); props.onCancel(); return}
-      if(k==="space"||seq===" "){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ setDontKnow(v=>!v); if(!dontKnow()) setSelected(new Map()); else setDontKnow(true); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
-      if(k==="enter"||seq==="\r"){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ setDontKnow(v=>!v); } else if(isMulti()) submitSelect(); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
+      if(k==="space"||seq===" "){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
+      if(k==="enter"||seq==="\r"){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); } else if(isMulti()) submitSelect(); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
       if(seq==="ctrl+j" || (k==="enter" && evt.ctrl)){prevent(evt); submitSelect(); return}
     } catch(e){ tlog("useKeyboard batch failed", String(e)) }
   })
