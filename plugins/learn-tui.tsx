@@ -237,10 +237,10 @@ function QuizDialog(props: {
                 let icon = " "
                 let fg = theme().textMuted
                 let bg: any = undefined
-                if (dontKnow()) { icon = isCorrect() ? "✓" : " "; fg = isCorrect() ? theme().success : theme().textMuted; bg = isCorrect() ? theme().success + "22" : undefined }
-                else if (isSelected() && isCorrect()) { icon = "✓"; fg = theme().success; bg = theme().success + "1a" }
-                else if (isSelected() && !isCorrect()) { icon = "✗"; fg = theme().error; bg = theme().error + "1a" }
-                else if (!isSelected() && isCorrect()) { icon = "✓"; fg = theme().success }
+                if (dontKnow()) { icon = isCorrect() ? "✓" : " "; fg = isCorrect() ? theme().success : theme().textMuted; }
+                else if (isSelected() && isCorrect()) { icon = "✓"; fg = theme().success; }
+                else if (isSelected() && !isCorrect()) { icon = "✗"; fg = theme().error; }
+                else if (!isSelected() && isCorrect()) { icon = "✓"; fg = theme().success; }
                 return (
                   <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={bg}>
                     <box width={2} alignItems="center"><text fg={fg} bold>{icon}</text></box>
