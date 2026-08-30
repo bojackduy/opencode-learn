@@ -368,22 +368,141 @@ const server: Plugin = async ({ client, directory }) => {
       await client.app.log({ body: { service: "learn", level: "info", message: "learn plugin initialized", extra: { directory } } })
     },
 
-    // Mirror session to markdown file (best-effort, mirrors pi's md-log)
+    // Programmatic mirroring — port of .pi/md-log.ts:198 (no prompting, just code)
     event: async ({ event }) => {
       if (!mdLogFile) return
-      const t = (event as any).type as string
-      const props = (event as any).properties ?? {}
+      const etype = (event as any).type as string
+      const props: any = (event as any).properties ?? (event as any).data ?? {}
       try {
-        if (t === "session.created" || t === "session.updated") {
-          // ignore, status bar handled elsewhere
-        } else if (t.startsWith("message.")) {
-          // message.updated carries the full message; we append on idle to avoid duplicates
-        } else if (t === "tool.execute.after") {
-          const toolName = props.tool ?? (event as any).tool
-          if (toolName === "quiz" || toolName === "ask_user_question") {
-            // details are in output metadata; event props contain callID etc.
-            // We can't get full details here, but we log a marker
-            await withMdLock(() => appendToMdLog(callout("note", `Tool ${toolName} completed`, [`call: ${(event as any).properties?.callID ?? ""}`])))
+        if (etype === "session.created" || etype === "session.updated" || etype === "session.status") return
+        if (etype.startsWith("message.") || props.message || props.info) {
+          const msg = props.message || props.info || (event as any).message
+          if (msg && typeof msg === "object" && "role" in msg) {
+            if (msg.role === "user") {
+              const text = typeof msg.content === "string" ? msg.content : Array.isArray(msg.content) ? msg.content.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("\n") : ""
+              const trimmed = stripSkillBlocks(text.trim())
+              if (trimmed) await withMdLock(() => appendToMdLog(`> [!quote] YOU\n\n${trimmed}`))
+              return
+            }
+            if (msg.role === "assistant") {
+              const parts = (msg.content || []).filter((c:any)=>c.type==="text").map((c:any)=>(c.text as string).trim()).filter((s:string)=>s.length>0)
+              if (parts.length) await withMdLock(() => appendToMdLog(`> [!abstract] PI\n\n${parts.join("\n\n")}`))
+              return
+            }
+          }
+          return
+        }
+        if (etype === "tool.execute.before" || etype === "tool_call") {
+          const toolName = props.tool ?? props.toolName ?? (event as any).toolName
+          const input = props.args ?? props.input ?? (event as any).input ?? {}
+          if (toolName === "ask_user_question" && input?.question) {
+            const q = String(input.question)
+            const ctx2 = input.details ? String(input.details) : undefined
+            const opts = Array.isArray(input.options) ? input.options : []
+            const body: string[] = []
+            for (const l of q.split("\n")) body.push(l)
+            if (ctx2) { body.push(""); for (const l of ctx2.split("\n")) body.push(l) }
+            if (opts.length) { body.push(""); for (let i=0;i<opts.length;i++) body.push(`${i+1}. ${opts[i].label}`) }
+            await withMdLock(() => appendToMdLog(callout("question", "Question", body)))
+            return
+          }
+          return
+        }
+        if (etype === "tool.execute.update" || etype === "tool_execution_update") {
+          const toolName = props.tool ?? (event as any).toolName
+          if (toolName === "quiz") {
+            const args = props.args ?? {}
+            const shuffled = (event as any).partialResult?.details?.options ?? props.options
+            const opts = Array.isArray(shuffled) && shuffled.length ? shuffled : (args?.options || [])
+            const q = String(args?.question || "")
+            const ctx2 = args?.details ? String(args.details) : undefined
+            if (q && opts.length) {
+              const body: string[] = []
+              for (const l of q.split("\n")) body.push(l)
+              if (ctx2) { body.push(""); for (const l of ctx2.split("\n")) body.push(l) }
+              body.push(""); for (let i=0;i<opts.length;i++) body.push(`${i+1}. ${opts[i].label}`)
+              await withMdLock(() => appendToMdLog(callout("question", "Quiz", body)))
+            }
+            return
+          }
+          if (toolName === "quiz_batch") {
+            const args = props.args ?? {}
+            const quizzes = Array.isArray(args?.quizzes) ? args.quizzes : []
+            const detailsList = (event as any).partialResult?.details?.quizzes ?? quizzes
+            for (let qi=0; qi<detailsList.length; qi++) {
+              const q = detailsList[qi]
+              const qq = String(q.question || "")
+              const ctx3 = q.details ? String(q.details) : undefined
+              const opts = Array.isArray(q.options) ? q.options : []
+              const body: string[] = []
+              for (const l of qq.split("\n")) body.push(l)
+              if (ctx3) { body.push(""); for (const l of ctx3.split("\n")) body.push(l) }
+              if (opts.length) { body.push(""); for (let i=0;i<opts.length;i++) body.push(`${i+1}. ${opts[i].label}`) }
+              await withMdLock(() => appendToMdLog(callout("question", `Quiz ${qi+1}/${detailsList.length}`, body)))
+            }
+            return
+          }
+          return
+        }
+        if (etype === "tool.execute.after" || etype === "tool_result") {
+          const toolName = props.tool ?? (event as any).toolName
+          const details: any = props.details ?? (event as any).details
+          const input: any = props.input ?? (event as any).input
+          if (toolName === "quiz_batch" && details?.results) {
+            const results: any[] = details.results || []
+            const quizzes: any[] = input?.quizzes || details?.quizzes || []
+            for (let i=0;i<results.length;i++) {
+              const r = results[i]
+              const qinfo = quizzes[i] || {}
+              const status = r?.cancelled ? "cancelled" : r?.dontKnow ? "dontKnow" : r?.correct ? "correct" : "incorrect"
+              let title = `Quiz ${i+1}/${results.length} — ${status}`
+              let body: string[] = []
+              if (status === "cancelled") body = ["(user skipped)"]
+              else if (status === "dontKnow") {
+                body.push("Your answer: I don't know")
+                const ci: number[] = r?.correctIndices || qinfo?.correctIndices || []
+                if (ci.length) body.push(`Correct answer: ${ci.join(", ")}`)
+                if (r?.note) { body.push(""); body.push(`Note: ${r.note}`) }
+                if (qinfo?.explanation) { body.push(""); for (const l of String(qinfo.explanation).split("\n")) body.push(l) }
+              } else {
+                const sel = Array.isArray(r?.answers) ? r.answers.map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)" : ""
+                body.push(`Your answer: ${sel}`)
+                const ci: number[] = r?.correctIndices || qinfo?.correctIndices || []
+                if (ci.length) body.push(`Correct answer: ${ci.join(", ")}`)
+                if (r?.note) { body.push(""); body.push(`Note: ${r.note}`) }
+                const expl = qinfo?.explanation || r?.explanation
+                if (expl) { body.push(""); for (const l of String(expl).split("\n")) body.push(l) }
+              }
+              const type = status === "correct" ? "success" : status === "incorrect" ? "failure" : status === "dontKnow" ? "question" : "warning"
+              await withMdLock(() => appendToMdLog(callout(type, title, body)))
+            }
+            return
+          }
+          if (toolName === "quiz") {
+            const dontKnow = details?.dontKnow === true
+            const correct = details?.correct === true
+            const type = dontKnow ? "question" : correct ? "success" : "failure"
+            const title = dontKnow ? "Quiz — I don't know" : correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗"
+            const body: string[] = []
+            if (dontKnow) body.push("Your answer: I don't know")
+            else {
+              const answers: any[] = details?.answers || []
+              const sel = answers.map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
+              body.push(`Your answer: ${sel}`)
+            }
+            const ci: number[] = details?.correctIndices || []
+            if (ci.length) body.push(`Correct answer: ${ci.join(", ")}`)
+            if (details?.note) { body.push(""); const nl = String(details.note).split("\n"); body.push(`Note: ${nl[0]}`); for(let i=1;i<nl.length;i++) body.push(nl[i]) }
+            if (details?.explanation) { body.push(""); for (const l of String(details.explanation).split("\n")) body.push(l) }
+            await withMdLock(() => appendToMdLog(callout(type, title, body)))
+            return
+          }
+          if (toolName === "ask_user_question") {
+            const answers: any[] = details?.answers || []
+            const body: string[] = answers.map(a => a.type==="other" ? `Other: ${a.label}` : a.type==="text" ? a.label : `${a.index}. ${a.label}`)
+            if (body.length===0) body.push("(no answer)")
+            await withMdLock(() => appendToMdLog(callout("example", "Answer", body)))
+            return
           }
         }
       } catch {}
