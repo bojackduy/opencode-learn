@@ -237,10 +237,10 @@ function QuizDialog(props: {
                 let icon = " "
                 let fg = theme().textMuted
                 let bg: any = undefined
-                if (dontKnow()) { icon = isCorrect() ? "✓" : " "; fg = isCorrect() ? theme().success : theme().textMuted; }
-                else if (isSelected() && isCorrect()) { icon = "✓"; fg = theme().success; }
-                else if (isSelected() && !isCorrect()) { icon = "✗"; fg = theme().error; }
-                else if (!isSelected() && isCorrect()) { icon = "✓"; fg = theme().success; }
+                if (dontKnow()) { icon = isCorrect() ? "✓" : " "; fg = isCorrect() ? theme().background : theme().textMuted; bg = isCorrect() ? theme().success : undefined; }
+                else if (isSelected() && isCorrect()) { icon = "✓"; fg = theme().background; bg = theme().success; }
+                else if (isSelected() && !isCorrect()) { icon = "✗"; fg = theme().background; bg = theme().error; }
+                else if (!isSelected() && isCorrect()) { icon = "○"; fg = theme().background; bg = theme().warning; }
                 return (
                   <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={bg}>
                     <box width={2} alignItems="center"><text fg={fg} bold>{icon}</text></box>
@@ -372,7 +372,7 @@ function QuizBatchDialog(props: {
       </Show>
       <Show when={phase()==="feedback"}>
         <box flexDirection="column" gap={1} padding={1} border={true} borderColor={feedback()?.correct?theme().success:theme().error} backgroundColor={theme().background}>
-          <For each={cur().options}>{(opt:any,i:any)=>{const id=i()+1; const sel=()=>feedback()?.selectedIndices.includes(id)??false; const ok=()=>new Set(cur().correctIndices).has(id); let ic=" "; let fg=theme().textMuted; if(dontKnow()){ic=ok()?"✓":" "; fg=ok()?theme().success:theme().textMuted} else if(sel()&&ok()){ic="✓"; fg=theme().success} else if(sel()&&!ok()){ic="✗"; fg=theme().error} else if(!sel()&&ok()){ic="✓"; fg=theme().success} return <box flexDirection="row" gap={1} paddingLeft={1}><box width={2}><text fg={fg} bold>{ic}</text></box><box flexGrow={1}><text fg={fg} wrapMode="wrap">{id}. {opt.label}</text></box></box>}}</For>
+          <For each={cur().options}>{(opt:any,i:any)=>{const id=i()+1; const sel=()=>feedback()?.selectedIndices.includes(id)??false; const ok=()=>new Set(cur().correctIndices).has(id); let ic=" "; let fg=theme().textMuted; let bg:any=undefined; if(dontKnow()){ic=ok()?"✓":" "; fg=ok()?theme().background:theme().textMuted; bg=ok()?theme().success:undefined} else if(sel()&&ok()){ic="✓"; fg=theme().background; bg=theme().success} else if(sel()&&!ok()){ic="✗"; fg=theme().background; bg=theme().error} else if(!sel()&&ok()){ic="○"; fg=theme().background; bg=theme().warning} return <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={bg}><box width={2}><text fg={fg} bold>{ic}</text></box><box flexGrow={1}><text fg={fg} wrapMode="wrap">{id}. {opt.label}</text></box></box>}}</For>
           <text fg={feedback()?.correct?theme().success:theme().error} bold>{feedback()?.correct?"✓ Correct":"✗ Incorrect"}</text>
           <text fg={theme().textMuted}>Correct: {cur().correctIndices.map((i:number)=>`${i}. ${cur().options[i-1]?.label}`).join(", ")}</text>
           <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><text fg={theme().text} wrapMode="wrap">{cur().explanation}</text></box>
