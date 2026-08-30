@@ -98,7 +98,9 @@ You can't teach into his zone of proximal development without knowing where its 
 
 Do not advance to Phase 2 until, for each goal-relevant strand, you can state concretely both what he has and where it ends. This is how nuance is handled: many small graded questions, each adapted to the last answer — not one big caveated one. Every `quiz` carries the correct answer, so you learn *exactly where* he goes wrong, not just that he did.
 
-**1b. His learning goal — use `ask_user_question` (or native `question`).** Find out what he actually wants taught. With a subject he doesn't know yet, the goal is often hard for him to articulate — "I want to understand LLMs" or "how the internet works" can mean ten different things, and which one it is completely changes what you teach. Interrogate the vision until it's concrete. This has no right answer, so it's `ask_user_question`/`question`, never `quiz`.
+**Guardrail — one quiz at a time:** Call exactly **one** `quiz` per turn and wait for the user's answer (injected via the TUI) before the next probe. Never call `quiz_batch` or multiple `quiz` in parallel for Phase 1 — the next question must adapt to the last answer.
+
+**1b. His learning goal — use `ask_user_question` (or native `question`).** Find out what he actually wants taught. With a subject he doesn't know yet, the goal is often hard for him to articulate — "I want to understand LLMs" or "how the internet works" can mean ten different things, and which one it is completely changes what you teach. Interrogate the vision until it's concrete. This has no right answer, so it's `ask_user_question`/`question`, never `quiz`. Do not use `quiz` or `quiz_batch` for the goal — goal has no correct answer.
 
 ### Phase 2 — Plan (think hard here)
 

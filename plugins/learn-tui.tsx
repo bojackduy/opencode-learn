@@ -545,18 +545,32 @@ export const tui: TuiPlugin = async (api) => {
   const hbTimer = setInterval(() => { try { fs.writeFileSync(heartbeatPath, String(Date.now()), "utf8") } catch {} }, 2000)
   api.lifecycle.onDispose(() => clearInterval(hbTimer))
 
-  let current: { id: string; type: string } | null = null
+  const currentBySession = new Map<string, { id: string; type: string }>()
   let watcher: ReturnType<typeof watch> | undefined
   let pollTimer: ReturnType<typeof setInterval> | undefined
 
+  const getCurrentSessionID = (): string | null => {
+    try {
+      const cur = (api.route as any)?.current
+      if (cur?.name === "session" && cur?.params?.sessionID) return cur.params.sessionID as string
+      if (cur?.params?.id) return cur.params.id as string
+    } catch {}
+    return null
+  }
+
   const processPending = () => {
-    try { tlog("processPending start", "current", current?.id, "dialogOpen", api.ui.dialog.open) } catch {}
+    const curSid = getCurrentSessionID()
+    if (!curSid) return
+    const current = currentBySession.get(curSid)
     if (current) return
     if (api.ui.dialog.open) return
     let files: string[] = []
     try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".")).sort() } catch { return }
-    if (files.length === 0) return
-    const file = files[0]!
+    // Session-distinct: only show pending for current session
+    const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean) as Array<{f: string, j: any}>
+    const pick = matching.find(x => x.j.sessionID === curSid) || matching.find(x => !x.j.sessionID)
+    if (!pick) return
+    const file = pick.f
     const full = path.join(pendingDir, file)
     let data: Pending | null = null
     try { data = JSON.parse(fs.readFileSync(full, "utf8")) as Pending } catch { try { fs.unlinkSync(full) } catch {}; return }
@@ -634,7 +648,7 @@ export const tui: TuiPlugin = async (api) => {
       } catch {}
       try { fs.unlinkSync(full) } catch {}
       api.ui.dialog.clear()
-      current = null
+      currentBySession.delete(curSid)
       setTimeout(processPending, 150)
     }
     const cancel = async () => {
@@ -657,7 +671,7 @@ export const tui: TuiPlugin = async (api) => {
       } catch {}
       try { fs.unlinkSync(full) } catch {}
       api.ui.dialog.clear()
-      current = null
+      currentBySession.delete(curSidCancel)
       setTimeout(processPending, 150)
     }
     if (data.type === "quiz") { tlog("processPending quiz", data.id); api.ui.dialog.replace(() => <QuizDialog api={api} request={data as QuizPending} onSubmit={done} onCancel={cancel} />) }

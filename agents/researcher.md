@@ -1,7 +1,6 @@
 ---
 description: Web researcher — searches the web and synthesizes findings
 mode: subagent
-model: openrouter/z-ai/glm-5.3
 permission:
   webfetch: allow
   websearch: allow
