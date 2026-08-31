@@ -61,12 +61,33 @@ function QuizDialog(props: {
   const [feedback, setFeedback] = createSignal<{ correct: boolean; selectedIndices: number[] } | null>(null)
 
   let noteInputEl: any
-
+  let scrollRef: any
+  const [canScrollUp, setCanScrollUp] = createSignal(false)
+  const [canScrollDown, setCanScrollDown] = createSignal(false)
+  const updateScrollIndicators = () => {
+    try {
+      if (!scrollRef) { setCanScrollUp(false); setCanScrollDown(false); return }
+      const y = typeof scrollRef.y === "number" ? scrollRef.y : (scrollRef.scrollTop ?? 0)
+      const h = typeof scrollRef.height === "number" ? scrollRef.height : (scrollRef.viewportHeight ?? popupHeight())
+      const sh = typeof scrollRef.scrollHeight === "number" ? scrollRef.scrollHeight : (typeof scrollRef.getScrollHeight === "function" ? scrollRef.getScrollHeight() : 0)
+      // Fallback: if scrollHeight unavailable, estimate from children
+      let effectiveSh = sh
+      if (!effectiveSh && typeof scrollRef.getChildren === "function") {
+        try { const kids = scrollRef.getChildren(); if (kids?.length) effectiveSh = Math.max(...kids.map((c:any)=> (c.y||0)+(c.height||0)), h) } catch {}
+      }
+      if (!effectiveSh || effectiveSh <= h + 1) { setCanScrollUp(false); setCanScrollDown(false); return }
+      setCanScrollUp(y > 0)
+      setCanScrollDown(y + h < effectiveSh - 1)
+    } catch { setCanScrollUp(false); setCanScrollDown(false) }
+  }
   createEffect(() => {
     if (focused() === "note" && noteInputEl) {
       try { noteInputEl.focus() } catch {}
     }
   })
+  // Keep indicators in sync on phase/dims/feedback changes
+  createEffect(() => { phase(); feedback(); dims(); setTimeout(updateScrollIndicators, 40) })
+  createEffect(() => { note(); setTimeout(updateScrollIndicators, 40) })
 
   const toggleOption = (idx: number) => {
     const opt = options()[idx]
@@ -174,8 +195,15 @@ function QuizDialog(props: {
     const key = evt.name || evt.sequence || evt.raw || ""
     const seq = evt.sequence || ""
     if ((phase() as any) === "classifying") { prevent(evt); return }
-    // When in feedback, any Enter/Esc confirms
+    // When in feedback, handle scroll first, then confirm
     if (phase() === "feedback") {
+      const halfPage = () => Math.max(3, Math.floor((scrollRef?.height ?? popupHeight()) / 2))
+      if (key === "d" || key === "D" || seq === "\x04") { prevent(evt); try { scrollRef?.scrollBy(halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
+      if (key === "u" || key === "U" || seq === "\x15") { prevent(evt); try { scrollRef?.scrollBy(-halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
+      if (key === "j" || seq === "\x1b[B") { prevent(evt); try { scrollRef?.scrollBy(2); setTimeout(updateScrollIndicators, 20) } catch {} return }
+      if (key === "k" || seq === "\x1b[A") { prevent(evt); try { scrollRef?.scrollBy(-2); setTimeout(updateScrollIndicators, 20) } catch {} return }
+      if (key === "pageup" || seq === "\x1b[5~") { prevent(evt); try { scrollRef?.scrollBy(-halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
+      if (key === "pagedown" || seq === "\x1b[6~") { prevent(evt); try { scrollRef?.scrollBy(halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
       if (key === "enter" || seq === "\r" || key === "escape" || key === "esc") {
         prevent(evt)
         confirmFeedback()
@@ -239,7 +267,7 @@ function QuizDialog(props: {
           <text fg={theme().background} dim>learn</text>
         </box>
 
-        <scrollbox flexGrow={1}>
+        <scrollbox ref={(el:any)=> scrollRef = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
         {/* Question */}
         <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1}>
           <text fg={theme().text} bold wrapMode="wrap">{props.request.question}</text>
@@ -356,9 +384,13 @@ function QuizDialog(props: {
           </box>
         </Show>
         </scrollbox>
+        <Show when={canScrollUp()}><box justifyContent="center" height={1}><text fg={theme.accent}>▲ more above — u/k to scroll up</text></box></Show>
+        <Show when={canScrollDown()}><box justifyContent="center" height={1}><text fg={theme.warning}>▼ more below — d/j to scroll down</text></box></Show>
         <box height={1} justifyContent="center">
           <text fg={theme().textMuted}>
-            {phase() === "feedback" ? "↵ Enter / Esc to continue  →  next probe" : phase() === "classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
+            {phase() === "feedback"
+              ? (canScrollUp() || canScrollDown() ? "d/u or j/k scroll · Enter to continue  →  next probe" : "↵ Enter / Esc to continue  →  next probe")
+              : phase() === "classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
           </text>
         </box>
       </box>
@@ -396,7 +428,27 @@ function QuizBatchDialog(props: {
   const dontKnowIdx = () => cur().options.length
   const submitIdx = () => isMulti() ? cur().options.length + 1 : -1
   let noteEl: any
+  let scrollRefBatch: any
+  const [canScrollUpBatch, setCanScrollUpBatch] = createSignal(false)
+  const [canScrollDownBatch, setCanScrollDownBatch] = createSignal(false)
+  const updateScrollBatch = () => {
+    try {
+      if (!scrollRefBatch) { setCanScrollUpBatch(false); setCanScrollDownBatch(false); return }
+      const y = typeof scrollRefBatch.y === "number" ? scrollRefBatch.y : (scrollRefBatch.scrollTop ?? 0)
+      const h = typeof scrollRefBatch.height === "number" ? scrollRefBatch.height : (scrollRefBatch.viewportHeight ?? popupHeight())
+      const sh = typeof scrollRefBatch.scrollHeight === "number" ? scrollRefBatch.scrollHeight : (typeof scrollRefBatch.getScrollHeight === "function" ? scrollRefBatch.getScrollHeight() : 0)
+      let effectiveSh = sh
+      if (!effectiveSh && typeof scrollRefBatch.getChildren === "function") {
+        try { const kids = scrollRefBatch.getChildren(); if (kids?.length) effectiveSh = Math.max(...kids.map((c:any)=> (c.y||0)+(c.height||0)), h) } catch {}
+      }
+      if (!effectiveSh || effectiveSh <= h + 1) { setCanScrollUpBatch(false); setCanScrollDownBatch(false); return }
+      setCanScrollUpBatch(y > 0)
+      setCanScrollDownBatch(y + h < effectiveSh - 1)
+    } catch { setCanScrollUpBatch(false); setCanScrollDownBatch(false) }
+  }
   createEffect(() => { if (focused()==="note" && noteEl) try{noteEl.focus()}catch(e){ tlog("note focus failed", String(e)) } })
+  createEffect(() => { phase(); feedback(); dims(); idx(); setTimeout(updateScrollBatch, 40) })
+  createEffect(() => { note(); setTimeout(updateScrollBatch, 40) })
   const toggle = (i:number) => {
     try {
       const o = cur().options[i]; if(!o) return
@@ -494,7 +546,15 @@ function QuizBatchDialog(props: {
     try {
       const k=evt.name||evt.sequence||evt.raw||""; const seq=evt.sequence||""
       if((phase() as any)==="classifying"){ prevent(evt); return }
-      if(phase()==="feedback"){ if(k==="enter"||seq==="\r"||k==="escape"||k==="esc"){ prevent(evt); goNext() } return }
+      if(phase()==="feedback"){
+        const halfBatch = () => Math.max(3, Math.floor((scrollRefBatch?.height ?? popupHeight()) / 2))
+        if (k==="d"||k==="D"||seq==="\x04"){ prevent(evt); try{scrollRefBatch?.scrollBy(halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
+        if (k==="u"||k==="U"||seq==="\x15"){ prevent(evt); try{scrollRefBatch?.scrollBy(-halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
+        if (k==="j"||seq==="\x1b[B"){ prevent(evt); try{scrollRefBatch?.scrollBy(2); setTimeout(updateScrollBatch,20)}catch{} return }
+        if (k==="k"||seq==="\x1b[A"){ prevent(evt); try{scrollRefBatch?.scrollBy(-2); setTimeout(updateScrollBatch,20)}catch{} return }
+        if (k==="pageup"||seq==="\x1b[5~"){ prevent(evt); try{scrollRefBatch?.scrollBy(-halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
+        if (k==="pagedown"||seq==="\x1b[6~"){ prevent(evt); try{scrollRefBatch?.scrollBy(halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
+        if(k==="enter"||seq==="\r"||k==="escape"||k==="esc"){ prevent(evt); goNext() } return }
       if(focused()==="note"){ if(k==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return} if(k==="escape"){prevent(evt); setFocused("options"); return} return }
       if(k==="up"||k==="k"||seq==="\x1b[A"){prevent(evt); setOptionIndex(i=>Math.max(0,i-1)); return}
       if(k==="down"||k==="j"||seq==="\x1b[B"){prevent(evt); setOptionIndex(i=>Math.min(isMulti()?submitIdx():dontKnowIdx(),i+1)); return}
@@ -511,7 +571,7 @@ function QuizBatchDialog(props: {
         <text fg={theme().background} bold> decks.quiz batch  {idx()+1}/{props.request.quizzes.length} {phase()==="feedback"?(feedback()?.correct?"✓":"✗"):""}</text>
         <text fg={theme().background} dim>learn</text>
       </box>
-      <scrollbox flexGrow={1}>
+      <scrollbox ref={(el:any)=> scrollRefBatch = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
       <text fg={theme().text} bold wrapMode="wrap">{cur().question}</text>
       <Show when={cur().details}><text fg={theme().textMuted} wrapMode="wrap">{cur().details}</text></Show>
       <Show when={phase()==="select"}>
@@ -540,9 +600,11 @@ function QuizBatchDialog(props: {
         </box>
       </Show>
       </scrollbox>
+      <Show when={canScrollUpBatch()}><box justifyContent="center" height={1}><text fg={theme.accent}>▲ more above — u/k to scroll up</text></box></Show>
+      <Show when={canScrollDownBatch()}><box justifyContent="center" height={1}><text fg={theme.warning}>▼ more below — d/j to scroll down</text></box></Show>
       <box height={1} justifyContent="center">
         <text fg={theme().textMuted}>
-          {phase()==="feedback" ? `Enter → next (${idx()+1}/${props.request.quizzes.length})` : phase()==="classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
+          {phase()==="feedback" ? (canScrollUpBatch() || canScrollDownBatch() ? `d/u or j/k scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
         </text>
       </box>
     </box>
