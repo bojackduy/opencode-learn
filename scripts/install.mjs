@@ -184,7 +184,7 @@ async function installOrUpdate() {
   const agentsSrc = join(root, "agents")
   const agentsDest = join(config, "agents")
   let agentsCount = 0
-  for (const f of ["researcher.md", "mermaid-maker.md", "svg-maker.md"]) {
+  for (const f of ["researcher.md", "mermaid-maker.md", "svg-maker.md", "classify.md"]) {
     try {
       await copyFile(join(agentsSrc, f), join(agentsDest, f))
       agentsCount++
@@ -216,7 +216,7 @@ async function installOrUpdate() {
 
   console.log(`Installed ${packageName}@${packageVersion} to ${config}`)
   if (changed) console.log(`Updated plugin registration in ${changed} config file(s)`)
-  console.log(`  Agents: ${agentsCount} (researcher, mermaid-maker, svg-maker)`)
+  console.log(`  Agents: ${agentsCount} (researcher, mermaid-maker, svg-maker, classify)`)
   console.log(`  Skills: ${skillsCount} (teach, visualize, marker-pdf-parser, notebooklm-lecture-notes)`)
   if (commandsCount) console.log(`  Commands: ${commandsCount}`)
   console.log(`  Plugin: ${packageName} (server) + ${packageName}/tui (TUI)`)
@@ -230,7 +230,7 @@ async function uninstall() {
   const changed = await configurePlugins(true)
 
   // Remove agents (only those we own)
-  for (const f of ["researcher.md", "mermaid-maker.md", "svg-maker.md"]) {
+  for (const f of ["researcher.md", "mermaid-maker.md", "svg-maker.md", "classify.md"]) {
     try { await rm(join(config, "agents", f), { force: true }) } catch {}
   }
   // Remove skills (including subdirectories like scripts/assets)

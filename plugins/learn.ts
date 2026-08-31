@@ -471,21 +471,22 @@ const server: Plugin = async ({ client, directory }) => {
     }
     return [...new Set(out)]
   }
-  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string): Promise<number[]> {
-    // Try LLM classify via transient opencode session — handles Vietnamese free-text → English options
-    const prompt = `You are a quiz classifier. Map learner's free-text note (may be Vietnamese or English) to the closest option(s). Only pick from given options, no new options.
+  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string }> {
+    const prompt = `Map learner's free-text note (may be Vietnamese or English) to closest option(s) and judge semantic correctness. Only pick from given Options, no new options.
 
 ${question ? `Question: ${question}\n` : ""}Options:
 ${options.map((o, i) => `${i + 1}. ${o.label} (value: ${o.value || o.label})`).join("\n")}
 
 Learner note: "${note}"
 
-Which option(s) does the note best match? Consider Vietnamese translations and synonyms. Return ONLY JSON array of indices, e.g. [1] or [1,3]. If note is vague, empty, or "I don't know", return []. No explanation, just JSON.`
+Task: 1) inferred: which option(s) note best matches (Vietnamese translations/synonyms allowed). 2) semanticCorrect: true if note shows valid understanding or deeper nuance even when inferred != correct key (e.g., note about rotate array variant vs standard sorted is valid nuance). 3) reason: short English reason.
+
+Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If vague/"I don't know", inferred:[], semanticCorrect:false. No markdown, just JSON.`
     try {
-      const created: any = await client.session.create({ body: { title: "classify" } })
+      const created: any = await client.session.create({ body: { title: "classify", agent: "classify" } })
       const sid = created?.data?.id || created?.id || created?.data?.sessionID
       if (!sid) throw new Error("no sid")
-      await client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: prompt }] } })
+      await client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: prompt }], agent: "classify" } })
       // Poll for assistant response up to 12s
       for (let i = 0; i < 24; i++) {
         await new Promise(r => setTimeout(r, 500))
@@ -493,11 +494,23 @@ Which option(s) does the note best match? Consider Vietnamese translations and s
           const msgs: any = await client.session.messages({ path: { id: sid } })
           const data = msgs?.data || msgs
           const arr = Array.isArray(data) ? data : []
-          // Find last assistant message with text
           for (let j = arr.length - 1; j >= 0; j--) {
             const entry = arr[j]
             if (entry?.info?.role === "assistant") {
               const text = (entry.parts || []).filter((p: any) => p.type === "text").map((p: any) => p.text).join(" ") || ""
+              // Try object JSON {"inferred":[2],"semanticCorrect":false}
+              const objMatch = text.match(/\{[^}]*"inferred"[^}]*\}/)
+              if (objMatch) {
+                try {
+                  const parsed = JSON.parse(objMatch[0])
+                  if (parsed && Array.isArray(parsed.inferred)) {
+                    const nums = parsed.inferred.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
+                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `semantic:${parsed.semanticCorrect}`)
+                    try { await client.session.delete?.({ path: { id: sid } }) } catch {}
+                    return { inferred: nums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason }
+                  }
+                } catch {}
+              }
               const m = text.match(/\[[\s\d,]*\]/)
               if (m) {
                 try {
@@ -505,19 +518,16 @@ Which option(s) does the note best match? Consider Vietnamese translations and s
                   if (Array.isArray(parsed)) {
                     const nums = parsed.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     if (nums.length) {
-                      slog("llmClassify success", note.slice(0, 40), nums.join(","))
-                      // Cleanup temp session async
+                      slog("llmClassify success array", note.slice(0, 40), nums.join(","))
                       try { await client.session.delete?.({ path: { id: sid } }) } catch {}
-                      return nums
+                      return { inferred: nums }
                     }
                   }
                 } catch {}
               }
-              // If assistant responded but no JSON, try fallback: look for numbers in text
               if (text.includes("1") || text.includes("2")) {
-                // Fallback: extract numbers 1..n
                 const nums = [...text.matchAll(/\b([1-9])\b/g)].map(x => parseInt(x[1])).filter(n => n <= options.length)
-                if (nums.length) return [...new Set(nums)]
+                if (nums.length) return { inferred: [...new Set(nums)] }
               }
             }
           }
@@ -527,7 +537,7 @@ Which option(s) does the note best match? Consider Vietnamese translations and s
     } catch (e) {
       slog("llmClassify failed", String(e).slice(0, 200))
     }
-    return []
+    return { inferred: [] }
   }
   function startClassifyWatcher(client: any, directory: string) {
     const dir = pendingDir(directory)
@@ -544,12 +554,15 @@ Which option(s) does the note best match? Consider Vietnamese translations and s
       slog("classify watcher processing", data.id, data.note.slice(0, 80))
       const byVal = new Map<string, number>(data.options.map((o: any, i: number) => [o.value, i + 1] as [string, number]))
       const start = Date.now()
-      // Always try LLM for semantic (Vietnamese free-text → English options) — heuristic as fallback
       let inferred: number[] = []
-      const llm = await llmClassify(client, directory, data.note, data.options, data.question)
-      if (llm.length) {
-        inferred = llm
-        slog("classify llm hit", data.id, llm.join(","))
+      let semanticCorrect: boolean | undefined
+      let reason: string | undefined
+      const llmRes = await llmClassify(client, directory, data.note, data.options, data.question)
+      if (llmRes.inferred.length) {
+        inferred = llmRes.inferred
+        semanticCorrect = llmRes.semanticCorrect
+        reason = llmRes.reason
+        slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect}`)
       } else {
         inferred = heuristicClassify(data.note, data.options)
         if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","))
@@ -559,6 +572,7 @@ Which option(s) does the note best match? Consider Vietnamese translations and s
       const elapsed = Date.now() - start
       if (elapsed < 1200) await new Promise(r => setTimeout(r, 1200 - elapsed))
       const inferredValues = inferred.map((i: number) => data.options[i - 1]?.value).filter(Boolean) as string[]
+      // Final fallback if still empty
       if (!inferred.length && data.note) {
         const n = data.note.toLowerCase()
         for (const o of data.options) {
@@ -569,8 +583,8 @@ Which option(s) does the note best match? Consider Vietnamese translations and s
           }
         }
       }
-      slog("classify inferred", data.id, inferred.join(",") || "(none)", `note:"${data.note.slice(0, 60)}"`)
-      const out = { id: data.id, inferredIndices: inferred, inferredValues, note: data.note, at: Date.now() }
+      slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} note:"${data.note.slice(0, 60)}"`)
+      const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, note: data.note, at: Date.now() }
       try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8"); slog("classify response written", data.id, inferred.join(",")) } catch {}
     }
     // Initial sweep
@@ -644,7 +658,7 @@ Which option(s) does the note best match? Consider Vietnamese translations and s
     config: async (output) => {
       const agents = (output as any).agent ?? {}
       let mutated = false
-      for (const name of ["researcher", "mermaid-maker", "svg-maker"]) {
+      for (const name of ["researcher", "mermaid-maker", "svg-maker", "classify"]) {
         if (!agents[name]) {
           // Minimal placeholder — real agent definitions live in .opencode/agents/*.md
           // We inject a lightweight config so `task` tool can discover them even if md file is missing.

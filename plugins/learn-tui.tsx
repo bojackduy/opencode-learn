@@ -110,6 +110,12 @@ function QuizDialog(props: {
               try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${props.request.id}.json`)) } catch {}
               const inferred = data?.inferredIndices as number[] | undefined
               const inferredValues = data?.inferredValues as string[] | undefined
+              const semanticCorrect = data?.semanticCorrect as boolean | undefined
+              const reason = data?.reason as string | undefined
+              const computeCorrect = (idxs: number[]) => {
+                if (typeof semanticCorrect === "boolean") return semanticCorrect
+                return idxs.length === props.request.correctIndices.length && idxs.every((v: number) => correctSet.has(v)) && props.request.correctIndices.every((v: number) => idxs.includes(v))
+              }
               if (inferred && inferred.length) {
                 const m = new Map<string, { label: string; value: string; index: number }>()
                 for (let i = 0; i < inferred.length; i++) {
@@ -118,20 +124,22 @@ function QuizDialog(props: {
                   if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx })
                 }
                 setSelected(m)
-                const correct = inferred.length === props.request.correctIndices.length && inferred.every((v: number) => correctSet.has(v)) && props.request.correctIndices.every((v: number) => inferred.includes(v))
+                const correct = computeCorrect(inferred)
                 setFeedback({ correct, selectedIndices: inferred })
-                tlog("QuizDialog classify done", inferred.join(","), correct)
+                if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
+                tlog("QuizDialog classify done", inferred.join(","), correct, reason || "")
               } else if (inferredValues && inferredValues.length) {
-                // Fallback via values
                 const byVal = new Map(options().map((o, i) => [o.value, i + 1]))
                 const idxs = inferredValues.map(v => byVal.get(v)).filter(Boolean) as number[]
                 const m = new Map<string, { label: string; value: string; index: number }>()
                 for (const idx of idxs) { const opt = options()[idx - 1]; if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
                 setSelected(m)
-                const correct = idxs.length === props.request.correctIndices.length && idxs.every(v => correctSet.has(v)) && props.request.correctIndices.every(v => idxs.includes(v))
+                const correct = computeCorrect(idxs)
                 setFeedback({ correct, selectedIndices: idxs })
               } else {
-                setFeedback({ correct: false, selectedIndices: [] })
+                const correct = typeof semanticCorrect === "boolean" ? semanticCorrect : false
+                setFeedback({ correct, selectedIndices: [] })
+                if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
               }
               setPhase("feedback")
             }
@@ -433,16 +441,25 @@ function QuizBatchDialog(props: {
                 const data: any = JSON.parse(raw)
                 try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${cid}.json`)) } catch {}
                 const inferred = data?.inferredIndices as number[] | undefined
+                const semanticCorrect = data?.semanticCorrect as boolean | undefined
+                const reason = data?.reason as string | undefined
+                const computeOk2 = (idxs: number[]) => {
+                  if (typeof semanticCorrect === "boolean") return semanticCorrect
+                  const correctSet2 = new Set(cur().correctIndices)
+                  return idxs.length === cur().correctIndices.length && idxs.every(v => correctSet2.has(v)) && cur().correctIndices.every(v => idxs.includes(v))
+                }
                 if (inferred && inferred.length) {
                   const mm = new Map<string, any>()
                   for (const idx of inferred) { const opt = cur().options[idx - 1]; if (opt) mm.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
                   setSelected(mm)
-                  const correctSet2 = new Set(cur().correctIndices)
-                  const ok2 = inferred.length === cur().correctIndices.length && inferred.every(v => correctSet2.has(v)) && cur().correctIndices.every(v => inferred.includes(v))
+                  const ok2 = computeOk2(inferred)
                   setFeedback({ correct: ok2, selectedIndices: inferred })
-                  tlog("QuizBatchDialog classify done", inferred.join(","), ok2)
+                  if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
+                  tlog("QuizBatchDialog classify done", inferred.join(","), ok2, reason || "")
                 } else {
-                  setFeedback({ correct: false, selectedIndices: [] })
+                  const ok2 = typeof semanticCorrect === "boolean" ? semanticCorrect : false
+                  setFeedback({ correct: ok2, selectedIndices: [] })
+                  if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
                 }
                 setPhase("feedback")
               }
