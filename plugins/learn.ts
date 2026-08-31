@@ -125,6 +125,15 @@ function resolveCorrect(correctAnswer: string | string[] | undefined, options: A
   return { indices: Array.from(new Set(indices)).sort((a, b) => a - b) as number[] }
 }
 
+function decodeQuizText(s: string | undefined): string | undefined {
+  if (!s || typeof s !== "string") return s
+  if (!s.includes("\\")) return s
+  let out = s.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\t/g, "\t")
+  out = out.replace(/\\"/g, '"').replace(/\\'/g, "'")
+  out = out.replace(/\\\\/g, "\\")
+  return out
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // md-log helpers (ported from .pi/extensions/md-log.ts)
 // ────────────────────────────────────────────────────────────────────────────
@@ -788,8 +797,14 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
           shuffle: tool.schema.boolean().optional().describe("Default true: shuffle before display. False only if order matters."),
         },
         async execute(args, ctx) {
+          // Fix double-escaped \n coming from LLM JSON (e.g. "\\n" literal instead of newline)
+          const qFixed = (decodeQuizText(args.question) ?? args.question) as string
+          const dFixed = decodeQuizText(args.details) as string | undefined
+          const eFixed = (decodeQuizText(args.explanation) ?? args.explanation) as string
+          // Also decode option labels in case they contain code
+          const optsDecoded = (args.options as any[] | undefined)?.map((o: any) => ({ ...o, label: decodeQuizText(o.label) ?? o.label, description: o.description ? decodeQuizText(o.description) : o.description })) as any
           let options: Array<{ label: string; value: string; description?: string }>
-          try { options = normalizeQuizOptions(args.options as any) } catch (e) { return `quiz error: ${(e as Error).message}` }
+          try { options = normalizeQuizOptions(optsDecoded) } catch (e) { return `quiz error: ${(e as Error).message}` }
           if (args.shuffle !== false) options = shuffleOptions(options)
           const { indices: correctIndices, error: correctError } = resolveCorrect(args.correctAnswer as any, options)
           if (correctError) return `quiz error: ${correctError}`
@@ -808,17 +823,17 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
           const payload = {
             id,
             type: "quiz" as const,
-            question: args.question,
-            details: args.details,
+            question: qFixed,
+            details: dFixed,
             options: options.map((o, i) => ({ label: o.label, value: o.value, description: o.description, index: i + 1 })),
             correctIndices,
-            explanation: args.explanation,
+            explanation: eFixed,
             multiSelect: !!args.multiSelect,
             sessionID: (ctx as any).sessionID,
             timestamp: Date.now(),
           }
           try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8"); slog("quiz wrote durably", pendingPath, "alive", tuiAlive) } catch (e) { slog("quiz write failed", String(e)) }
-          try { await (ctx as any).metadata?.({ title: `Quiz: ${args.question.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
+          try { await (ctx as any).metadata?.({ title: `Quiz: ${qFixed.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
           watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
               const dk = !!r?.dontKnow
               const sel = (r?.answers || []).map((a: any) => `${a.index}. ${a.label}`).join(", ") || "(none)"
@@ -832,19 +847,19 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                   answers: r?.answers || [],
                   correct: ok,
                   correctIndices,
-                  explanation: args.explanation,
+                  explanation: eFixed,
                   dontKnow: dk,
                   note: r?.note,
                 }
                 void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
               }
               return dk
-                ? `[quiz answered] "${args.question}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
-                : `[quiz answered] "${args.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${args.explanation}${note}`
+                ? `[quiz answered] "${qFixed}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}`
+                : `[quiz answered] "${qFixed}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}`
             })
           // Always mirror question with TRUE shuffled order (pi: tool_execution_update)
           if (mdLogFile) {
-            try { await withMdLock(() => appendToMdLog(questionCallout("Quiz", args.question, args.details?.trim() || undefined, options.map((o) => ({ label: o.label }))))) } catch {}
+            try { await withMdLock(() => appendToMdLog(questionCallout("Quiz", qFixed, dFixed?.trim() || undefined, options.map((o) => ({ label: o.label }))))) } catch {}
           }
           if (tuiAlive) {
             return `[quiz displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
@@ -863,8 +878,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
             if (raw === null) return "User cancelled the quiz"
             const trimmed = (raw as string).trim()
             if (trimmed === "0" || trimmed.toLowerCase() === "i don't know") {
-              const msg = `User selected "I don't know" — genuine gap, not a guess.\nCorrect: ${correctStr}\nExplanation: ${args.explanation}`
-              if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Quiz — I don't know", [args.question, trimmed, `Correct: ${correctStr}`, args.explanation])))
+              const msg = `User selected "I don't know" — genuine gap, not a guess.\nCorrect: ${correctStr}\nExplanation: ${eFixed}`
+              if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Quiz — I don't know", [qFixed, trimmed, `Correct: ${correctStr}`, eFixed])))
               return msg
             }
             const nums = trimmed.split(/[,\s]+/).map(s => parseInt(s, 10)).filter(n => !isNaN(n) && n >= 1 && n <= options.length)
@@ -873,28 +888,28 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
             const correct = selectedSet.size === correctSet.size && [...selectedSet].every(n => correctSet.has(n))
             const selectedStr = nums.map(n => `${n}. ${options[n - 1].label}`).join(", ") || "(none)"
             const verdict = correct ? "correctly" : "incorrectly"
-            const result = `User answered ${verdict}.\nSelected: ${selectedStr}\nCorrect: ${correctStr}\nExplanation: ${args.explanation}`
-              ;(ctx as any).metadata?.({ title: correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", metadata: { correct, correctIndices, explanation: args.explanation } })
-            if (mdLogFile) await withMdLock(() => appendToMdLog(callout(correct ? "success" : "failure", correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", [`Q: ${args.question}`, `Selected: ${selectedStr}`, `Correct: ${correctStr}`, args.explanation])))
+            const result = `User answered ${verdict}.\nSelected: ${selectedStr}\nCorrect: ${correctStr}\nExplanation: ${eFixed}`
+              ;(ctx as any).metadata?.({ title: correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", metadata: { correct, correctIndices, explanation: eFixed } })
+            if (mdLogFile) await withMdLock(() => appendToMdLog(callout(correct ? "success" : "failure", correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", [`Q: ${qFixed}`, `Selected: ${selectedStr}`, `Correct: ${correctStr}`, eFixed])))
             return result
           }
           const instruction = [
             `[quiz ready — awaiting user answer via \`question\` tool]`,
-            `Question: ${args.question}`,
-            args.details ? `Details: ${args.details}` : null,
+            `Question: ${qFixed}`,
+            dFixed ? `Details: ${dFixed}` : null,
             `Options (display order, already shuffled):`,
             ...options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""} (value="${o.value}")`),
             `Correct indices: ${correctIndices.join(", ")} (Correct values: ${correctStr})`,
-            `Explanation (reveal AFTER answer): ${args.explanation}`,
+            `Explanation (reveal AFTER answer): ${eFixed}`,
             `Mode: ${args.multiSelect ? "multi-select (exact set)" : "single-select"}`,
             ``,
             `INSTRUCTION FOR LLM: Call the built-in \`question\` tool with:`,
             `  header: "Quiz"`,
-            `  question: "${args.question.replace(/"/g, '\\"')}"`,
+            `  question: "${qFixed.replace(/"/g, '\\"')}"`,
             `  options: [${options.map(o => `{label:"${o.label.replace(/"/g, '\\"')}", description:"${(o.description ?? "").replace(/"/g, '\\"')}"}`).join(", ")}]`,
             `Then compare the user's selected labels to correct indices [${correctIndices.join(", ")}]. Grade as ${args.multiSelect ? "exact-set match" : "single match"}, show ✓/✗, reveal Correct: ${correctStr}, and Explanation. An 'I don't know' maps to dontKnow (genuine gap).`,
           ].filter(Boolean).join("\n")
-            ;(ctx as any).metadata?.({ title: `Quiz: ${args.question.slice(0, 40)}`, metadata: { correctIndices, explanation: args.explanation, options: options.map((o, i) => ({ index: i + 1, label: o.label })) } })
+            ;(ctx as any).metadata?.({ title: `Quiz: ${qFixed.slice(0, 40)}`, metadata: { correctIndices, explanation: eFixed, options: options.map((o, i) => ({ index: i + 1, label: o.label })) } })
           return instruction
         },
       }),
@@ -924,13 +939,17 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
           slog("quiz_batch isAlive", isAlive)
           const normalized: any[] = []
           for (const q of (args.quizzes as any[])) {
+            const qFixed = (decodeQuizText(q.question) ?? q.question) as string
+            const dFixed = decodeQuizText(q.details) as string | undefined
+            const eFixed = (decodeQuizText(q.explanation) ?? q.explanation) as string
+            const optsDecoded = (q.options as any[] | undefined)?.map((o: any) => ({ ...o, label: decodeQuizText(o.label) ?? o.label, description: o.description ? decodeQuizText(o.description) : o.description })) as any
             let opts: any
-            try { opts = normalizeQuizOptions(q.options) } catch (e) { slog("quiz_batch normalize error", (e as Error).message); return `quiz_batch error: ${(e as Error).message} in "${q.question}"` }
+            try { opts = normalizeQuizOptions(optsDecoded) } catch (e) { slog("quiz_batch normalize error", (e as Error).message); return `quiz_batch error: ${(e as Error).message} in "${qFixed}"` }
             if (q.shuffle !== false) opts = shuffleOptions(opts)
             const { indices, error } = resolveCorrect(q.correctAnswer as any, opts)
-            if (error) { slog("quiz_batch resolveCorrect error", error); return `quiz_batch error: ${error} in "${q.question}"` }
-            if (opts.length < 2) return `quiz_batch error: need 2+ options in "${q.question}"`
-            normalized.push({ question: q.question, details: q.details, options: opts, correctIndices: indices, explanation: q.explanation, multiSelect: !!q.multiSelect })
+            if (error) { slog("quiz_batch resolveCorrect error", error); return `quiz_batch error: ${error} in "${qFixed}"` }
+            if (opts.length < 2) return `quiz_batch error: need 2+ options in "${qFixed}"`
+            normalized.push({ question: qFixed, details: dFixed, options: opts, correctIndices: indices, explanation: eFixed, multiSelect: !!q.multiSelect })
           }
           slog("quiz_batch normalized", normalized.length)
           try { fs.mkdirSync(pendingDirPath, { recursive: true }) } catch {}

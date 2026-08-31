@@ -12,6 +12,19 @@ import { tmpdir } from "node:os"
 const TUI_LOG = path.join(tmpdir(), "learn-tui.log")
 function tlog(...a: any[]) { try { fs.appendFileSync(TUI_LOG, `[${new Date().toISOString()}] ${a.map(x=> typeof x==="string"? x : JSON.stringify(x)).join(" ")}\n`) } catch {} }
 function ensureDir(dir: string) { try { fs.mkdirSync(dir, { recursive: true }) } catch {} }
+function decodeQuizText(s: string): string {
+  if (!s || typeof s !== "string") return s
+  if (!s.includes("\\")) return s
+  // Convert literal \n / \r\n / \t escapes to real whitespace. Handles both single and double-escaped payloads (e.g. file contains \\n after JSON round-trip).
+  // Only touches backslash sequences, leaves actual newlines intact.
+  let out = s.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\r/g, "\r").replace(/\\t/g, "\t")
+  // Decode escaped quotes/backslashes that may survive double-escaping: \" -> ", \' -> ', \\ -> \
+  // Do this after newline handling to avoid re-introducing \n.
+  out = out.replace(/\\"/g, '"').replace(/\\'/g, "'")
+  // Collapse double-escaped backslashes that are not part of \n already handled
+  out = out.replace(/\\\\/g, "\\")
+  return out
+}
 
 type QuizPending = {
   id: string
@@ -288,9 +301,9 @@ function QuizDialog(props: {
         <scrollbox ref={(el:any)=> scrollRef = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
         {/* Question */}
         <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1}>
-          <text fg={theme().text} bold wrapMode="wrap">{props.request.question}</text>
+          <text fg={theme().text} bold wrapMode="wrap">{decodeQuizText(props.request.question)}</text>
           <Show when={props.request.details}>
-            <text fg={theme().textMuted} wrapMode="wrap">{props.request.details}</text>
+            <text fg={theme().textMuted} wrapMode="wrap">{decodeQuizText(props.request.details)}</text>
           </Show>
         </box>
 
@@ -396,7 +409,7 @@ function QuizDialog(props: {
             <text fg={theme().textMuted}>Correct: {props.request.correctIndices.map(i => `${i}. ${options()[i-1]?.label}`).join(", ")}</text>
             <Show when={note()}><text fg={theme().textMuted}>Your note: {note()}</text></Show>
             <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}>
-              <text fg={theme().text} wrapMode="wrap">{props.request.explanation}</text>
+              <text fg={theme().text} wrapMode="wrap">{decodeQuizText(props.request.explanation)}</text>
             </box>
           </box>
         </Show>
@@ -601,8 +614,8 @@ function QuizBatchDialog(props: {
         <text fg={theme().background} dim>learn</text>
       </box>
       <scrollbox ref={(el:any)=> scrollRefBatch = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
-      <text fg={theme().text} bold wrapMode="wrap">{cur().question}</text>
-      <Show when={cur().details}><text fg={theme().textMuted} wrapMode="wrap">{cur().details}</text></Show>
+      <text fg={theme().text} bold wrapMode="wrap">{decodeQuizText(cur().question)}</text>
+      <Show when={cur().details}><text fg={theme().textMuted} wrapMode="wrap">{decodeQuizText(cur().details)}</text></Show>
       <Show when={phase()==="select"}>
         <box flexDirection="column" gap={0} padding={1} border={true} borderColor={theme().borderSubtle} backgroundColor={theme().background}>
           <For each={cur().options}>{(opt:any,i:any)=>{const id=i(); const foc=()=>focused()==="options"&&optionIndex()===id; const sel=()=>selected().has(`opt:${id}`); return <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={foc()?theme().backgroundElement:undefined}><box width={2}><text fg={foc()?theme().accent:theme().textMuted}>{foc()?"▸":" "}</text></box><box width={2}><text fg={isMulti()?(sel()?theme().success:theme().textMuted):(sel()?theme().accent:theme().textMuted)}>{isMulti()?(sel()?"☑":"☐"):(sel()?"⬢":"○")}</text></box><box flexGrow={1}><text fg={sel()?theme().text:theme().textMuted} bold={foc()} wrapMode="wrap">{id+1}. {opt.label}</text></box></box>}}</For>
@@ -625,7 +638,7 @@ function QuizBatchDialog(props: {
           <For each={cur().options}>{(opt:any,i:any)=>{const id=i()+1; const sel=()=>feedback()?.selectedIndices.includes(id)??false; const ok=()=>new Set(cur().correctIndices).has(id); let ic=" "; let fg=theme().textMuted; let bg:any=undefined; if(dontKnow()){ic=ok()?"✓":" "; fg=ok()?theme().background:theme().textMuted; bg=ok()?theme().success:undefined} else if(sel()&&ok()){ic="✓"; fg=theme().background; bg=theme().success} else if(sel()&&!ok()){ic="✗"; fg=theme().background; bg=theme().error} else if(!sel()&&ok()){ic="○"; fg=theme().background; bg=theme().warning} return <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={bg}><box width={2}><text fg={fg} bold>{ic}</text></box><box flexGrow={1}><text fg={fg} wrapMode="wrap">{id}. {opt.label}</text></box></box>}}</For>
           <text fg={feedback()?.correct?theme().success:theme().error} bold>{feedback()?.correct?"✓ Correct":"✗ Incorrect"}</text>
           <text fg={theme().textMuted}>Correct: {cur().correctIndices.map((i:number)=>`${i}. ${cur().options[i-1]?.label}`).join(", ")}</text>
-          <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><text fg={theme().text} wrapMode="wrap">{cur().explanation}</text></box>
+          <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><text fg={theme().text} wrapMode="wrap">{decodeQuizText(cur().explanation)}</text></box>
         </box>
       </Show>
       </scrollbox>
