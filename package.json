@@ -30,7 +30,7 @@
     "opentui"
   ],
   "bin": {
-    "opencode-learn": "./scripts/install.mjs"
+    "opencode-learn": "scripts/install.mjs"
   },
   "files": [
     "dist",
