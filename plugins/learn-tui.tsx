@@ -89,7 +89,7 @@ function QuizDialog(props: {
   createEffect(() => { phase(); feedback(); dims(); setTimeout(updateScrollIndicators, 40); setTimeout(updateScrollIndicators, 200) })
   createEffect(() => { note(); setTimeout(updateScrollIndicators, 40) })
   createEffect(() => {
-    if (phase() !== "feedback") return
+    if (phase() !== "feedback" && phase() !== "select") return
     const id = setInterval(updateScrollIndicators, 200)
     onCleanup(() => clearInterval(id))
   })
@@ -231,6 +231,11 @@ function QuizDialog(props: {
       // Allow typing to go to input; don't prevent
       return
     }
+    // d/u scroll works in both select and feedback — page scroll even before answer
+    if (phase() === "select" && (isPlainKey(evt,"d") || seq === "\x04")) { prevent(evt); try { scrollRef?.scrollBy(scrollAmount()); setTimeout(updateScrollIndicators,30); setTimeout(updateScrollIndicators,120) } catch {} return }
+    if (phase() === "select" && (isPlainKey(evt,"u") || seq === "\x15")) { prevent(evt); try { scrollRef?.scrollBy(-scrollAmount()); setTimeout(updateScrollIndicators,30); setTimeout(updateScrollIndicators,120) } catch {} return }
+    if (phase() === "select" && (lower === "pageup" || seq === "\x1b[5~")) { prevent(evt); try { scrollRef?.scrollBy(-scrollAmount()); setTimeout(updateScrollIndicators,30) } catch {} return }
+    if (phase() === "select" && (lower === "pagedown" || seq === "\x1b[6~")) { prevent(evt); try { scrollRef?.scrollBy(scrollAmount()); setTimeout(updateScrollIndicators,30) } catch {} return }
     // Options focused — extra Submit for single note-only at dontKnowIdx+1
     const maxIdx = () => {
       if (isMulti()) return submitIdx()
@@ -334,9 +339,8 @@ function QuizDialog(props: {
             </box>
 
             <box flexDirection="row" justifyContent="space-between" paddingTop={1}>
-              <text fg={theme().textMuted}>{focused() === "note" ? "Enter submit note → classify · Tab back · Esc back" : "↑↓/j k  ·  Space toggle  ·  ↓ to Submit → Enter  ·  Tab note  ·  Esc cancel"}</text>
-              <Show when={isMulti()}><text fg={selected().size > 0 || dontKnow() ? theme().success : note().trim() ? theme().warning : theme().warning}>{selected().size > 0 ? `${selected().size} selected` : note().trim() ? "note → classify" : "0 selected"} {dontKnow() ? "· I don't know" : ""}</text></Show>
-              <Show when={!isMulti() && note().trim() && !selected().size && !dontKnow()}><text fg={theme().warning}>note → classify on Enter</text></Show>
+              <text fg={theme().textMuted}>{isMulti() ? `${selected().size} selected${dontKnow() ? " · I don't know" : ""}` : note().trim() && !selected().size && !dontKnow() ? "note → classify" : dontKnow() ? "I don't know" : ""}</text>
+              <text fg={theme().textMuted}>{focused() === "note" ? "Tab/Esc back" : ""}</text>
             </box>
             <Show when={isMulti()}>
               <box justifyContent="center" paddingTop={1}>
@@ -398,13 +402,16 @@ function QuizDialog(props: {
         </Show>
         </scrollbox>
         <box height={1} justifyContent="center">
-          <text fg={theme().textMuted}>
+          <text fg={theme().textMuted} wrapMode="wrap">
             {phase() === "feedback"
               ? (canScrollUp() && canScrollDown() ? "▲ more above · ▼ more below — d/u to scroll · Enter to continue"
                 : canScrollDown() ? "▼ more below — d to scroll · Enter to continue"
                 : canScrollUp() ? "▲ more above — u to scroll · Enter to continue"
                 : "↵ Enter / Esc to continue  →  next probe")
-              : phase() === "classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
+              : phase() === "classifying" ? "Classifying your note..."
+              : focused() === "note" ? "Enter submit note → classify · Tab/Esc back"
+              : (canScrollUp() || canScrollDown()) ? "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel · d/u scroll"
+              : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
           </text>
         </box>
       </box>
@@ -465,7 +472,7 @@ function QuizBatchDialog(props: {
   createEffect(() => { phase(); feedback(); dims(); idx(); setTimeout(updateScrollBatch, 40); setTimeout(updateScrollBatch, 200) })
   createEffect(() => { note(); setTimeout(updateScrollBatch, 40) })
   createEffect(() => {
-    if (phase() !== "feedback") return
+    if (phase() !== "feedback" && phase() !== "select") return
     const id = setInterval(updateScrollBatch, 200)
     onCleanup(() => clearInterval(id))
   })
@@ -576,6 +583,8 @@ function QuizBatchDialog(props: {
         if (lower==="pagedown"||seq==="\x1b[6~"){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30)}catch{} return }
         if(lower==="enter"||seq==="\r"||lower==="escape"||lower==="esc"){ prevent(evt); goNext() } return }
       if(focused()==="note"){ if(k==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return} if(k==="escape"){prevent(evt); setFocused("options"); return} return }
+      if(phase()==="select" && (isPlainKeyBatch(evt,"d")||seq==="\x04")){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
+      if(phase()==="select" && (isPlainKeyBatch(evt,"u")||seq==="\x15")){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
       if(k==="up"||k==="k"||seq==="\x1b[A"){prevent(evt); setOptionIndex(i=>Math.max(0,i-1)); return}
       if(k==="down"||k==="j"||seq==="\x1b[B"){prevent(evt); setOptionIndex(i=>Math.min(isMulti()?submitIdx():dontKnowIdx(),i+1)); return}
       if(k==="tab"||seq==="\t"){prevent(evt); setFocused("note"); return}
@@ -600,7 +609,7 @@ function QuizBatchDialog(props: {
           <box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(20,popupWidth()-8))}</text></box>
           <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().backgroundElement:undefined}><box width={2}><text fg={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===dontKnowIdx()?"▸":" "}</text></box><box width={2}><text fg={dontKnow()?theme().warning:theme().textMuted}>{dontKnow()?"☑":"☐"}</text></box><box flexGrow={1}><text fg={dontKnow()?theme().warning:theme().textMuted} italic>I don't know</text></box></box>
           <box flexDirection="column" paddingTop={1}><text fg={focused()==="note"?theme().accent:theme().textMuted}>✎ Note</text><box border={true} borderColor={focused()==="note"?theme().accent:theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}><Show when={focused()==="note"} fallback={<text fg={theme().textMuted}>{note()||"Tab to edit · share what you were thinking"}</text>}><input ref={(el:any)=>noteEl=el} value={note()} onInput={(v:any)=>setNote(typeof v==="string"?v:v?.target?.value??"")} onSubmit={()=>{ if (!selected().size && !dontKnow() && note().trim()) submitSelect(); else setFocused("options") }} placeholder="note (Enter to submit note → classify)" /></Show></box></box>
-          <box flexDirection="row" justifyContent="space-between" paddingTop={1}><text fg={theme().textMuted}>{focused()==="note" ? "Enter submit note → classify · Tab back · Esc back" : "Space toggle · ↓ to Submit → Enter · Tab note · Ctrl+Enter submit"}</text><text fg={theme().textMuted}>{idx()+1}/{props.request.quizzes.length}</text></box>
+          <box flexDirection="row" justifyContent="space-between" paddingTop={1}><text fg={theme().textMuted}>{isMulti() ? `${selected().size} selected` : note().trim() && !selected().size ? "note → classify" : ""}</text><text fg={theme().textMuted}>{idx()+1}/{props.request.quizzes.length}</text></box>
           <Show when={isMulti()}><box justifyContent="center" paddingTop={1}><box flexDirection="row" gap={1} border={true} borderColor={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().borderSubtle} backgroundColor={focused()==="options"&&optionIndex()===submitIdx()?theme().backgroundElement:theme().background} paddingLeft={2} paddingRight={2}><text fg={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===submitIdx()?"▸":" "}</text><text bold>↳ Submit</text></box></box></Show>
         </box>
       </Show>
@@ -621,8 +630,8 @@ function QuizBatchDialog(props: {
       </Show>
       </scrollbox>
       <box height={1} justifyContent="center">
-        <text fg={theme().textMuted}>
-          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? `▲ more above · ▼ more below — d/u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollDownBatch() ? `▼ more below — d to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollUpBatch() ? `▲ more above — u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
+        <text fg={theme().textMuted} wrapMode="wrap">
+          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? `▲ more above · ▼ more below — d/u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollDownBatch() ? `▼ more below — d to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollUpBatch() ? `▲ more above — u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : focused()==="note" ? "Enter submit note → classify · Tab/Esc back" : (canScrollUpBatch() || canScrollDownBatch()) ? "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel · d/u scroll" : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
         </text>
       </box>
     </box>
