@@ -67,27 +67,32 @@ function QuizDialog(props: {
   const updateScrollIndicators = () => {
     try {
       if (!scrollRef) { setCanScrollUp(false); setCanScrollDown(false); return }
-      const y = typeof scrollRef.y === "number" ? scrollRef.y : (scrollRef.scrollTop ?? 0)
+      const st = typeof scrollRef.scrollTop === "number" ? scrollRef.scrollTop : 0
       const h = typeof scrollRef.height === "number" ? scrollRef.height : (scrollRef.viewportHeight ?? popupHeight())
-      const sh = typeof scrollRef.scrollHeight === "number" ? scrollRef.scrollHeight : (typeof scrollRef.getScrollHeight === "function" ? scrollRef.getScrollHeight() : 0)
-      // Fallback: if scrollHeight unavailable, estimate from children
+      const sh = typeof scrollRef.scrollHeight === "number" ? scrollRef.scrollHeight : 0
       let effectiveSh = sh
       if (!effectiveSh && typeof scrollRef.getChildren === "function") {
         try { const kids = scrollRef.getChildren(); if (kids?.length) effectiveSh = Math.max(...kids.map((c:any)=> (c.y||0)+(c.height||0)), h) } catch {}
       }
       if (!effectiveSh || effectiveSh <= h + 1) { setCanScrollUp(false); setCanScrollDown(false); return }
-      setCanScrollUp(y > 0)
-      setCanScrollDown(y + h < effectiveSh - 1)
+      setCanScrollUp(st > 0)
+      setCanScrollDown(st + h < effectiveSh - 1)
     } catch { setCanScrollUp(false); setCanScrollDown(false) }
   }
+  const scrollAmount = () => Math.max(1, Math.floor((scrollRef?.height ?? popupHeight()) / 3))
   createEffect(() => {
     if (focused() === "note" && noteInputEl) {
       try { noteInputEl.focus() } catch {}
     }
   })
   // Keep indicators in sync on phase/dims/feedback changes
-  createEffect(() => { phase(); feedback(); dims(); setTimeout(updateScrollIndicators, 40) })
+  createEffect(() => { phase(); feedback(); dims(); setTimeout(updateScrollIndicators, 40); setTimeout(updateScrollIndicators, 200) })
   createEffect(() => { note(); setTimeout(updateScrollIndicators, 40) })
+  createEffect(() => {
+    if (phase() !== "feedback") return
+    const id = setInterval(updateScrollIndicators, 200)
+    onCleanup(() => clearInterval(id))
+  })
 
   const toggleOption = (idx: number) => {
     const opt = options()[idx]
@@ -191,20 +196,28 @@ function QuizDialog(props: {
     props.onSubmit({ answers: dontKnow() ? [] : sel, dontKnow: dontKnow(), note: note().trim() || undefined })
   }
 
+  const isPlainKey = (evt:any, want:string) => {
+    try {
+      const n = String(evt.name||evt.sequence||"").toLowerCase()
+      if (n !== want.toLowerCase()) return false
+      if (evt.ctrl || evt.meta || evt.option || evt.alt) return false
+      return true
+    } catch { return false }
+  }
   useKeyboard((evt: any) => {
     const key = evt.name || evt.sequence || evt.raw || ""
     const seq = evt.sequence || ""
+    const lower = String(key||"").toLowerCase()
     if ((phase() as any) === "classifying") { prevent(evt); return }
     // When in feedback, handle scroll first, then confirm
     if (phase() === "feedback") {
-      const halfPage = () => Math.max(3, Math.floor((scrollRef?.height ?? popupHeight()) / 2))
-      if (key === "d" || key === "D" || seq === "\x04") { prevent(evt); try { scrollRef?.scrollBy(halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
-      if (key === "u" || key === "U" || seq === "\x15") { prevent(evt); try { scrollRef?.scrollBy(-halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
-      if (key === "j" || seq === "\x1b[B") { prevent(evt); try { scrollRef?.scrollBy(2); setTimeout(updateScrollIndicators, 20) } catch {} return }
-      if (key === "k" || seq === "\x1b[A") { prevent(evt); try { scrollRef?.scrollBy(-2); setTimeout(updateScrollIndicators, 20) } catch {} return }
-      if (key === "pageup" || seq === "\x1b[5~") { prevent(evt); try { scrollRef?.scrollBy(-halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
-      if (key === "pagedown" || seq === "\x1b[6~") { prevent(evt); try { scrollRef?.scrollBy(halfPage()); setTimeout(updateScrollIndicators, 20) } catch {} return }
-      if (key === "enter" || seq === "\r" || key === "escape" || key === "esc") {
+      if (isPlainKey(evt,"d") || seq === "\x04") { prevent(evt); try { scrollRef?.scrollBy(scrollAmount()); setTimeout(updateScrollIndicators, 30); setTimeout(updateScrollIndicators, 120) } catch {} return }
+      if (isPlainKey(evt,"u") || seq === "\x15") { prevent(evt); try { scrollRef?.scrollBy(-scrollAmount()); setTimeout(updateScrollIndicators, 30); setTimeout(updateScrollIndicators, 120) } catch {} return }
+      if (isPlainKey(evt,"j") || seq === "\x1b[B") { prevent(evt); try { scrollRef?.scrollBy(1); setTimeout(updateScrollIndicators, 30) } catch {} return }
+      if (isPlainKey(evt,"k") || seq === "\x1b[A") { prevent(evt); try { scrollRef?.scrollBy(-1); setTimeout(updateScrollIndicators, 30) } catch {} return }
+      if (key === "pageup" || seq === "\x1b[5~") { prevent(evt); try { scrollRef?.scrollBy(-scrollAmount()); setTimeout(updateScrollIndicators, 30) } catch {} return }
+      if (key === "pagedown" || seq === "\x1b[6~") { prevent(evt); try { scrollRef?.scrollBy(scrollAmount()); setTimeout(updateScrollIndicators, 30) } catch {} return }
+      if ( lower === "enter" || seq === "\r" || lower === "escape" || lower === "esc") {
         prevent(evt)
         confirmFeedback()
       }
@@ -384,12 +397,13 @@ function QuizDialog(props: {
           </box>
         </Show>
         </scrollbox>
-        <Show when={canScrollUp()}><box justifyContent="center" height={1}><text fg={theme.accent}>▲ more above — u/k to scroll up</text></box></Show>
-        <Show when={canScrollDown()}><box justifyContent="center" height={1}><text fg={theme.warning}>▼ more below — d/j to scroll down</text></box></Show>
         <box height={1} justifyContent="center">
           <text fg={theme().textMuted}>
             {phase() === "feedback"
-              ? (canScrollUp() || canScrollDown() ? "d/u or j/k scroll · Enter to continue  →  next probe" : "↵ Enter / Esc to continue  →  next probe")
+              ? (canScrollUp() && canScrollDown() ? "▲ more above · ▼ more below — d/u to scroll · Enter to continue"
+                : canScrollDown() ? "▼ more below — d to scroll · Enter to continue"
+                : canScrollUp() ? "▲ more above — u to scroll · Enter to continue"
+                : "↵ Enter / Esc to continue  →  next probe")
               : phase() === "classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
           </text>
         </box>
@@ -434,21 +448,27 @@ function QuizBatchDialog(props: {
   const updateScrollBatch = () => {
     try {
       if (!scrollRefBatch) { setCanScrollUpBatch(false); setCanScrollDownBatch(false); return }
-      const y = typeof scrollRefBatch.y === "number" ? scrollRefBatch.y : (scrollRefBatch.scrollTop ?? 0)
+      const st = typeof scrollRefBatch.scrollTop === "number" ? scrollRefBatch.scrollTop : 0
       const h = typeof scrollRefBatch.height === "number" ? scrollRefBatch.height : (scrollRefBatch.viewportHeight ?? popupHeight())
-      const sh = typeof scrollRefBatch.scrollHeight === "number" ? scrollRefBatch.scrollHeight : (typeof scrollRefBatch.getScrollHeight === "function" ? scrollRefBatch.getScrollHeight() : 0)
+      const sh = typeof scrollRefBatch.scrollHeight === "number" ? scrollRefBatch.scrollHeight : 0
       let effectiveSh = sh
       if (!effectiveSh && typeof scrollRefBatch.getChildren === "function") {
         try { const kids = scrollRefBatch.getChildren(); if (kids?.length) effectiveSh = Math.max(...kids.map((c:any)=> (c.y||0)+(c.height||0)), h) } catch {}
       }
       if (!effectiveSh || effectiveSh <= h + 1) { setCanScrollUpBatch(false); setCanScrollDownBatch(false); return }
-      setCanScrollUpBatch(y > 0)
-      setCanScrollDownBatch(y + h < effectiveSh - 1)
+      setCanScrollUpBatch(st > 0)
+      setCanScrollDownBatch(st + h < effectiveSh - 1)
     } catch { setCanScrollUpBatch(false); setCanScrollDownBatch(false) }
   }
+  const scrollAmountBatch = () => Math.max(1, Math.floor((scrollRefBatch?.height ?? popupHeight()) / 3))
   createEffect(() => { if (focused()==="note" && noteEl) try{noteEl.focus()}catch(e){ tlog("note focus failed", String(e)) } })
-  createEffect(() => { phase(); feedback(); dims(); idx(); setTimeout(updateScrollBatch, 40) })
+  createEffect(() => { phase(); feedback(); dims(); idx(); setTimeout(updateScrollBatch, 40); setTimeout(updateScrollBatch, 200) })
   createEffect(() => { note(); setTimeout(updateScrollBatch, 40) })
+  createEffect(() => {
+    if (phase() !== "feedback") return
+    const id = setInterval(updateScrollBatch, 200)
+    onCleanup(() => clearInterval(id))
+  })
   const toggle = (i:number) => {
     try {
       const o = cur().options[i]; if(!o) return
@@ -542,19 +562,19 @@ function QuizBatchDialog(props: {
       setPhase("feedback")
     } catch(e){ tlog("submitSelect failed", String(e)) }
   }
+  const isPlainKeyBatch = (evt:any, want:string) => {
+    try { const n=String(evt.name||evt.sequence||"").toLowerCase(); if(n!==want.toLowerCase()) return false; if(evt.ctrl||evt.meta||evt.option||evt.alt) return false; return true } catch { return false }
+  }
   useKeyboard((evt:any)=>{
     try {
-      const k=evt.name||evt.sequence||evt.raw||""; const seq=evt.sequence||""
+      const k=evt.name||evt.sequence||evt.raw||""; const seq=evt.sequence||""; const lower=String(k||"").toLowerCase()
       if((phase() as any)==="classifying"){ prevent(evt); return }
       if(phase()==="feedback"){
-        const halfBatch = () => Math.max(3, Math.floor((scrollRefBatch?.height ?? popupHeight()) / 2))
-        if (k==="d"||k==="D"||seq==="\x04"){ prevent(evt); try{scrollRefBatch?.scrollBy(halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
-        if (k==="u"||k==="U"||seq==="\x15"){ prevent(evt); try{scrollRefBatch?.scrollBy(-halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
-        if (k==="j"||seq==="\x1b[B"){ prevent(evt); try{scrollRefBatch?.scrollBy(2); setTimeout(updateScrollBatch,20)}catch{} return }
-        if (k==="k"||seq==="\x1b[A"){ prevent(evt); try{scrollRefBatch?.scrollBy(-2); setTimeout(updateScrollBatch,20)}catch{} return }
-        if (k==="pageup"||seq==="\x1b[5~"){ prevent(evt); try{scrollRefBatch?.scrollBy(-halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
-        if (k==="pagedown"||seq==="\x1b[6~"){ prevent(evt); try{scrollRefBatch?.scrollBy(halfBatch()); setTimeout(updateScrollBatch,20)}catch{} return }
-        if(k==="enter"||seq==="\r"||k==="escape"||k==="esc"){ prevent(evt); goNext() } return }
+        if (isPlainKeyBatch(evt,"d")||seq==="\x04"){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
+        if (isPlainKeyBatch(evt,"u")||seq==="\x15"){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
+        if (lower==="pageup"||seq==="\x1b[5~"){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30)}catch{} return }
+        if (lower==="pagedown"||seq==="\x1b[6~"){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30)}catch{} return }
+        if(lower==="enter"||seq==="\r"||lower==="escape"||lower==="esc"){ prevent(evt); goNext() } return }
       if(focused()==="note"){ if(k==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return} if(k==="escape"){prevent(evt); setFocused("options"); return} return }
       if(k==="up"||k==="k"||seq==="\x1b[A"){prevent(evt); setOptionIndex(i=>Math.max(0,i-1)); return}
       if(k==="down"||k==="j"||seq==="\x1b[B"){prevent(evt); setOptionIndex(i=>Math.min(isMulti()?submitIdx():dontKnowIdx(),i+1)); return}
@@ -600,11 +620,9 @@ function QuizBatchDialog(props: {
         </box>
       </Show>
       </scrollbox>
-      <Show when={canScrollUpBatch()}><box justifyContent="center" height={1}><text fg={theme.accent}>▲ more above — u/k to scroll up</text></box></Show>
-      <Show when={canScrollDownBatch()}><box justifyContent="center" height={1}><text fg={theme.warning}>▼ more below — d/j to scroll down</text></box></Show>
       <box height={1} justifyContent="center">
         <text fg={theme().textMuted}>
-          {phase()==="feedback" ? (canScrollUpBatch() || canScrollDownBatch() ? `d/u or j/k scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
+          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? `▲ more above · ▼ more below — d/u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollDownBatch() ? `▼ more below — d to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollUpBatch() ? `▲ more above — u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
         </text>
       </box>
     </box>
