@@ -26,12 +26,11 @@ jobs:
           package-manager-cache: false
       - name: Install dependencies
         run: bun install
-        working-directory: .opencode
       - name: Verify release version
         id: package
         run: |
-          name=$(jq -r .name .opencode/package.json)
-          version=$(jq -r .version .opencode/package.json)
+          name=$(jq -r .name package.json)
+          version=$(jq -r .version package.json)
           tag_version="${GITHUB_REF_NAME#v}"
           if [ "$tag_version" != "$version" ]; then
             echo "::error::Git tag $GITHUB_REF_NAME != package.json version $version"
@@ -45,10 +44,8 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Typecheck & build
         run: bun run prepack
-        working-directory: .opencode
       - name: Publish to npm
         run: npm publish --access public
-        working-directory: .opencode
       - name: Create GitHub release
         if: github.ref_type == 'tag'
         env:
@@ -62,7 +59,7 @@ jobs:
               next
             }
             found { print }
-          ' .opencode/CHANGELOG.md)
+          ' CHANGELOG.md)
           if [ -z "$notes" ]; then
             notes="Published ${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }}"
           fi
