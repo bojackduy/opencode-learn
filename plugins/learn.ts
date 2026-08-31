@@ -471,7 +471,7 @@ const server: Plugin = async ({ client, directory }) => {
     }
     return [...new Set(out)]
   }
-  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string }> {
+  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string, parentSessionID?: string): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string }> {
     const prompt = `Map learner's free-text note (may be Vietnamese or English) to closest option(s) and judge semantic correctness. Only pick from given Options, no new options.
 
 ${question ? `Question: ${question}\n` : ""}Options:
@@ -483,9 +483,13 @@ Task: 1) inferred: which option(s) note best matches (Vietnamese translations/sy
 
 Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If vague/"I don't know", inferred:[], semanticCorrect:false. No markdown, just JSON.`
     try {
-      const created: any = await client.session.create({ body: { title: "classify", agent: "classify" } })
+      const title = `classify: ${question ? question.slice(0, 30) : note.slice(0, 20)}`
+      const body: any = { title, agent: "classify" }
+      if (parentSessionID) body.parentID = parentSessionID
+      const created: any = await client.session.create({ body })
       const sid = created?.data?.id || created?.id || created?.data?.sessionID
       if (!sid) throw new Error("no sid")
+      slog("classify subagent created", sid, `parent:${parentSessionID || "none"}`, note.slice(0, 40))
       await client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: prompt }], agent: "classify" } })
       // Poll for assistant response up to 12s
       for (let i = 0; i < 24; i++) {
@@ -505,9 +509,9 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                   const parsed = JSON.parse(objMatch[0])
                   if (parsed && Array.isArray(parsed.inferred)) {
                     const nums = parsed.inferred.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
-                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `semantic:${parsed.semanticCorrect}`)
-                    try { await client.session.delete?.({ path: { id: sid } }) } catch {}
-                    return { inferred: nums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason }
+                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `semantic:${parsed.semanticCorrect} reason:${parsed.reason || ""} sid:${sid}`)
+                    setTimeout(() => { try { client.session.delete?.({ path: { id: sid } }) } catch {} }, 10 * 60 * 1000)
+                    return { inferred: nums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason, sessionID: sid }
                   }
                 } catch {}
               }
@@ -519,15 +523,17 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                     const nums = parsed.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     if (nums.length) {
                       slog("llmClassify success array", note.slice(0, 40), nums.join(","))
-                      try { await client.session.delete?.({ path: { id: sid } }) } catch {}
-                      return { inferred: nums }
+                      // Keep session for browsing via leader+arrowDown, don't delete immediately — will be visible as child
+                      // Auto-cleanup after 10m in background
+                      setTimeout(() => { try { client.session.delete?.({ path: { id: sid } }) } catch {} }, 10 * 60 * 1000)
+                      return { inferred: nums, sessionID: sid }
                     }
                   }
                 } catch {}
               }
               if (text.includes("1") || text.includes("2")) {
                 const nums = [...text.matchAll(/\b([1-9])\b/g)].map(x => parseInt(x[1])).filter(n => n <= options.length)
-                if (nums.length) return { inferred: [...new Set(nums)] }
+                if (nums.length) return { inferred: [...new Set(nums)], sessionID: sid }
               }
             }
           }
@@ -557,12 +563,12 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
       let inferred: number[] = []
       let semanticCorrect: boolean | undefined
       let reason: string | undefined
-      const llmRes = await llmClassify(client, directory, data.note, data.options, data.question)
+      const llmRes = await llmClassify(client, directory, data.note, data.options, data.question, data.sessionID)
       if (llmRes.inferred.length) {
         inferred = llmRes.inferred
         semanticCorrect = llmRes.semanticCorrect
         reason = llmRes.reason
-        slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect}`)
+        slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect} sid:${llmRes.sessionID || ""}`)
       } else {
         inferred = heuristicClassify(data.note, data.options)
         if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","))
@@ -583,8 +589,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
           }
         }
       }
-      slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} note:"${data.note.slice(0, 60)}"`)
-      const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, note: data.note, at: Date.now() }
+      slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} sid:${(llmRes as any)?.sessionID || ""} note:"${data.note.slice(0, 60)}"`)
+      const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, classifySessionID: (llmRes as any)?.sessionID, note: data.note, at: Date.now() }
       try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8"); slog("classify response written", data.id, inferred.join(",")) } catch {}
     }
     // Initial sweep

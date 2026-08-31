@@ -229,13 +229,14 @@ function QuizDialog(props: {
   })
 
   return (
-    <box flexDirection="column" width={popupWidth()} border={true} borderColor={phase() === "feedback" ? (feedback()?.correct ? theme().success : theme().error) : theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
+    <box flexDirection="column" width={popupWidth()} maxHeight={Math.max(12, dims().height - 2)} border={true} borderColor={phase() === "feedback" ? (feedback()?.correct ? theme().success : theme().error) : theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
         {/* Header */}
         <box flexDirection="row" justifyContent="space-between" alignItems="center" backgroundColor={phase() === "feedback" ? (feedback()?.correct ? theme().success : theme().error) : theme().accent} paddingLeft={1} paddingRight={1} height={1}>
           <text fg={theme().background} bold>{phase() === "feedback" ? (feedback()?.correct ? "✓  CORRECT" : dontKnow() ? "○  I DON'T KNOW" : "✗  INCORRECT") : isMulti() ? "☑  QUIZ · MULTI-SELECT" : "●  QUIZ · SINGLE" }</text>
           <text fg={theme().background} dim>learn</text>
         </box>
 
+        <scrollbox flexGrow={1} maxHeight={Math.max(8, dims().height - 8)}>
         {/* Question */}
         <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1}>
           <text fg={theme().text} bold wrapMode="wrap">{props.request.question}</text>
@@ -352,6 +353,7 @@ function QuizDialog(props: {
             <box justifyContent="center" paddingTop={1}><text fg={theme().textMuted}>↵ Enter / Esc to continue  →  next probe</text></box>
           </box>
         </Show>
+        </scrollbox>
       </box>
   )
 }
@@ -495,11 +497,12 @@ function QuizBatchDialog(props: {
     } catch(e){ tlog("useKeyboard batch failed", String(e)) }
   })
   return (
-    <box flexDirection="column" width={popupWidth()} border={true} borderColor={phase()==="feedback"?(feedback()?.correct?theme().success:theme().error):theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
+    <box flexDirection="column" width={popupWidth()} maxHeight={Math.max(12, dims().height - 2)} border={true} borderColor={phase()==="feedback"?(feedback()?.correct?theme().success:theme().error):theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
       <box flexDirection="row" justifyContent="space-between" backgroundColor={theme().accent} paddingLeft={1} paddingRight={1} height={1}>
         <text fg={theme().background} bold> decks.quiz batch  {idx()+1}/{props.request.quizzes.length} {phase()==="feedback"?(feedback()?.correct?"✓":"✗"):""}</text>
         <text fg={theme().background} dim>learn</text>
       </box>
+      <scrollbox flexGrow={1} maxHeight={Math.max(8, dims().height - 8)}>
       <text fg={theme().text} bold wrapMode="wrap">{cur().question}</text>
       <Show when={cur().details}><text fg={theme().textMuted} wrapMode="wrap">{cur().details}</text></Show>
       <Show when={phase()==="select"}>
@@ -525,9 +528,10 @@ function QuizBatchDialog(props: {
           <text fg={feedback()?.correct?theme().success:theme().error} bold>{feedback()?.correct?"✓ Correct":"✗ Incorrect"}</text>
           <text fg={theme().textMuted}>Correct: {cur().correctIndices.map((i:number)=>`${i}. ${cur().options[i-1]?.label}`).join(", ")}</text>
           <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><text fg={theme().text} wrapMode="wrap">{cur().explanation}</text></box>
-          <box justifyContent="center"><text fg={theme().textMuted}>Enter → next ({idx()+1}/{props.request.quizzes.length})</text></box>
+           <box justifyContent="center"><text fg={theme().textMuted}>Enter → next ({idx()+1}/{props.request.quizzes.length})</text></box>
         </box>
       </Show>
+      </scrollbox>
     </box>
   )
 }
