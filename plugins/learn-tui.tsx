@@ -6,6 +6,47 @@ import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { watch } from "node:fs"
+import { SyntaxStyle } from "@opentui/core"
+function syntaxStyle(theme:any){
+  return SyntaxStyle.fromTheme([
+    { scope: ["default"], style: { foreground: theme.text } },
+    { scope: ["comment", "comment.documentation"], style: { foreground: theme.syntaxComment, italic: true } },
+    { scope: ["string", "symbol", "character", "character.special"], style: { foreground: theme.syntaxString } },
+    { scope: ["number", "boolean", "float", "constant"], style: { foreground: theme.syntaxNumber } },
+    { scope: ["keyword.return", "keyword.conditional", "keyword.repeat", "keyword.coroutine", "keyword", "keyword.directive", "keyword.modifier", "keyword.exception"], style: { foreground: theme.syntaxKeyword, italic: true } },
+    { scope: ["keyword.type"], style: { foreground: theme.syntaxType, bold: true, italic: true } },
+    { scope: ["keyword.import", "keyword.export", "tag.attribute"], style: { foreground: theme.syntaxKeyword } },
+    { scope: ["keyword.function", "function.method", "variable.member", "function", "constructor"], style: { foreground: theme.syntaxFunction } },
+    { scope: ["operator", "keyword.operator", "punctuation.delimiter", "keyword.conditional.ternary", "punctuation.special", "tag.delimiter"], style: { foreground: theme.syntaxOperator } },
+    { scope: ["variable", "variable.parameter", "function.method.call", "function.call", "property", "parameter", "field"], style: { foreground: theme.syntaxVariable } },
+    { scope: ["type", "module", "class", "namespace"], style: { foreground: theme.syntaxType } },
+    { scope: ["punctuation", "punctuation.bracket"], style: { foreground: theme.syntaxPunctuation } },
+    { scope: ["variable.builtin", "type.builtin", "function.builtin", "module.builtin", "constant.builtin", "variable.super", "tag"], style: { foreground: theme.error } },
+    { scope: ["string.escape", "string.regexp"], style: { foreground: theme.syntaxKeyword } },
+    { scope: ["markup.heading"], style: { foreground: theme.markdownHeading, bold: true } },
+    { scope: ["markup.heading.1"], style: { foreground: theme.markdownHeading, bold: true, underline: true } },
+    { scope: ["markup.bold", "markup.strong"], style: { foreground: theme.markdownStrong, bold: true } },
+    { scope: ["markup.italic"], style: { foreground: theme.markdownEmph, italic: true } },
+    { scope: ["markup.list"], style: { foreground: theme.markdownListItem } },
+    { scope: ["markup.quote"], style: { foreground: theme.markdownBlockQuote, italic: true } },
+    { scope: ["markup.raw", "markup.raw.block"], style: { foreground: theme.markdownCode } },
+    { scope: ["markup.raw.inline"], style: { foreground: theme.markdownCode, background: theme.background } },
+    { scope: ["markup.link", "markup.link.url", "string.special", "string.special.url"], style: { foreground: theme.markdownLink, underline: true } },
+    { scope: ["markup.link.label", "label"], style: { foreground: theme.markdownLinkText, underline: true } },
+    { scope: ["spell", "nospell", "markup.underline"], style: { foreground: theme.text } },
+    { scope: ["conceal", "markup.strikethrough", "markup.list.unchecked", "debug"], style: { foreground: theme.textMuted } },
+    { scope: ["comment.error", "error"], style: { foreground: theme.error, italic: true, bold: true } },
+    { scope: ["comment.warning", "warning"], style: { foreground: theme.warning, italic: true, bold: true } },
+    { scope: ["comment.todo", "comment.note"], style: { foreground: theme.info, italic: true, bold: true } },
+    { scope: ["type.definition"], style: { foreground: theme.syntaxType, bold: true } },
+    { scope: ["attribute", "annotation"], style: { foreground: theme.warning } },
+    { scope: ["markup.list.checked"], style: { foreground: theme.success } },
+    { scope: ["diff.plus"], style: { foreground: theme.diffAdded, background: theme.diffAddedBg } },
+    { scope: ["diff.minus"], style: { foreground: theme.diffRemoved, background: theme.diffRemovedBg } },
+    { scope: ["diff.delta"], style: { foreground: theme.diffContext, background: theme.diffContextBg } },
+    { scope: ["info"], style: { foreground: theme.info } },
+  ])
+}
 
 const PENDING_DIR = ".opencode/learn-pending"
 import { tmpdir } from "node:os"
@@ -56,6 +97,7 @@ function QuizDialog(props: {
   onCancel: () => void
 }) {
   const theme = () => props.api.theme.current
+  const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
   const popupWidth = () => Math.max(68, Math.min(dims().width - 4, 92))
   const popupHeight = () => Math.max(4, Math.min(24, dims().height - 2))
@@ -299,11 +341,11 @@ function QuizDialog(props: {
         </box>
 
         <scrollbox ref={(el:any)=> scrollRef = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
-        {/* Question */}
+        {/* Question — use opencode markdown render so ```python blocks get syntax coloring like native messages */}
         <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1}>
-          <text fg={theme().text} bold wrapMode="wrap">{decodeQuizText(props.request.question)}</text>
+          <markdown syntaxStyle={syntax()} content={decodeQuizText(props.request.question)} fg={theme().text} bg={theme().backgroundPanel} />
           <Show when={props.request.details}>
-            <text fg={theme().textMuted} wrapMode="wrap">{decodeQuizText(props.request.details)}</text>
+            <markdown syntaxStyle={syntax()} content={decodeQuizText(props.request.details)} fg={theme().textMuted} bg={theme().backgroundPanel} />
           </Show>
         </box>
 
@@ -409,7 +451,7 @@ function QuizDialog(props: {
             <text fg={theme().textMuted}>Correct: {props.request.correctIndices.map(i => `${i}. ${options()[i-1]?.label}`).join(", ")}</text>
             <Show when={note()}><text fg={theme().textMuted}>Your note: {note()}</text></Show>
             <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}>
-              <text fg={theme().text} wrapMode="wrap">{decodeQuizText(props.request.explanation)}</text>
+              <markdown syntaxStyle={syntax()} content={decodeQuizText(props.request.explanation)} fg={theme().text} bg={theme().backgroundPanel} />
             </box>
           </box>
         </Show>
@@ -439,6 +481,7 @@ function QuizBatchDialog(props: {
   onCancel: () => void
 }) {
   const theme = () => props.api.theme.current
+  const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
   const popupWidth = () => Math.max(68, Math.min(dims().width - 4, 96))
   const popupHeight = () => Math.max(4, Math.min(24, dims().height - 2))
@@ -614,8 +657,8 @@ function QuizBatchDialog(props: {
         <text fg={theme().background} dim>learn</text>
       </box>
       <scrollbox ref={(el:any)=> scrollRefBatch = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
-      <text fg={theme().text} bold wrapMode="wrap">{decodeQuizText(cur().question)}</text>
-      <Show when={cur().details}><text fg={theme().textMuted} wrapMode="wrap">{decodeQuizText(cur().details)}</text></Show>
+      <markdown syntaxStyle={syntax()} content={decodeQuizText(cur().question)} fg={theme().text} bg={theme().backgroundPanel} />
+      <Show when={cur().details}><markdown syntaxStyle={syntax()} content={decodeQuizText(cur().details)} fg={theme().textMuted} bg={theme().backgroundPanel} /></Show>
       <Show when={phase()==="select"}>
         <box flexDirection="column" gap={0} padding={1} border={true} borderColor={theme().borderSubtle} backgroundColor={theme().background}>
           <For each={cur().options}>{(opt:any,i:any)=>{const id=i(); const foc=()=>focused()==="options"&&optionIndex()===id; const sel=()=>selected().has(`opt:${id}`); return <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={foc()?theme().backgroundElement:undefined}><box width={2}><text fg={foc()?theme().accent:theme().textMuted}>{foc()?"▸":" "}</text></box><box width={2}><text fg={isMulti()?(sel()?theme().success:theme().textMuted):(sel()?theme().accent:theme().textMuted)}>{isMulti()?(sel()?"☑":"☐"):(sel()?"⬢":"○")}</text></box><box flexGrow={1}><text fg={sel()?theme().text:theme().textMuted} bold={foc()} wrapMode="wrap">{id+1}. {opt.label}</text></box></box>}}</For>
@@ -638,7 +681,7 @@ function QuizBatchDialog(props: {
           <For each={cur().options}>{(opt:any,i:any)=>{const id=i()+1; const sel=()=>feedback()?.selectedIndices.includes(id)??false; const ok=()=>new Set(cur().correctIndices).has(id); let ic=" "; let fg=theme().textMuted; let bg:any=undefined; if(dontKnow()){ic=ok()?"✓":" "; fg=ok()?theme().background:theme().textMuted; bg=ok()?theme().success:undefined} else if(sel()&&ok()){ic="✓"; fg=theme().background; bg=theme().success} else if(sel()&&!ok()){ic="✗"; fg=theme().background; bg=theme().error} else if(!sel()&&ok()){ic="○"; fg=theme().background; bg=theme().warning} return <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={bg}><box width={2}><text fg={fg} bold>{ic}</text></box><box flexGrow={1}><text fg={fg} wrapMode="wrap">{id}. {opt.label}</text></box></box>}}</For>
           <text fg={feedback()?.correct?theme().success:theme().error} bold>{feedback()?.correct?"✓ Correct":"✗ Incorrect"}</text>
           <text fg={theme().textMuted}>Correct: {cur().correctIndices.map((i:number)=>`${i}. ${cur().options[i-1]?.label}`).join(", ")}</text>
-          <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><text fg={theme().text} wrapMode="wrap">{decodeQuizText(cur().explanation)}</text></box>
+          <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><markdown syntaxStyle={syntax()} content={decodeQuizText(cur().explanation)} fg={theme().text} bg={theme().backgroundPanel} /></box>
         </box>
       </Show>
       </scrollbox>
