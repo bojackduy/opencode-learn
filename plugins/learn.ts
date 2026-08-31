@@ -484,12 +484,16 @@ Task: 1) inferred: which option(s) note best matches (Vietnamese translations/sy
 Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If vague/"I don't know", inferred:[], semanticCorrect:false. No markdown, just JSON.`
     try {
       const title = `classify: ${question ? question.slice(0, 30) : note.slice(0, 20)}`
-      const body: any = { title, agent: "classify" }
+      const body: any = { title }
       if (parentSessionID) body.parentID = parentSessionID
-      const created: any = await client.session.create({ body })
+      const created: any = await client.session.create({ body, query: { directory } })
       const sid = created?.data?.id || created?.id || created?.data?.sessionID
       if (!sid) throw new Error("no sid")
-      slog("classify subagent created", sid, `parent:${parentSessionID || "none"}`, note.slice(0, 40))
+      const createdSession = created?.data || created
+      slog("classify subagent created", sid, `requestedParent:${parentSessionID || "none"}`, `actualParent:${createdSession?.parentID || "none"}`, note.slice(0, 40))
+      if (parentSessionID && createdSession?.parentID !== parentSessionID) {
+        throw new Error(`classifier parent mismatch: expected ${parentSessionID}, got ${createdSession?.parentID || "none"}`)
+      }
       await client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: prompt }], agent: "classify" } })
       // Poll for assistant response up to 12s
       for (let i = 0; i < 24; i++) {
@@ -510,7 +514,6 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                   if (parsed && Array.isArray(parsed.inferred)) {
                     const nums = parsed.inferred.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     slog("llmClassify success object", note.slice(0, 40), nums.join(","), `semantic:${parsed.semanticCorrect} reason:${parsed.reason || ""} sid:${sid}`)
-                    setTimeout(() => { try { client.session.delete?.({ path: { id: sid } }) } catch {} }, 10 * 60 * 1000)
                     return { inferred: nums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason, sessionID: sid }
                   }
                 } catch {}
@@ -523,9 +526,6 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                     const nums = parsed.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     if (nums.length) {
                       slog("llmClassify success array", note.slice(0, 40), nums.join(","))
-                      // Keep session for browsing via leader+arrowDown, don't delete immediately — will be visible as child
-                      // Auto-cleanup after 10m in background
-                      setTimeout(() => { try { client.session.delete?.({ path: { id: sid } }) } catch {} }, 10 * 60 * 1000)
                       return { inferred: nums, sessionID: sid }
                     }
                   }

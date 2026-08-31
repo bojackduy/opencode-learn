@@ -22,6 +22,7 @@ type QuizPending = {
   correctIndices: number[]
   explanation: string
   multiSelect?: boolean
+  sessionID?: string
   timestamp: number
 }
 type QuizBatchPending = {
@@ -44,6 +45,7 @@ function QuizDialog(props: {
   const theme = () => props.api.theme.current
   const dims = useTerminalDimensions()
   const popupWidth = () => Math.max(68, Math.min(dims().width - 4, 92))
+  const popupHeight = () => Math.max(4, Math.min(24, dims().height - 2))
   const options = () => props.request.options
   const correctSet = new Set(props.request.correctIndices)
   const isMulti = () => !!props.request.multiSelect
@@ -93,7 +95,8 @@ function QuizDialog(props: {
       setPhase("classifying" as any)
       try {
         const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
-        const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: (props.request as any).sessionID }
+        const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
+        const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
         fs.writeFileSync(path.join(pDir, `classify-${props.request.id}.json`), JSON.stringify(pendingClassify), "utf8")
         tlog("QuizDialog classify request", props.request.id, note().trim().slice(0, 50))
         // Poll for classify-response
@@ -229,14 +232,14 @@ function QuizDialog(props: {
   })
 
   return (
-    <box flexDirection="column" width={popupWidth()} maxHeight={Math.max(12, dims().height - 2)} border={true} borderColor={phase() === "feedback" ? (feedback()?.correct ? theme().success : theme().error) : theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
+    <box flexDirection="column" width={popupWidth()} height={popupHeight()} border={true} borderColor={phase() === "feedback" ? (feedback()?.correct ? theme().success : theme().error) : theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
         {/* Header */}
         <box flexDirection="row" justifyContent="space-between" alignItems="center" backgroundColor={phase() === "feedback" ? (feedback()?.correct ? theme().success : theme().error) : theme().accent} paddingLeft={1} paddingRight={1} height={1}>
           <text fg={theme().background} bold>{phase() === "feedback" ? (feedback()?.correct ? "✓  CORRECT" : dontKnow() ? "○  I DON'T KNOW" : "✗  INCORRECT") : isMulti() ? "☑  QUIZ · MULTI-SELECT" : "●  QUIZ · SINGLE" }</text>
           <text fg={theme().background} dim>learn</text>
         </box>
 
-        <scrollbox flexGrow={1} maxHeight={Math.max(8, dims().height - 8)}>
+        <scrollbox flexGrow={1}>
         {/* Question */}
         <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1}>
           <text fg={theme().text} bold wrapMode="wrap">{props.request.question}</text>
@@ -350,10 +353,14 @@ function QuizDialog(props: {
             <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}>
               <text fg={theme().text} wrapMode="wrap">{props.request.explanation}</text>
             </box>
-            <box justifyContent="center" paddingTop={1}><text fg={theme().textMuted}>↵ Enter / Esc to continue  →  next probe</text></box>
           </box>
         </Show>
         </scrollbox>
+        <box height={1} justifyContent="center">
+          <text fg={theme().textMuted}>
+            {phase() === "feedback" ? "↵ Enter / Esc to continue  →  next probe" : phase() === "classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
+          </text>
+        </box>
       </box>
   )
 }
@@ -368,6 +375,7 @@ function QuizBatchDialog(props: {
   const theme = () => props.api.theme.current
   const dims = useTerminalDimensions()
   const popupWidth = () => Math.max(68, Math.min(dims().width - 4, 96))
+  const popupHeight = () => Math.max(4, Math.min(24, dims().height - 2))
   const [idx, setIdx] = createSignal(0)
   // Guard: if no quizzes, cancel
   if (!props.request.quizzes || props.request.quizzes.length === 0) {
@@ -428,7 +436,8 @@ function QuizBatchDialog(props: {
         try {
           const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
           const cid = `${props.request.id}-${idx()}`
-          const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: (props.request as any).sessionID }
+          const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
+          const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
           fs.writeFileSync(path.join(pDir, `classify-${cid}.json`), JSON.stringify(pendingClassify), "utf8")
           tlog("QuizBatchDialog classify request", cid, note().trim().slice(0, 50))
           const respPath = path.join(pDir, `classify-response-${cid}.json`)
@@ -497,12 +506,12 @@ function QuizBatchDialog(props: {
     } catch(e){ tlog("useKeyboard batch failed", String(e)) }
   })
   return (
-    <box flexDirection="column" width={popupWidth()} maxHeight={Math.max(12, dims().height - 2)} border={true} borderColor={phase()==="feedback"?(feedback()?.correct?theme().success:theme().error):theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
+    <box flexDirection="column" width={popupWidth()} height={popupHeight()} border={true} borderColor={phase()==="feedback"?(feedback()?.correct?theme().success:theme().error):theme().accent} backgroundColor={theme().backgroundPanel} padding={1} gap={1}>
       <box flexDirection="row" justifyContent="space-between" backgroundColor={theme().accent} paddingLeft={1} paddingRight={1} height={1}>
         <text fg={theme().background} bold> decks.quiz batch  {idx()+1}/{props.request.quizzes.length} {phase()==="feedback"?(feedback()?.correct?"✓":"✗"):""}</text>
         <text fg={theme().background} dim>learn</text>
       </box>
-      <scrollbox flexGrow={1} maxHeight={Math.max(8, dims().height - 8)}>
+      <scrollbox flexGrow={1}>
       <text fg={theme().text} bold wrapMode="wrap">{cur().question}</text>
       <Show when={cur().details}><text fg={theme().textMuted} wrapMode="wrap">{cur().details}</text></Show>
       <Show when={phase()==="select"}>
@@ -528,10 +537,14 @@ function QuizBatchDialog(props: {
           <text fg={feedback()?.correct?theme().success:theme().error} bold>{feedback()?.correct?"✓ Correct":"✗ Incorrect"}</text>
           <text fg={theme().textMuted}>Correct: {cur().correctIndices.map((i:number)=>`${i}. ${cur().options[i-1]?.label}`).join(", ")}</text>
           <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><text fg={theme().text} wrapMode="wrap">{cur().explanation}</text></box>
-           <box justifyContent="center"><text fg={theme().textMuted}>Enter → next ({idx()+1}/{props.request.quizzes.length})</text></box>
         </box>
       </Show>
       </scrollbox>
+      <box height={1} justifyContent="center">
+        <text fg={theme().textMuted}>
+          {phase()==="feedback" ? `Enter → next (${idx()+1}/${props.request.quizzes.length})` : phase()==="classifying" ? "Classifying your note..." : "Navigate options · Tab note · Esc cancel"}
+        </text>
+      </box>
     </box>
   )
 }
@@ -576,6 +589,7 @@ export const tui: TuiPlugin = async (api) => {
     let data: Pending | null = null
     try { data = JSON.parse(fs.readFileSync(full, "utf8")) as Pending } catch { try { fs.unlinkSync(full) } catch {}; return }
     if (!data || !data.id) { try { fs.unlinkSync(full) } catch {}; return }
+    if (!(data as any).sessionID) (data as any).sessionID = curSid
     // If pending was from a previous session that no longer exists, rebind to current session so inject still wakes you (like loop guardLoopOwnedUserMessage)
     try {
       const cur = (api.route as any)?.current
