@@ -52,7 +52,7 @@ function QuizDialog(props: {
 
   const [focused, setFocused] = createSignal<"options" | "note">("options")
   const [optionIndex, setOptionIndex] = createSignal(0)
-  const [phase, setPhase] = createSignal<"select" | "feedback">("select")
+  const [phase, setPhase] = createSignal<"select" | "feedback" | "classifying">("select")
   const [note, setNote] = createSignal("")
   const [dontKnow, setDontKnow] = createSignal(false)
   const [selected, setSelected] = createSignal<Map<string, { label: string; value: string; index: number }>>(new Map())
@@ -86,8 +86,62 @@ function QuizDialog(props: {
   }
   const submitSelect = () => {
     const selMap = selected()
-    if (!isMulti() && selMap.size === 0 && !dontKnow()) return
-    if (isMulti() && selMap.size === 0 && !dontKnow()) return
+    if (!isMulti() && selMap.size === 0 && !dontKnow() && !note().trim()) return
+    if (isMulti() && selMap.size === 0 && !dontKnow() && !note().trim()) return
+    // If 0 selected but note present, trigger AI classify (async popup) — keep popup, show classifying
+    if (selMap.size === 0 && !dontKnow() && note().trim()) {
+      setPhase("classifying" as any)
+      try {
+        const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
+        const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: (props.request as any).sessionID }
+        fs.writeFileSync(path.join(pDir, `classify-${props.request.id}.json`), JSON.stringify(pendingClassify), "utf8")
+        tlog("QuizDialog classify request", props.request.id, note().trim().slice(0, 50))
+        // Poll for classify-response
+        const respPath = path.join(pDir, `classify-response-${props.request.id}.json`)
+        let attempts = 0
+        const poll = setInterval(() => {
+          attempts++
+          if (attempts > 60) { clearInterval(poll); setPhase("feedback"); setFeedback({ correct: false, selectedIndices: [] }); return }
+          try {
+            if (fs.existsSync(respPath)) {
+              clearInterval(poll)
+              const raw = fs.readFileSync(respPath, "utf8")
+              const data: any = JSON.parse(raw)
+              try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${props.request.id}.json`)) } catch {}
+              const inferred = data?.inferredIndices as number[] | undefined
+              const inferredValues = data?.inferredValues as string[] | undefined
+              if (inferred && inferred.length) {
+                const m = new Map<string, { label: string; value: string; index: number }>()
+                for (let i = 0; i < inferred.length; i++) {
+                  const idx = inferred[i]
+                  const opt = options()[idx - 1]
+                  if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx })
+                }
+                setSelected(m)
+                const correct = inferred.length === props.request.correctIndices.length && inferred.every((v: number) => correctSet.has(v)) && props.request.correctIndices.every((v: number) => inferred.includes(v))
+                setFeedback({ correct, selectedIndices: inferred })
+                tlog("QuizDialog classify done", inferred.join(","), correct)
+              } else if (inferredValues && inferredValues.length) {
+                // Fallback via values
+                const byVal = new Map(options().map((o, i) => [o.value, i + 1]))
+                const idxs = inferredValues.map(v => byVal.get(v)).filter(Boolean) as number[]
+                const m = new Map<string, { label: string; value: string; index: number }>()
+                for (const idx of idxs) { const opt = options()[idx - 1]; if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
+                setSelected(m)
+                const correct = idxs.length === props.request.correctIndices.length && idxs.every(v => correctSet.has(v)) && props.request.correctIndices.every(v => idxs.includes(v))
+                setFeedback({ correct, selectedIndices: idxs })
+              } else {
+                setFeedback({ correct: false, selectedIndices: [] })
+              }
+              setPhase("feedback")
+            }
+          } catch {}
+        }, 500)
+        // Cleanup on dispose
+        onCleanup(() => clearInterval(poll))
+      } catch (e) { tlog("classify request failed", String(e)); setPhase("feedback"); setFeedback({ correct: false, selectedIndices: [] }) }
+      return
+    }
     if (dontKnow()) {
       setFeedback({ correct: false, selectedIndices: [] })
       setPhase("feedback")
@@ -108,6 +162,7 @@ function QuizDialog(props: {
   useKeyboard((evt: any) => {
     const key = evt.name || evt.sequence || evt.raw || ""
     const seq = evt.sequence || ""
+    if ((phase() as any) === "classifying") { prevent(evt); return }
     // When in feedback, any Enter/Esc confirms
     if (phase() === "feedback") {
       if (key === "enter" || seq === "\r" || key === "escape" || key === "esc") {
@@ -124,15 +179,21 @@ function QuizDialog(props: {
       // Allow typing to go to input; don't prevent
       return
     }
-    // Options focused
+    // Options focused — extra Submit for single note-only at dontKnowIdx+1
+    const maxIdx = () => {
+      if (isMulti()) return submitIdx()
+      if (note().trim() && !selected().size && !dontKnow()) return dontKnowIdx() + 1
+      return dontKnowIdx()
+    }
     if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(evt); setOptionIndex(i => Math.max(0, i - 1)); return }
-    if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(evt); setOptionIndex(i => Math.min(isMulti() ? submitIdx() : dontKnowIdx(), i + 1)); return }
+    if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(evt); setOptionIndex(i => Math.min(maxIdx(), i + 1)); return }
     if (key === "tab" || seq === "\t") { prevent(evt); setFocused("note"); return }
     if (key === "escape" || key === "esc") { prevent(evt); props.onCancel(); return }
     if (key === "space" || seq === " ") {
       prevent(evt)
       const idx = optionIndex()
       if (idx === dontKnowIdx()) handleDontKnow()
+      else if (!isMulti() && idx === dontKnowIdx() + 1 && note().trim() && !selected().size && !dontKnow()) submitSelect()
       else {
         if (isMulti()) toggleOption(idx)
         else {
@@ -146,6 +207,7 @@ function QuizDialog(props: {
       prevent(evt)
       const idx = optionIndex()
       if (idx === dontKnowIdx()) handleDontKnow()
+      else if (!isMulti() && idx === dontKnowIdx() + 1 && note().trim() && !selected().size && !dontKnow()) submitSelect()
       else if (isMulti()) submitSelect()
       else {
           const opt = options()[idx]
@@ -208,25 +270,44 @@ function QuizDialog(props: {
                     ref={(el: any) => noteInputEl = el}
                     value={note()}
                     onInput={(value: any) => setNote(typeof value === "string" ? value : value?.target?.value ?? value?.value ?? String(value ?? ""))}
-                    onSubmit={() => setFocused("options")}
-                    placeholder="what was on your mind?"
+                    onSubmit={() => {
+                      if (!selected().size && !dontKnow() && note().trim()) submitSelect()
+                      else setFocused("options")
+                    }}
+                    placeholder="what was on your mind? (Enter to submit note → classify)"
                   />
                 </Show>
               </box>
             </box>
 
             <box flexDirection="row" justifyContent="space-between" paddingTop={1}>
-              <text fg={theme().textMuted}>↑↓/j k  ·  Space toggle  ·  ↓ to Submit → Enter  ·  Tab note  ·  Esc cancel</text>
-              <Show when={isMulti()}><text fg={selected().size > 0 || dontKnow() ? theme().success : theme().warning}>{selected().size} selected {dontKnow() ? "· I don't know" : ""}</text></Show>
+              <text fg={theme().textMuted}>{focused() === "note" ? "Enter submit note → classify · Tab back · Esc back" : "↑↓/j k  ·  Space toggle  ·  ↓ to Submit → Enter  ·  Tab note  ·  Esc cancel"}</text>
+              <Show when={isMulti()}><text fg={selected().size > 0 || dontKnow() ? theme().success : note().trim() ? theme().warning : theme().warning}>{selected().size > 0 ? `${selected().size} selected` : note().trim() ? "note → classify" : "0 selected"} {dontKnow() ? "· I don't know" : ""}</text></Show>
+              <Show when={!isMulti() && note().trim() && !selected().size && !dontKnow()}><text fg={theme().warning}>note → classify on Enter</text></Show>
             </box>
             <Show when={isMulti()}>
               <box justifyContent="center" paddingTop={1}>
-                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() ? theme().success : theme().borderSubtle)} backgroundColor={focused() === "options" && optionIndex() === submitIdx() ? theme().backgroundElement : (selected().size > 0 || dontKnow() ? theme().success : theme().background)} paddingLeft={2} paddingRight={2}>
-                  <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() ? theme().background : theme().textMuted)}>{focused() === "options" && optionIndex() === submitIdx() ? "▸" : " "}</text>
-                  <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() ? theme().background : theme().textMuted)} bold>↳  Submit</text>
+                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() || note().trim() ? theme().success : theme().borderSubtle)} backgroundColor={focused() === "options" && optionIndex() === submitIdx() ? theme().backgroundElement : (selected().size > 0 || dontKnow() || note().trim() ? theme().success : theme().background)} paddingLeft={2} paddingRight={2}>
+                  <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() || note().trim() ? theme().background : theme().textMuted)}>{focused() === "options" && optionIndex() === submitIdx() ? "▸" : " "}</text>
+                  <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() || note().trim() ? theme().background : theme().textMuted)} bold>↳  Submit{note().trim() && !selected().size && !dontKnow() ? " note" : ""}</text>
                 </box>
               </box>
             </Show>
+            <Show when={!isMulti() && note().trim() && !selected().size && !dontKnow()}>
+              <box justifyContent="center" paddingTop={1}>
+                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().accent : theme().success} backgroundColor={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().backgroundElement : theme().success} paddingLeft={2} paddingRight={2}>
+                  <text fg={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().accent : theme().background} bold>↳  Submit note → classify</text>
+                </box>
+              </box>
+            </Show>
+          </box>
+        </Show>
+
+        <Show when={(phase() as any) === "classifying"}>
+          <box flexDirection="column" gap={1} padding={1} border={true} borderColor={theme().accent} backgroundColor={theme().background} alignItems="center">
+            <text fg={theme().accent} bold>◐ Classifying your note...</text>
+            <text fg={theme().textMuted} wrapMode="wrap">"{note()}"</text>
+            <text fg={theme().textMuted}>Mapping to options — please wait</text>
           </box>
         </Show>
 
@@ -285,7 +366,7 @@ function QuizBatchDialog(props: {
     return null as any
   }
   const cur = () => props.request.quizzes[idx()] ?? props.request.quizzes[0]
-  const [phase, setPhase] = createSignal<"select" | "feedback">("select")
+  const [phase, setPhase] = createSignal<"select" | "feedback" | "classifying">("select")
   const [feedback, setFeedback] = createSignal<{ correct: boolean; selectedIndices: number[] } | null>(null)
   const [dontKnow, setDontKnow] = createSignal(false)
   const [selected, setSelected] = createSignal<Map<string, any>>(new Map())
@@ -329,8 +410,48 @@ function QuizBatchDialog(props: {
   const submitSelect = () => {
     try {
       const m = selected()
-      if (!isMulti() && m.size===0 && !dontKnow()) return
-      if (isMulti() && m.size===0 && !dontKnow()) return
+      if (!isMulti() && m.size===0 && !dontKnow() && !note().trim()) return
+      if (isMulti() && m.size===0 && !dontKnow() && !note().trim()) return
+      // 0 selected + note -> AI classify, keep popup
+      if (m.size===0 && !dontKnow() && note().trim()) {
+        setPhase("classifying" as any)
+        try {
+          const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
+          const cid = `${props.request.id}-${idx()}`
+          const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: (props.request as any).sessionID }
+          fs.writeFileSync(path.join(pDir, `classify-${cid}.json`), JSON.stringify(pendingClassify), "utf8")
+          tlog("QuizBatchDialog classify request", cid, note().trim().slice(0, 50))
+          const respPath = path.join(pDir, `classify-response-${cid}.json`)
+          let attempts = 0
+          const poll = setInterval(() => {
+            attempts++
+            if (attempts > 60) { clearInterval(poll); setFeedback({ correct: false, selectedIndices: [] }); setPhase("feedback"); return }
+            try {
+              if (fs.existsSync(respPath)) {
+                clearInterval(poll)
+                const raw = fs.readFileSync(respPath, "utf8")
+                const data: any = JSON.parse(raw)
+                try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${cid}.json`)) } catch {}
+                const inferred = data?.inferredIndices as number[] | undefined
+                if (inferred && inferred.length) {
+                  const mm = new Map<string, any>()
+                  for (const idx of inferred) { const opt = cur().options[idx - 1]; if (opt) mm.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
+                  setSelected(mm)
+                  const correctSet2 = new Set(cur().correctIndices)
+                  const ok2 = inferred.length === cur().correctIndices.length && inferred.every(v => correctSet2.has(v)) && cur().correctIndices.every(v => inferred.includes(v))
+                  setFeedback({ correct: ok2, selectedIndices: inferred })
+                  tlog("QuizBatchDialog classify done", inferred.join(","), ok2)
+                } else {
+                  setFeedback({ correct: false, selectedIndices: [] })
+                }
+                setPhase("feedback")
+              }
+            } catch {}
+          }, 500)
+          onCleanup(() => clearInterval(poll))
+        } catch (e) { tlog("classify batch failed", String(e)); setFeedback({ correct: false, selectedIndices: [] }); setPhase("feedback") }
+        return
+      }
       const sel = Array.from(m.values())
       const dk = dontKnow()
       const correctSet = new Set(cur().correctIndices)
@@ -344,6 +465,7 @@ function QuizBatchDialog(props: {
   useKeyboard((evt:any)=>{
     try {
       const k=evt.name||evt.sequence||evt.raw||""; const seq=evt.sequence||""
+      if((phase() as any)==="classifying"){ prevent(evt); return }
       if(phase()==="feedback"){ if(k==="enter"||seq==="\r"||k==="escape"||k==="esc"){ prevent(evt); goNext() } return }
       if(focused()==="note"){ if(k==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return} if(k==="escape"){prevent(evt); setFocused("options"); return} return }
       if(k==="up"||k==="k"||seq==="\x1b[A"){prevent(evt); setOptionIndex(i=>Math.max(0,i-1)); return}
@@ -368,9 +490,16 @@ function QuizBatchDialog(props: {
           <For each={cur().options}>{(opt:any,i:any)=>{const id=i(); const foc=()=>focused()==="options"&&optionIndex()===id; const sel=()=>selected().has(`opt:${id}`); return <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={foc()?theme().backgroundElement:undefined}><box width={2}><text fg={foc()?theme().accent:theme().textMuted}>{foc()?"▸":" "}</text></box><box width={2}><text fg={isMulti()?(sel()?theme().success:theme().textMuted):(sel()?theme().accent:theme().textMuted)}>{isMulti()?(sel()?"☑":"☐"):(sel()?"⬢":"○")}</text></box><box flexGrow={1}><text fg={sel()?theme().text:theme().textMuted} bold={foc()} wrapMode="wrap">{id+1}. {opt.label}</text></box></box>}}</For>
           <box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(20,popupWidth()-8))}</text></box>
           <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().backgroundElement:undefined}><box width={2}><text fg={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===dontKnowIdx()?"▸":" "}</text></box><box width={2}><text fg={dontKnow()?theme().warning:theme().textMuted}>{dontKnow()?"☑":"☐"}</text></box><box flexGrow={1}><text fg={dontKnow()?theme().warning:theme().textMuted} italic>I don't know</text></box></box>
-          <box flexDirection="column" paddingTop={1}><text fg={focused()==="note"?theme().accent:theme().textMuted}>✎ Note</text><box border={true} borderColor={focused()==="note"?theme().accent:theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}><Show when={focused()==="note"} fallback={<text fg={theme().textMuted}>{note()||"Tab to edit"}</text>}><input ref={(el:any)=>noteEl=el} value={note()} onInput={(v:any)=>setNote(typeof v==="string"?v:v?.target?.value??"")} onSubmit={()=>setFocused("options")} placeholder="note" /></Show></box></box>
-          <box flexDirection="row" justifyContent="space-between" paddingTop={1}><text fg={theme().textMuted}>Space toggle · ↓ to Submit → Enter · Tab note · Ctrl+Enter submit</text><text fg={theme().textMuted}>{idx()+1}/{props.request.quizzes.length}</text></box>
+          <box flexDirection="column" paddingTop={1}><text fg={focused()==="note"?theme().accent:theme().textMuted}>✎ Note</text><box border={true} borderColor={focused()==="note"?theme().accent:theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}><Show when={focused()==="note"} fallback={<text fg={theme().textMuted}>{note()||"Tab to edit · share what you were thinking"}</text>}><input ref={(el:any)=>noteEl=el} value={note()} onInput={(v:any)=>setNote(typeof v==="string"?v:v?.target?.value??"")} onSubmit={()=>{ if (!selected().size && !dontKnow() && note().trim()) submitSelect(); else setFocused("options") }} placeholder="note (Enter to submit note → classify)" /></Show></box></box>
+          <box flexDirection="row" justifyContent="space-between" paddingTop={1}><text fg={theme().textMuted}>{focused()==="note" ? "Enter submit note → classify · Tab back · Esc back" : "Space toggle · ↓ to Submit → Enter · Tab note · Ctrl+Enter submit"}</text><text fg={theme().textMuted}>{idx()+1}/{props.request.quizzes.length}</text></box>
           <Show when={isMulti()}><box justifyContent="center" paddingTop={1}><box flexDirection="row" gap={1} border={true} borderColor={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().borderSubtle} backgroundColor={focused()==="options"&&optionIndex()===submitIdx()?theme().backgroundElement:theme().background} paddingLeft={2} paddingRight={2}><text fg={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===submitIdx()?"▸":" "}</text><text bold>↳ Submit</text></box></box></Show>
+        </box>
+      </Show>
+      <Show when={(phase() as any)==="classifying"}>
+        <box flexDirection="column" gap={1} padding={1} border={true} borderColor={theme().accent} backgroundColor={theme().background} alignItems="center">
+          <text fg={theme().accent} bold>◐ Classifying your note...</text>
+          <text fg={theme().textMuted} wrapMode="wrap">"{note()}"</text>
+          <text fg={theme().textMuted}>Mapping to options — please wait</text>
         </box>
       </Show>
       <Show when={phase()==="feedback"}>
@@ -389,6 +518,7 @@ function QuizBatchDialog(props: {
 export const tui: TuiPlugin = async (api) => {
   const dir = api.state.path.directory || api.state.path.worktree || process.cwd()
   const pendingDir = path.join(dir, PENDING_DIR)
+  ;(globalThis as any).__learnPendingDir = pendingDir
   ensureDir(pendingDir)
   const heartbeatPath = path.join(pendingDir, ".tui-alive")
   try { fs.writeFileSync(heartbeatPath, String(Date.now()), "utf8") } catch {}
@@ -415,7 +545,7 @@ export const tui: TuiPlugin = async (api) => {
     if (current) return
     if (api.ui.dialog.open) return
     let files: string[] = []
-    try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".")).sort() } catch { return }
+    try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort() } catch { return }
     // Session-distinct: only show pending for current session
     const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean) as Array<{f: string, j: any}>
     const pick = matching.find(x => x.j.sessionID === curSid) || matching.find(x => !x.j.sessionID)

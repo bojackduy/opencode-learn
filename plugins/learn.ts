@@ -454,11 +454,144 @@ const server: Plugin = async ({ client, directory }) => {
   const loggedToolCallIds = new Set<string>()
   const messageIdToRole = new Map<string, string>()
 
+  // ── Classify watcher: note → inferred options (learner-easy) — LLM-backed, not heuristic-only
+  function heuristicClassify(note: string, options: Array<{ label: string; value?: string }>): number[] {
+    const n = note.toLowerCase()
+    const out: number[] = []
+    for (let i = 0; i < options.length; i++) {
+      const o = options[i]
+      const label = (o.label || "").toLowerCase()
+      const value = (o.value || "").toLowerCase()
+      if (label && n.includes(label)) out.push(i + 1)
+      else if (value && n.includes(value)) out.push(i + 1)
+      else {
+        const tokens = label.split(/[^a-z0-9]+/).filter(t => t.length >= 3)
+        if (tokens.some(t => n.includes(t))) out.push(i + 1)
+      }
+    }
+    return [...new Set(out)]
+  }
+  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string): Promise<number[]> {
+    // Try LLM classify via transient opencode session — handles Vietnamese free-text → English options
+    const prompt = `You are a quiz classifier. Map learner's free-text note (may be Vietnamese or English) to the closest option(s). Only pick from given options, no new options.
+
+${question ? `Question: ${question}\n` : ""}Options:
+${options.map((o, i) => `${i + 1}. ${o.label} (value: ${o.value || o.label})`).join("\n")}
+
+Learner note: "${note}"
+
+Which option(s) does the note best match? Consider Vietnamese translations and synonyms. Return ONLY JSON array of indices, e.g. [1] or [1,3]. If note is vague, empty, or "I don't know", return []. No explanation, just JSON.`
+    try {
+      const created: any = await client.session.create({ body: { title: "classify" } })
+      const sid = created?.data?.id || created?.id || created?.data?.sessionID
+      if (!sid) throw new Error("no sid")
+      await client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: prompt }] } })
+      // Poll for assistant response up to 12s
+      for (let i = 0; i < 24; i++) {
+        await new Promise(r => setTimeout(r, 500))
+        try {
+          const msgs: any = await client.session.messages({ path: { id: sid } })
+          const data = msgs?.data || msgs
+          const arr = Array.isArray(data) ? data : []
+          // Find last assistant message with text
+          for (let j = arr.length - 1; j >= 0; j--) {
+            const entry = arr[j]
+            if (entry?.info?.role === "assistant") {
+              const text = (entry.parts || []).filter((p: any) => p.type === "text").map((p: any) => p.text).join(" ") || ""
+              const m = text.match(/\[[\s\d,]*\]/)
+              if (m) {
+                try {
+                  const parsed = JSON.parse(m[0])
+                  if (Array.isArray(parsed)) {
+                    const nums = parsed.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
+                    if (nums.length) {
+                      slog("llmClassify success", note.slice(0, 40), nums.join(","))
+                      // Cleanup temp session async
+                      try { await client.session.delete?.({ path: { id: sid } }) } catch {}
+                      return nums
+                    }
+                  }
+                } catch {}
+              }
+              // If assistant responded but no JSON, try fallback: look for numbers in text
+              if (text.includes("1") || text.includes("2")) {
+                // Fallback: extract numbers 1..n
+                const nums = [...text.matchAll(/\b([1-9])\b/g)].map(x => parseInt(x[1])).filter(n => n <= options.length)
+                if (nums.length) return [...new Set(nums)]
+              }
+            }
+          }
+        } catch {}
+      }
+      slog("llmClassify timeout", note.slice(0, 40))
+    } catch (e) {
+      slog("llmClassify failed", String(e).slice(0, 200))
+    }
+    return []
+  }
+  function startClassifyWatcher(client: any, directory: string) {
+    const dir = pendingDir(directory)
+    try { fs.mkdirSync(dir, { recursive: true }) } catch {}
+    const processClassify = async (filename: string) => {
+      if (!filename.startsWith("classify-") || filename.startsWith("classify-response-")) return
+      const fp = path.join(dir, filename)
+      if (!fs.existsSync(fp)) return
+      const respPath = path.join(dir, filename.replace("classify-", "classify-response-"))
+      if (fs.existsSync(respPath)) return
+      let data: any
+      try { data = JSON.parse(fs.readFileSync(fp, "utf8")) } catch { return }
+      if (data?.type !== "classify" || !data?.note || !Array.isArray(data?.options)) return
+      slog("classify watcher processing", data.id, data.note.slice(0, 80))
+      const byVal = new Map<string, number>(data.options.map((o: any, i: number) => [o.value, i + 1] as [string, number]))
+      const start = Date.now()
+      // Always try LLM for semantic (Vietnamese free-text → English options) — heuristic as fallback
+      let inferred: number[] = []
+      const llm = await llmClassify(client, directory, data.note, data.options, data.question)
+      if (llm.length) {
+        inferred = llm
+        slog("classify llm hit", data.id, llm.join(","))
+      } else {
+        inferred = heuristicClassify(data.note, data.options)
+        if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","))
+        else slog("classify no match", data.id, `"${data.note.slice(0, 40)}"`)
+      }
+      // Ensure minimal classify time so UI doesn't feel instant-wrong (at least 1200ms)
+      const elapsed = Date.now() - start
+      if (elapsed < 1200) await new Promise(r => setTimeout(r, 1200 - elapsed))
+      const inferredValues = inferred.map((i: number) => data.options[i - 1]?.value).filter(Boolean) as string[]
+      if (!inferred.length && data.note) {
+        const n = data.note.toLowerCase()
+        for (const o of data.options) {
+          const v = o.value ? String(o.value).toLowerCase() : ""
+          if (v && n.includes(v) && !inferred.includes(byVal.get(o.value) as number)) {
+            const idx = byVal.get(o.value) as number | undefined
+            if (idx) inferred.push(idx)
+          }
+        }
+      }
+      slog("classify inferred", data.id, inferred.join(",") || "(none)", `note:"${data.note.slice(0, 60)}"`)
+      const out = { id: data.id, inferredIndices: inferred, inferredValues, note: data.note, at: Date.now() }
+      try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8"); slog("classify response written", data.id, inferred.join(",")) } catch {}
+    }
+    // Initial sweep
+    try {
+      for (const f of fs.readdirSync(dir).filter(f => f.startsWith("classify-") && !f.startsWith("classify-response-"))) {
+        void processClassify(f)
+      }
+    } catch {}
+    try {
+      const w = fs.watch(dir, (_e, filename) => { if (filename) void processClassify(filename) })
+      w.on("error", () => {})
+      // Keep watcher alive; store to avoid GC? No need.
+    } catch {}
+  }
+  startClassifyWatcher(client, directory)
+
   // Durability: on (re)start, re-watch any pending quizzes left from a crash/exit
   try {
     const dir = pendingDir(directory)
     if (fs.existsSync(dir)) {
-      for (const f of fs.readdirSync(dir).filter(x => x.endsWith(".json") && !x.startsWith("response-") && !x.startsWith("."))) {
+      for (const f of fs.readdirSync(dir).filter(x => x.endsWith(".json") && !x.startsWith("response-") && !x.startsWith(".") && !x.startsWith("classify"))) {
         try {
           const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
           if (j?.id && j?.sessionID) {
