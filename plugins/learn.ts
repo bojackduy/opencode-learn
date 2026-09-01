@@ -464,31 +464,41 @@ const server: Plugin = async ({ client, directory }) => {
   const messageIdToRole = new Map<string, string>()
 
   // ── Classify watcher: note → inferred options (learner-easy) — LLM-backed, not heuristic-only
-  function heuristicClassify(note: string, options: Array<{ label: string; value?: string }>): number[] {
+  function heuristicClassify(note: string, options: Array<{ label: string; value?: string }>, multiSelect?: boolean): number[] {
     const n = note.toLowerCase()
-    const out: number[] = []
+    const scored: Array<{ idx:number, score:number, len:number }> = []
     for (let i = 0; i < options.length; i++) {
       const o = options[i]
       const label = (o.label || "").toLowerCase()
       const value = (o.value || "").toLowerCase()
-      if (label && n.includes(label)) out.push(i + 1)
-      else if (value && n.includes(value)) out.push(i + 1)
+      let score = 0
+      if (label && n.includes(label)) score = 3
+      else if (value && n.includes(value)) score = 2
       else {
         const tokens = label.split(/[^a-z0-9]+/).filter(t => t.length >= 3)
-        if (tokens.some(t => n.includes(t))) out.push(i + 1)
+        if (tokens.some(t => n.includes(t))) score = 1
       }
+      if (score) scored.push({ idx: i + 1, score, len: label.length })
     }
-    return [...new Set(out)]
+    scored.sort((a,b)=> b.score - a.score || b.len - a.len)
+    const out = scored.map(s=> s.idx)
+    const uniq = [...new Set(out)]
+    if (!multiSelect && uniq.length > 1) {
+      slog("heuristicClassify single-select trimmed", uniq.join(","), "->", uniq[0])
+      return [uniq[0]!]
+    }
+    return uniq
   }
-  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string, parentSessionID?: string): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string }> {
-    const prompt = `Map learner's free-text note (may be Vietnamese or English) to closest option(s) and judge semantic correctness. Only pick from given Options, no new options.
+  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string, parentSessionID?: string, multiSelect?: boolean): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string }> {
+    const modeHint = multiSelect ? "This is a MULTI-SELECT question (0..N options may be correct). You may return 0..N inferred indices." : "This is a SINGLE-SELECT question (exactly 0 or 1 inferred). You MUST return at most ONE inferred index. Never return multiple. If note is ambiguous or mentions several options, pick the SINGLE best match. Return [] if vague."
+    const prompt = `Map learner's free-text note (may be Vietnamese or English) to closest option(s) and judge semantic correctness. Only pick from given Options, no new options. ${modeHint}
 
 ${question ? `Question: ${question}\n` : ""}Options:
 ${options.map((o, i) => `${i + 1}. ${o.label} (value: ${o.value || o.label})`).join("\n")}
 
 Learner note: "${note}"
 
-Task: 1) inferred: which option(s) note best matches (Vietnamese translations/synonyms allowed). 2) semanticCorrect: true if note shows valid understanding or deeper nuance even when inferred != correct key (e.g., note about rotate array variant vs standard sorted is valid nuance). 3) reason: short English reason.
+Task: 1) inferred: which option(s) note best matches (Vietnamese translations/synonyms allowed) — respect single/multi mode above. 2) semanticCorrect: true if note shows valid understanding or deeper nuance even when inferred != correct key (e.g., note about rotate array variant vs standard sorted is valid nuance). 3) reason: short English reason.
 
 Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If vague/"I don't know", inferred:[], semanticCorrect:false. No markdown, just JSON.`
     try {
@@ -515,6 +525,14 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
             const entry = arr[j]
             if (entry?.info?.role === "assistant") {
               const text = (entry.parts || []).filter((p: any) => p.type === "text").map((p: any) => p.text).join(" ") || ""
+              const enforceSingle = (arr:number[]) => {
+                if (!multiSelect && arr.length > 1) {
+                  const trimmed = [arr[0]!]
+                  slog("llmClassify enforce single", arr.join(","), "->", trimmed.join(","), multiSelect ? "multi" : "single")
+                  return trimmed
+                }
+                return arr
+              }
               // Try object JSON {"inferred":[2],"semanticCorrect":false}
               const objMatch = text.match(/\{[^}]*"inferred"[^}]*\}/)
               if (objMatch) {
@@ -522,8 +540,9 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                   const parsed = JSON.parse(objMatch[0])
                   if (parsed && Array.isArray(parsed.inferred)) {
                     const nums = parsed.inferred.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
-                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `semantic:${parsed.semanticCorrect} reason:${parsed.reason || ""} sid:${sid}`)
-                    return { inferred: nums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason, sessionID: sid }
+                    const fnums = enforceSingle(nums)
+                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `->${fnums.join(",")}`, `semantic:${parsed.semanticCorrect} reason:${parsed.reason || ""} sid:${sid}`)
+                    return { inferred: fnums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason, sessionID: sid }
                   }
                 } catch {}
               }
@@ -534,15 +553,20 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                   if (Array.isArray(parsed)) {
                     const nums = parsed.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     if (nums.length) {
-                      slog("llmClassify success array", note.slice(0, 40), nums.join(","))
-                      return { inferred: nums, sessionID: sid }
+                      const fnums = enforceSingle(nums)
+                      slog("llmClassify success array", note.slice(0, 40), nums.join(","), `->${fnums.join(",")}`)
+                      return { inferred: fnums, sessionID: sid }
                     }
                   }
                 } catch {}
               }
               if (text.includes("1") || text.includes("2")) {
                 const nums = [...text.matchAll(/\b([1-9])\b/g)].map(x => parseInt(x[1])).filter(n => n <= options.length)
-                if (nums.length) return { inferred: [...new Set(nums)], sessionID: sid }
+                if (nums.length) {
+                  const uniq = [...new Set(nums)]
+                  const fnums = enforceSingle(uniq)
+                  return { inferred: fnums, sessionID: sid }
+                }
               }
             }
           }
@@ -572,33 +596,52 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
       let inferred: number[] = []
       let semanticCorrect: boolean | undefined
       let reason: string | undefined
-      const llmRes = await llmClassify(client, directory, data.note, data.options, data.question, data.sessionID)
+      const multi = !!data.multiSelect
+      const llmRes = await llmClassify(client, directory, data.note, data.options, data.question, data.sessionID, multi)
       if (llmRes.inferred.length) {
         inferred = llmRes.inferred
         semanticCorrect = llmRes.semanticCorrect
         reason = llmRes.reason
-        slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect} sid:${llmRes.sessionID || ""}`)
+        slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect} multi:${multi} sid:${llmRes.sessionID || ""}`)
       } else {
-        inferred = heuristicClassify(data.note, data.options)
-        if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","))
+        inferred = heuristicClassify(data.note, data.options, multi)
+        if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","), `multi:${multi}`)
         else slog("classify no match", data.id, `"${data.note.slice(0, 40)}"`)
+      }
+      // Enforce single-select at the watcher level too (defense in depth — prompt + llmClassify + heuristic may still return multi)
+      if (!multi && inferred.length > 1) {
+        const before = inferred.join(",")
+        inferred = [inferred[0]!]
+        slog("classify enforce single at watcher", data.id, `${before} -> ${inferred.join(",")}`)
       }
       // Ensure minimal classify time so UI doesn't feel instant-wrong (at least 1200ms)
       const elapsed = Date.now() - start
       if (elapsed < 1200) await new Promise(r => setTimeout(r, 1200 - elapsed))
-      const inferredValues = inferred.map((i: number) => data.options[i - 1]?.value).filter(Boolean) as string[]
-      // Final fallback if still empty
+      // Final fallback if still empty (respects single-select)
       if (!inferred.length && data.note) {
         const n = data.note.toLowerCase()
         for (const o of data.options) {
           const v = o.value ? String(o.value).toLowerCase() : ""
           if (v && n.includes(v) && !inferred.includes(byVal.get(o.value) as number)) {
             const idx = byVal.get(o.value) as number | undefined
-            if (idx) inferred.push(idx)
+            if (idx) {
+              inferred.push(idx)
+              if (!multi) break
+            }
           }
         }
+        if (!multi && inferred.length > 1) {
+          slog("classify fallback enforce single", data.id, inferred.join(","))
+          inferred = [inferred[0]!]
+        }
       }
-      slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} sid:${(llmRes as any)?.sessionID || ""} note:"${data.note.slice(0, 60)}"`)
+      if (!multi && inferred.length > 1) {
+        const before2 = inferred.join(",")
+        inferred = [inferred[0]!]
+        slog("classify final enforce single", data.id, `${before2} -> ${inferred.join(",")}`)
+      }
+      const inferredValues = inferred.map((i: number) => data.options[i - 1]?.value).filter(Boolean) as string[]
+      slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} multi:${multi} sid:${(llmRes as any)?.sessionID || ""} note:"${data.note.slice(0, 60)}"`)
       const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, classifySessionID: (llmRes as any)?.sessionID, note: data.note, at: Date.now() }
       try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8"); slog("classify response written", data.id, inferred.join(",")) } catch {}
     }

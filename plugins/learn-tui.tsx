@@ -183,7 +183,7 @@ function QuizDialog(props: {
       try {
         const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
         const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
-        const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
+        const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
         fs.writeFileSync(path.join(pDir, `classify-${props.request.id}.json`), JSON.stringify(pendingClassify), "utf8")
         tlog("QuizDialog classify request", props.request.id, note().trim().slice(0, 50))
         // Poll for classify-response
@@ -207,20 +207,23 @@ function QuizDialog(props: {
                 return idxs.length === props.request.correctIndices.length && idxs.every((v: number) => correctSet.has(v)) && props.request.correctIndices.every((v: number) => idxs.includes(v))
               }
               if (inferred && inferred.length) {
+                const eff = !isMulti() && inferred.length > 1 ? [inferred[0]!] : inferred
+                if (eff.length !== inferred.length) tlog("QuizDialog classify enforce single", inferred.join(","), "->", eff.join(","))
                 const m = new Map<string, { label: string; value: string; index: number }>()
-                for (let i = 0; i < inferred.length; i++) {
-                  const idx = inferred[i]
+                for (let i = 0; i < eff.length; i++) {
+                  const idx = eff[i]
                   const opt = options()[idx - 1]
                   if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx })
                 }
                 setSelected(m)
-                const correct = computeCorrect(inferred)
-                setFeedback({ correct, selectedIndices: inferred })
+                const correct = computeCorrect(eff)
+                setFeedback({ correct, selectedIndices: eff })
                 if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
-                tlog("QuizDialog classify done", inferred.join(","), correct, reason || "")
+                tlog("QuizDialog classify done", eff.join(","), correct, reason || "")
               } else if (inferredValues && inferredValues.length) {
                 const byVal = new Map(options().map((o, i) => [o.value, i + 1]))
-                const idxs = inferredValues.map(v => byVal.get(v)).filter(Boolean) as number[]
+                let idxs = inferredValues.map(v => byVal.get(v)).filter(Boolean) as number[]
+                if (!isMulti() && idxs.length > 1) { const b=idxs.join(","); idxs=[idxs[0]!]; tlog("QuizDialog classifyValues enforce single", b, "->", idxs.join(",")) }
                 const m = new Map<string, { label: string; value: string; index: number }>()
                 for (const idx of idxs) { const opt = options()[idx - 1]; if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
                 setSelected(m)
@@ -588,7 +591,7 @@ function QuizBatchDialog(props: {
           const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
           const cid = `${props.request.id}-${idx()}`
           const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
-          const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
+          const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
           fs.writeFileSync(path.join(pDir, `classify-${cid}.json`), JSON.stringify(pendingClassify), "utf8")
           tlog("QuizBatchDialog classify request", cid, note().trim().slice(0, 50))
           const respPath = path.join(pDir, `classify-response-${cid}.json`)
