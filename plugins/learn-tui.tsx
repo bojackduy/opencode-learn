@@ -345,6 +345,14 @@ function QuizDialog(props: {
           <text fg={theme().background} bold>{phase() === "feedback" ? (feedback()?.correct ? "✓  CORRECT" : dontKnow() ? "○  I DON'T KNOW" : "✗  INCORRECT") : isMulti() ? "☑  QUIZ · MULTI-SELECT" : "●  QUIZ · SINGLE" }</text>
           <text fg={theme().background} dim>learn</text>
         </box>
+        {/* Pinned scroll cue — header-anchored, high contrast so user instantly knows explanation is below */}
+        <Show when={phase()==="feedback" && (canScrollUp() || canScrollDown())}>
+          <box justifyContent="center" height={1} backgroundColor={canScrollDown() ? theme().warning : theme().accent} paddingLeft={1} paddingRight={1}>
+            <text fg={theme().background} bold>
+              {canScrollUp() && canScrollDown() ? "▲ more above · ▼ more below — d / u to scroll" : canScrollDown() ? "▼ more below — press d to see explanation" : "▲ more above — press u to scroll up"}
+            </text>
+          </box>
+        </Show>
 
         <scrollbox ref={(el:any)=> scrollRef = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
         {/* Question — use opencode markdown render so ```python blocks get syntax coloring like native messages */}
@@ -465,14 +473,10 @@ function QuizDialog(props: {
         <box height={1} justifyContent="center">
           <text fg={theme().textMuted} wrapMode="wrap">
             {phase() === "feedback"
-              ? (canScrollUp() && canScrollDown() ? "▲ more above · ▼ more below — d/u to scroll · Enter to continue"
-                : canScrollDown() ? "▼ more below — d to scroll · Enter to continue"
-                : canScrollUp() ? "▲ more above — u to scroll · Enter to continue"
-                : "↵ Enter / Esc to continue  →  next probe")
+              ? (canScrollUp() && canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter to continue</span></> : canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter to continue</span></> : canScrollUp() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter to continue</span></> : "↵ Enter / Esc to continue  →  next probe")
               : phase() === "classifying" ? "Classifying your note..."
               : focused() === "note" ? "Enter submit note → classify · Tab/Esc back"
-              : (canScrollUp() || canScrollDown()) ? "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel · d/u scroll"
-              : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
+              : (canScrollUp() || canScrollDown()) ? <><span style={{fg: theme().textMuted}}>j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel</span><span style={{fg: theme.warning, bold: true}}> · d/u scroll</span></> : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
           </text>
         </box>
       </box>
@@ -668,6 +672,14 @@ function QuizBatchDialog(props: {
         <text fg={theme().background} bold> decks.quiz batch  {idx()+1}/{props.request.quizzes.length} {phase()==="feedback"?(feedback()?.correct?"✓":"✗"):""}</text>
         <text fg={theme().background} dim>learn</text>
       </box>
+      {/* Pinned scroll cue — header-anchored, high contrast */}
+      <Show when={phase()==="feedback" && (canScrollUpBatch() || canScrollDownBatch())}>
+        <box justifyContent="center" height={1} backgroundColor={canScrollDownBatch() ? theme().warning : theme().accent} paddingLeft={1} paddingRight={1}>
+          <text fg={theme().background} bold>
+            {canScrollUpBatch() && canScrollDownBatch() ? "▲ more above · ▼ more below — d / u to scroll" : canScrollDownBatch() ? "▼ more below — press d to see explanation" : "▲ more above — press u to scroll up"}
+          </text>
+        </box>
+      </Show>
       <scrollbox ref={(el:any)=> scrollRefBatch = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
       <markdown syntaxStyle={syntax()} content={decodeQuizText(cur().question)} fg={theme().text} bg={theme().backgroundPanel} />
       <Show when={cur().details}><markdown syntaxStyle={syntax()} content={decodeQuizText(cur().details)} fg={theme().textMuted} bg={theme().backgroundPanel} /></Show>
@@ -699,7 +711,7 @@ function QuizBatchDialog(props: {
       </scrollbox>
       <box height={1} justifyContent="center">
         <text fg={theme().textMuted} wrapMode="wrap">
-          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? `▲ more above · ▼ more below — d/u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollDownBatch() ? `▼ more below — d to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : canScrollUpBatch() ? `▲ more above — u to scroll · Enter → next (${idx()+1}/${props.request.quizzes.length})` : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : focused()==="note" ? "Enter submit note → classify · Tab/Esc back" : (canScrollUpBatch() || canScrollDownBatch()) ? "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel · d/u scroll" : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
+          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollUpBatch() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : focused()==="note" ? "Enter submit note → classify · Tab/Esc back" : (canScrollUpBatch() || canScrollDownBatch()) ? <><span style={{fg: theme().textMuted}}>j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel</span><span style={{fg: theme.warning, bold: true}}> · d/u scroll</span></> : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
         </text>
       </box>
     </box>
