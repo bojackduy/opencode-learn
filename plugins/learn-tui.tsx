@@ -286,9 +286,9 @@ function QuizDialog(props: {
     }
     // Note focused: handle Tab/Esc/Enter to exit note, otherwise let input handle typing
     if (focused() === "note") {
-      if (key === "tab" || seq === "\t") { prevent(evt); setFocused("options"); return }
-      if (key === "escape" || key === "esc") { prevent(evt); setFocused("options"); return }
-      if (key === "enter" && (evt.ctrl || evt.meta)) { prevent(evt); setFocused("options"); return }
+      if (lower === "tab" || seq === "\t") { prevent(evt); setFocused("options"); return }
+      if (lower === "escape" || lower === "esc") { prevent(evt); setFocused("options"); return }
+      if (lower === "enter" && (evt.ctrl || evt.meta)) { prevent(evt); setFocused("options"); return }
       // Allow typing to go to input; don't prevent
       return
     }
@@ -303,11 +303,11 @@ function QuizDialog(props: {
       if (note().trim() && !selected().size && !dontKnow()) return dontKnowIdx() + 1
       return dontKnowIdx()
     }
-    if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(evt); setOptionIndex(i => Math.max(0, i - 1)); return }
-    if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(evt); setOptionIndex(i => Math.min(maxIdx(), i + 1)); return }
-    if (key === "tab" || seq === "\t") { prevent(evt); setFocused("note"); return }
-    if (key === "escape" || key === "esc") { prevent(evt); props.onCancel(); return }
-    if (key === "space" || seq === " ") {
+    if (lower === "up" || isPlainKey(evt,"k") || seq === "\x1b[A") { prevent(evt); setOptionIndex(i => Math.max(0, i - 1)); return }
+    if (lower === "down" || isPlainKey(evt,"j") || seq === "\x1b[B") { prevent(evt); setOptionIndex(i => Math.min(maxIdx(), i + 1)); return }
+    if (lower === "tab" || seq === "\t") { prevent(evt); setFocused("note"); return }
+    if (lower === "escape" || lower === "esc") { prevent(evt); props.onCancel(); return }
+    if (lower === "space" || seq === " ") {
       prevent(evt)
       const idx = optionIndex()
       if (idx === dontKnowIdx()) handleDontKnow()
@@ -321,7 +321,7 @@ function QuizDialog(props: {
       }
       return
     }
-    if (key === "enter" || seq === "\r") {
+    if (lower === "enter" || seq === "\r") {
       prevent(evt)
       const idx = optionIndex()
       if (idx === dontKnowIdx()) handleDontKnow()
@@ -333,7 +333,7 @@ function QuizDialog(props: {
         }
       return
     }
-    if (seq === "ctrl+j" || (key === "enter" && (evt as any).ctrl)) {
+    if (seq === "ctrl+j" || (lower === "enter" && (evt as any).ctrl)) {
       prevent(evt); submitSelect(); return
     }
   })
@@ -654,16 +654,16 @@ function QuizBatchDialog(props: {
         if (lower==="pageup"||seq==="\x1b[5~"){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30)}catch{} return }
         if (lower==="pagedown"||seq==="\x1b[6~"){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30)}catch{} return }
         if(lower==="enter"||seq==="\r"||lower==="escape"||lower==="esc"){ prevent(evt); goNext() } return }
-      if(focused()==="note"){ if(k==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return} if(k==="escape"){prevent(evt); setFocused("options"); return} return }
+      if(focused()==="note"){ if(lower==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return} if(lower==="escape"||lower==="esc"){prevent(evt); setFocused("options"); return} return }
       if(phase()==="select" && (isPlainKeyBatch(evt,"d")||seq==="\x04")){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
       if(phase()==="select" && (isPlainKeyBatch(evt,"u")||seq==="\x15")){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
-      if(k==="up"||k==="k"||seq==="\x1b[A"){prevent(evt); setOptionIndex(i=>Math.max(0,i-1)); return}
-      if(k==="down"||k==="j"||seq==="\x1b[B"){prevent(evt); setOptionIndex(i=>Math.min(isMulti()?submitIdx():dontKnowIdx(),i+1)); return}
-      if(k==="tab"||seq==="\t"){prevent(evt); setFocused("note"); return}
-      if(k==="escape"||k==="esc"){prevent(evt); props.onCancel(); return}
-      if(k==="space"||seq===" "){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
-      if(k==="enter"||seq==="\r"){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); } else if(isMulti()) submitSelect(); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
-      if(seq==="ctrl+j" || (k==="enter" && evt.ctrl)){prevent(evt); submitSelect(); return}
+      if(lower==="up"||isPlainKeyBatch(evt,"k")||seq==="\x1b[A"){prevent(evt); setOptionIndex(i=>Math.max(0,i-1)); return}
+      if(lower==="down"||isPlainKeyBatch(evt,"j")||seq==="\x1b[B"){prevent(evt); setOptionIndex(i=>Math.min(isMulti()?submitIdx():dontKnowIdx(),i+1)); return}
+      if(lower==="tab"||seq==="\t"){prevent(evt); setFocused("note"); return}
+      if(lower==="escape"||lower==="esc"){prevent(evt); props.onCancel(); return}
+      if(lower==="space"||seq===" "){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); } else if(isMulti() && i===submitIdx()) submitSelect(); else if(isMulti()) toggle(i); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
+      if(lower==="enter"||seq==="\r"){prevent(evt); const i=optionIndex(); if(i===dontKnowIdx()){ const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); } else if(isMulti()) submitSelect(); else { const o=cur().options[i]; if(o){setSelected(new Map([[`opt:${i}`,{label:o.label,value:o.value,index:i+1}]])); setDontKnow(false); submitSelect()} } return}
+      if(seq==="ctrl+j" || (lower==="enter" && evt.ctrl)){prevent(evt); submitSelect(); return}
     } catch(e){ tlog("useKeyboard batch failed", String(e)) }
   })
   return (
