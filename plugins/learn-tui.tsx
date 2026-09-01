@@ -99,8 +99,14 @@ function QuizDialog(props: {
   const theme = () => props.api.theme.current
   const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
-  const popupWidth = () => Math.max(68, Math.min(dims().width - 4, 92))
-  const popupHeight = () => Math.max(4, Math.min(24, dims().height - 2))
+  const popupWidth = () => {
+    const w = dims().width
+    return Math.max(62, Math.min(w - 8, Math.floor(w * 0.80), 92))
+  }
+  const popupHeight = () => {
+    const h = dims().height
+    return Math.max(14, Math.min(h - 6, Math.floor(h * 0.62), 26))
+  }
   const options = () => props.request.options
   const correctSet = new Set(props.request.correctIndices)
   const isMulti = () => !!props.request.multiSelect
@@ -483,8 +489,14 @@ function QuizBatchDialog(props: {
   const theme = () => props.api.theme.current
   const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
-  const popupWidth = () => Math.max(68, Math.min(dims().width - 4, 96))
-  const popupHeight = () => Math.max(4, Math.min(24, dims().height - 2))
+  const popupWidth = () => {
+    const w = dims().width
+    return Math.max(64, Math.min(w - 8, Math.floor(w * 0.82), 96))
+  }
+  const popupHeight = () => {
+    const h = dims().height
+    return Math.max(14, Math.min(h - 6, Math.floor(h * 0.64), 28))
+  }
   const [idx, setIdx] = createSignal(0)
   // Guard: if no quizzes, cancel
   if (!props.request.quizzes || props.request.quizzes.length === 0) {
