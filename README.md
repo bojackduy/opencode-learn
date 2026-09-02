@@ -6,7 +6,7 @@
 
 [![opencode plugin](https://img.shields.io/badge/opencode-plugin-9cf?style=flat-square)](https://opencode.ai)
 [![TUI](https://img.shields.io/badge/TUI-OpenTUI-purple?style=flat-square)](https://github.com/anomalyco/opentui)
-[![license](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
+[![license](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue?style=flat-square)](LICENSE)
 
 ![Quiz — multi-select with I don't know and note, durable TUI](assets/demo.png)
 
@@ -148,7 +148,7 @@ See `~/Code/opencode-loopd/{package.json,scripts/install-node.mjs,.github/workfl
 
 ## License
 
-MIT — see `LICENSE`. Original `learn` is personal, shared as-is by Amos.
+AGPL-3.0-or-later — see [LICENSE](./LICENSE). Original `learn` is personal, shared as-is by Amos. Original `pi` remains MIT.
 
 ## Credits
 
