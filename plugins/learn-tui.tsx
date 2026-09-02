@@ -202,11 +202,19 @@ function QuizDialog(props: {
               const inferredValues = data?.inferredValues as string[] | undefined
               const semanticCorrect = data?.semanticCorrect as boolean | undefined
               const reason = data?.reason as string | undefined
+              const isIDK = !!(data as any)?.isIDK
               const computeCorrect = (idxs: number[]) => {
                 if (typeof semanticCorrect === "boolean") return semanticCorrect
                 return idxs.length === props.request.correctIndices.length && idxs.every((v: number) => correctSet.has(v)) && props.request.correctIndices.every((v: number) => idxs.includes(v))
               }
-              if (inferred && inferred.length) {
+              if (isIDK) {
+                setDontKnow(true)
+                setSelected(new Map())
+                setFeedback({ correct: false, selectedIndices: [] })
+                if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
+                else if (!note().toLowerCase().includes("idk") && !note().toLowerCase().includes("don't know")) setNote(prev => prev ? `${prev} — IDK: ${reason || "needs easier"}` : prev)
+                tlog("QuizDialog classify isIDK", reason || "")
+              } else if (inferred && inferred.length) {
                 const eff = !isMulti() && inferred.length > 1 ? [inferred[0]!] : inferred
                 if (eff.length !== inferred.length) tlog("QuizDialog classify enforce single", inferred.join(","), "->", eff.join(","))
                 const m = new Map<string, { label: string; value: string; index: number }>()
@@ -617,19 +625,28 @@ function QuizBatchDialog(props: {
                 const inferred = data?.inferredIndices as number[] | undefined
                 const semanticCorrect = data?.semanticCorrect as boolean | undefined
                 const reason = data?.reason as string | undefined
+                const isIDK = !!(data as any)?.isIDK
                 const computeOk2 = (idxs: number[]) => {
                   if (typeof semanticCorrect === "boolean") return semanticCorrect
                   const correctSet2 = new Set(cur().correctIndices)
                   return idxs.length === cur().correctIndices.length && idxs.every(v => correctSet2.has(v)) && cur().correctIndices.every(v => idxs.includes(v))
                 }
-                if (inferred && inferred.length) {
+                if (isIDK) {
+                  setDontKnow(true)
+                  setSelected(new Map())
+                  setFeedback({ correct: false, selectedIndices: [] })
+                  if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
+                  tlog("QuizBatchDialog classify isIDK", reason || "")
+                } else if (inferred && inferred.length) {
+                  const eff = !isMulti() && inferred.length > 1 ? [inferred[0]!] : inferred
+                  if (eff.length !== inferred.length) tlog("QuizBatchDialog classify enforce single", inferred.join(","), "->", eff.join(","))
                   const mm = new Map<string, any>()
-                  for (const idx of inferred) { const opt = cur().options[idx - 1]; if (opt) mm.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
+                  for (const idx of eff) { const opt = cur().options[idx - 1]; if (opt) mm.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
                   setSelected(mm)
-                  const ok2 = computeOk2(inferred)
-                  setFeedback({ correct: ok2, selectedIndices: inferred })
+                  const ok2 = computeOk2(eff)
+                  setFeedback({ correct: ok2, selectedIndices: eff })
                   if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
-                  tlog("QuizBatchDialog classify done", inferred.join(","), ok2, reason || "")
+                  tlog("QuizBatchDialog classify done", eff.join(","), ok2, reason || "")
                 } else {
                   const ok2 = typeof semanticCorrect === "boolean" ? semanticCorrect : false
                   setFeedback({ correct: ok2, selectedIndices: [] })

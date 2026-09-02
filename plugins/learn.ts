@@ -489,18 +489,19 @@ const server: Plugin = async ({ client, directory }) => {
     }
     return uniq
   }
-  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string, parentSessionID?: string, multiSelect?: boolean): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string }> {
+  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string, parentSessionID?: string, multiSelect?: boolean): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string; isIDK?: boolean }> {
     const modeHint = multiSelect ? "This is a MULTI-SELECT question (0..N options may be correct). You may return 0..N inferred indices." : "This is a SINGLE-SELECT question (exactly 0 or 1 inferred). You MUST return at most ONE inferred index. Never return multiple. If note is ambiguous or mentions several options, pick the SINGLE best match. Return [] if vague."
-    const prompt = `Map learner's free-text note (may be Vietnamese or English) to closest option(s) and judge semantic correctness. Only pick from given Options, no new options. ${modeHint}
+    const idkHint = `Also detect IDK intent: if note says "I don't know / idk / too hard / too difficult / need easier / want easier / skip / give me easier/harder" or expresses wanting difficulty adjustment, set "isIDK": true (and keep inferred as [] or best guess). Otherwise isIDK false. The main teacher will use this to adapt difficulty.`
+    const prompt = `Map learner's free-text note (may be Vietnamese or English) to closest option(s) and judge semantic correctness. Only pick from given Options, no new options. ${modeHint} ${idkHint}
 
 ${question ? `Question: ${question}\n` : ""}Options:
 ${options.map((o, i) => `${i + 1}. ${o.label} (value: ${o.value || o.label})`).join("\n")}
 
 Learner note: "${note}"
 
-Task: 1) inferred: which option(s) note best matches (Vietnamese translations/synonyms allowed) — respect single/multi mode above. 2) semanticCorrect: true if note shows valid understanding or deeper nuance even when inferred != correct key (e.g., note about rotate array variant vs standard sorted is valid nuance). 3) reason: short English reason.
+Task: 1) inferred: which option(s) note best matches (Vietnamese translations/synonyms allowed) — respect single/multi mode above. 2) semanticCorrect: true if note shows valid understanding or deeper nuance even when inferred != correct key (e.g., note about rotate array variant vs standard sorted is valid nuance). 3) reason: short English reason. 4) isIDK: true if note expresses IDK / wants easier/harder/skip.
 
-Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If vague/"I don't know", inferred:[], semanticCorrect:false. No markdown, just JSON.`
+Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK":false}  If vague/"I don't know", inferred:[], semanticCorrect:false, isIDK:true if IDK intent. No markdown, just JSON.`
     try {
       const title = `classify: ${question ? question.slice(0, 30) : note.slice(0, 20)}`
       const body: any = { title }
@@ -533,6 +534,10 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                 }
                 return arr
               }
+              const noteIsIDK = (() => {
+                const n = note.toLowerCase()
+                return n.includes("idk") || n.includes("i don't know") || n.includes("i dont know") || n.includes("dont know") || n.includes("too hard") || n.includes("too difficult") || n.includes("need easier") || n.includes("want easier") || n.includes("give me easier") || n.includes("skip") || n.includes("quá khó") || n.includes("khó quá") || n.includes("dễ hơn") || n.includes("dễ hơn")
+              })()
               // Try object JSON {"inferred":[2],"semanticCorrect":false}
               const objMatch = text.match(/\{[^}]*"inferred"[^}]*\}/)
               if (objMatch) {
@@ -541,8 +546,9 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                   if (parsed && Array.isArray(parsed.inferred)) {
                     const nums = parsed.inferred.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     const fnums = enforceSingle(nums)
-                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `->${fnums.join(",")}`, `semantic:${parsed.semanticCorrect} reason:${parsed.reason || ""} sid:${sid}`)
-                    return { inferred: fnums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason, sessionID: sid }
+                    const isIDK = !!(parsed.isIDK ?? parsed.isIdk ?? parsed.dontKnow ?? parsed.isDontKnow ?? parsed.dont_know) || (noteIsIDK && fnums.length===0)
+                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `->${fnums.join(",")}`, `semantic:${parsed.semanticCorrect} isIDK:${isIDK} reason:${parsed.reason || ""} sid:${sid}`)
+                    return { inferred: fnums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason, sessionID: sid, isIDK }
                   }
                 } catch {}
               }
@@ -554,8 +560,9 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                     const nums = parsed.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     if (nums.length) {
                       const fnums = enforceSingle(nums)
-                      slog("llmClassify success array", note.slice(0, 40), nums.join(","), `->${fnums.join(",")}`)
-                      return { inferred: fnums, sessionID: sid }
+                      const isIDK = noteIsIDK && fnums.length===0
+                      slog("llmClassify success array", note.slice(0, 40), nums.join(","), `->${fnums.join(",")} isIDK:${isIDK}`)
+                      return { inferred: fnums, sessionID: sid, isIDK }
                     }
                   }
                 } catch {}
@@ -565,8 +572,14 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
                 if (nums.length) {
                   const uniq = [...new Set(nums)]
                   const fnums = enforceSingle(uniq)
-                  return { inferred: fnums, sessionID: sid }
+                  const isIDK = noteIsIDK && fnums.length===0
+                  return { inferred: fnums, sessionID: sid, isIDK }
                 }
+              }
+              // If LLM returned no inferred but note is IDK intent, still surface isIDK
+              if (noteIsIDK) {
+                slog("llmClassify isIDK fallback from note", note.slice(0,40))
+                return { inferred: [], sessionID: sid, isIDK: true }
               }
             }
           }
@@ -596,17 +609,32 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
       let inferred: number[] = []
       let semanticCorrect: boolean | undefined
       let reason: string | undefined
+      let isIDK: boolean | undefined
       const multi = !!data.multiSelect
       const llmRes = await llmClassify(client, directory, data.note, data.options, data.question, data.sessionID, multi)
+      isIDK = (llmRes as any).isIDK
+      // Direct IDK keyword fallback if LLM didn't flag (covers heuristic-only path)
+      if (!isIDK) {
+        const n = data.note.toLowerCase()
+        if (n.includes("idk") || n.includes("i don't know") || n.includes("i dont know") || n.includes("too hard") || n.includes("too difficult") || n.includes("need easier") || n.includes("want easier") || n.includes("quá khó") || n.includes("khó quá")) {
+          // Only treat as IDK if no inferred or inferred is empty — don't override a confident inferred
+          if (!llmRes.inferred.length) isIDK = true
+        }
+      }
       if (llmRes.inferred.length) {
         inferred = llmRes.inferred
         semanticCorrect = llmRes.semanticCorrect
         reason = llmRes.reason
-        slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect} multi:${multi} sid:${llmRes.sessionID || ""}`)
+        isIDK = (llmRes as any).isIDK ?? isIDK
+        slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect} isIDK:${isIDK} multi:${multi} sid:${llmRes.sessionID || ""}`)
       } else {
         inferred = heuristicClassify(data.note, data.options, multi)
-        if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","), `multi:${multi}`)
-        else slog("classify no match", data.id, `"${data.note.slice(0, 40)}"`)
+        if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","), `multi:${multi} isIDK:${isIDK}`)
+        else slog("classify no match", data.id, `"${data.note.slice(0, 40)}" isIDK:${isIDK}`)
+        // If heuristic still empty but note is IDK, keep isIDK true so TUI can show IDK
+        if (!inferred.length && isIDK) {
+          slog("classify isIDK with no inferred", data.id)
+        }
       }
       // Enforce single-select at the watcher level too (defense in depth — prompt + llmClassify + heuristic may still return multi)
       if (!multi && inferred.length > 1) {
@@ -641,8 +669,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"..."}  If va
         slog("classify final enforce single", data.id, `${before2} -> ${inferred.join(",")}`)
       }
       const inferredValues = inferred.map((i: number) => data.options[i - 1]?.value).filter(Boolean) as string[]
-      slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} multi:${multi} sid:${(llmRes as any)?.sessionID || ""} note:"${data.note.slice(0, 60)}"`)
-      const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, classifySessionID: (llmRes as any)?.sessionID, note: data.note, at: Date.now() }
+      slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} isIDK:${isIDK} multi:${multi} sid:${(llmRes as any)?.sessionID || ""} note:"${data.note.slice(0, 60)}"`)
+      const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, isIDK, classifySessionID: (llmRes as any)?.sessionID, note: data.note, at: Date.now() }
       try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8"); slog("classify response written", data.id, inferred.join(",")) } catch {}
     }
     // Initial sweep
