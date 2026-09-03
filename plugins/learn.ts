@@ -136,23 +136,75 @@ function decodeQuizText(s: string | undefined): string | undefined {
 
 // ────────────────────────────────────────────────────────────────────────────
 // md-log helpers (ported from .pi/extensions/md-log.ts)
+// 1-1-1 model: session : link : log file. No global file.
 // ────────────────────────────────────────────────────────────────────────────
-let mdLogFile: string | null = null
-let mdLogWriteLock: Promise<void> = Promise.resolve()
-function withMdLock<T>(fn: () => T | Promise<T>): Promise<T> {
-  const prev = mdLogWriteLock
+type MdLinkMeta = { file: string; directory: string; linkedAt: number }
+const mdLinks = new Map<string, MdLinkMeta>() // sessionID -> link
+const mdFileLocks = new Map<string, Promise<void>>()
+function withMdFileLock<T>(file: string, fn: () => T | Promise<T>): Promise<T> {
+  const prev = mdFileLocks.get(file) ?? Promise.resolve()
   let release!: () => void
-  mdLogWriteLock = new Promise<void>(r => { release = r })
+  const next = new Promise<void>(r => { release = r })
+  mdFileLocks.set(file, next)
   return prev.then(fn).finally(() => release())
 }
-function appendToMdLog(text: string) {
-  if (!mdLogFile) return
+// Back-compat alias used by older call sites during migration (per-file lock)
+function withMdLock<T>(fn: () => T | Promise<T>): Promise<T> {
+  // Fallback: no file context — run directly (callers should migrate to withMdFileLock)
+  return Promise.resolve().then(fn)
+}
+function getMdFile(sessionID: string | undefined): string | undefined {
+  if (!sessionID) return undefined
+  return mdLinks.get(sessionID)?.file
+}
+function appendToMdLogForSession(sessionID: string | undefined, text: string) {
+  const file = getMdFile(sessionID)
+  if (!file || !sessionID) return
   try {
     let current = ""
-    if (fs.existsSync(mdLogFile)) current = fs.readFileSync(mdLogFile, "utf-8")
+    if (fs.existsSync(file)) current = fs.readFileSync(file, "utf-8")
     const prefix = current.trim().length > 0 ? "\n\n" : ""
-    fs.writeFileSync(mdLogFile, current + prefix + text + "\n", "utf-8")
+    fs.writeFileSync(file, current + prefix + text + "\n", "utf-8")
   } catch {}
+}
+function loadMdLinks(markerPath: string, directory: string) {
+  try {
+    if (!fs.existsSync(markerPath)) return 0
+    const data = JSON.parse(fs.readFileSync(markerPath, "utf-8"))
+    // Legacy shape {file} — do NOT auto-migrate (would bleed). Back up and start empty.
+    if (data && typeof data.file === "string" && !data.links) {
+      try { fs.writeFileSync(markerPath + ".bak", JSON.stringify(data), "utf-8") } catch {}
+      try { fs.writeFileSync(markerPath, JSON.stringify({ version: 1, links: {} }), "utf-8") } catch {}
+      try { slog("md-log legacy marker backed up, starting empty 1-1-1", markerPath) } catch {}
+      return 0
+    }
+    const links = (data as any)?.links ?? {}
+    let n = 0
+    for (const [ses, v] of Object.entries<any>(links)) {
+      const f = (v as any)?.file ?? (typeof v === "string" ? v : undefined)
+      if (typeof ses === "string" && typeof f === "string" && fs.existsSync(f)) {
+        mdLinks.set(ses, { file: f, directory: (v as any)?.directory || directory, linkedAt: (v as any)?.linkedAt || Date.now() })
+        n++
+      }
+    }
+    return n
+  } catch { return 0 }
+}
+function saveMdLinksForDirectory(markerPath: string, directory: string) {
+  try {
+    const out: Record<string, { file: string; directory: string; linkedAt: number }> = {}
+    for (const [ses, meta] of mdLinks) {
+      if (meta.directory === directory) out[ses] = meta
+    }
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true })
+    fs.writeFileSync(markerPath, JSON.stringify({ version: 1, links: out }), "utf-8")
+  } catch {}
+}
+function extractHookSessionID(...candidates: any[]): string | undefined {
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) return c
+  }
+  return undefined
 }
 function callout(type: string, title: string, bodyLines: string[]) {
   const lines = [`> [!${type}] ${title}`]
@@ -202,7 +254,8 @@ function answerCalloutAsk(details: any): string {
   return callout("example", "Answer", body)
 }
 async function backfillMdLog(client: any, sessionID: string, directory: string): Promise<number> {
-  if (!mdLogFile || !sessionID) return 0
+  const mdFile = getMdFile(sessionID)
+  if (!mdFile || !sessionID) return 0
   try {
     const res: any = await client.session.messages({ path: { id: sessionID }, query: { directory } })
     const data: any = res?.data ?? res
@@ -286,15 +339,16 @@ async function backfillMdLog(client: any, sessionID: string, directory: string):
       }
     }
     if (blocks.length) {
+      const mdFile2 = getMdFile(sessionID) || mdFile
       let current = ""
-      try { if (fs.existsSync(mdLogFile)) current = fs.readFileSync(mdLogFile, "utf-8") } catch {}
+      try { if (fs.existsSync(mdFile2)) current = fs.readFileSync(mdFile2, "utf-8") } catch {}
       // If file empty, overwrite; else append with separator (preserve user notes)
       if (current.trim().length === 0) {
-        fs.writeFileSync(mdLogFile, blocks.join("\n\n") + "\n", "utf-8")
+        fs.writeFileSync(mdFile2, blocks.join("\n\n") + "\n", "utf-8")
       } else {
         // Avoid duplicating if already contains same session text
         const prefix = current.trim().length > 0 ? "\n\n" : ""
-        fs.writeFileSync(mdLogFile, current + prefix + blocks.join("\n\n") + "\n", "utf-8")
+        fs.writeFileSync(mdFile2, current + prefix + blocks.join("\n\n") + "\n", "utf-8")
       }
     }
     return blocks.length
@@ -445,23 +499,22 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
 // Plugin definition
 // ────────────────────────────────────────────────────────────────────────────
 const server: Plugin = async ({ client, directory }) => {
-  // Try to restore md-log file from a marker file if exists
+  // 1-1-1: restore session->file links for this directory (same session resumes, different session stays silent)
   const markerPath = path.join(directory, ".opencode", "learn-md-log.json")
   try {
-    if (fs.existsSync(markerPath)) {
-      const data = JSON.parse(fs.readFileSync(markerPath, "utf-8"))
-      if (data?.file && fs.existsSync(data.file)) mdLogFile = data.file
-    }
+    const n = loadMdLinks(markerPath, directory)
+    if (n) slog("md-log links restored", n, markerPath)
   } catch {}
 
   // Session-scoped visual state (one per plugin instance; subagents get separate plugin instances per session, so isolation is natural)
   let mermaidSession: { workDir: string; bodyPath: string } | null = null
   let svgSession: { workDir: string; bodyPath: string } | null = null
 
-  // md-log dedup state (per plugin instance, survives across sessions but mdLogFile is global)
+  // md-log dedup state keyed by session to avoid cross-session suppression (1-1-1)
   const loggedTextPartIds = new Set<string>()
   const loggedToolCallIds = new Set<string>()
   const messageIdToRole = new Map<string, string>()
+  const mdKey = (ses: string | undefined, id: string) => `${ses || "?"}:${id}`
 
   // ── Classify watcher: note → inferred options (learner-easy) — LLM-backed, not heuristic-only
   function heuristicClassify(note: string, options: Array<{ label: string; value?: string }>, multiSelect?: boolean): number[] {
@@ -704,19 +757,23 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                 const dk = !!r?.dontKnow
                 const ok = !dk && si.length === (j.correctIndices||[]).length && si.every((i:number)=>cs.has(i))
                 const note = r?.note ? `\nNote: ${r.note}` : ""
-                if (mdLogFile) {
+                if (getMdFile(j.sessionID)) {
                   const details = { status: "completed" as const, answers: r?.answers || [], correct: ok, correctIndices: j.correctIndices || [], explanation: j.explanation, dontKnow: dk, note: r?.note }
-                  void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+                  const sesJ = j.sessionID as string
+                  const fJ = getMdFile(sesJ)!
+                  void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details)))
                 }
                 return dk ? `[quiz answered] "${j.question}" -> I don't know.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}` : `[quiz answered] "${j.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}`
               } else if (j.type === "quiz_batch") {
                 const results = (r as any)?.results || []
-                if (mdLogFile) {
+                if (getMdFile(j.sessionID)) {
                   for (let i = 0; i < (j.quizzes||[]).length; i++) {
                     const qq = j.quizzes[i]
                     const x = results[i] || {}
                     const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note }
-                    void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+                    const sesJ = j.sessionID as string
+                    const fJ = getMdFile(sesJ)!
+                    void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details)))
                   }
                 }
                 const lines = (j.quizzes || []).map((qq:any, i:number) => {
@@ -756,9 +813,11 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       await client.app.log({ body: { service: "learn", level: "info", message: "learn plugin initialized", extra: { directory } } })
     },
 
-    "chat.message": async (_input, output) => {
-      if (!mdLogFile) return
+    "chat.message": async (input, output) => {
       try {
+        const ses = extractHookSessionID((input as any)?.sessionID, (output as any)?.message?.sessionID)
+        const mdFile = getMdFile(ses)
+        if (!mdFile || !ses) return
         const msg: any = (output as any).message
         const parts: any[] = (output as any).parts ?? []
         let text = ""
@@ -770,25 +829,31 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         // Skip system-injected quiz/batch answer prompts — they are mirrored as beautiful callouts via watchAndInject, not as plain user quotes
         if (/^\[(quiz|quiz_batch|question) (answered|cancelled)\]/i.test(text) || text.startsWith("[quiz answered]") || text.startsWith("[quiz_batch answered]") || text.startsWith("[question answered]")) return
         const mid = msg?.id ? `msg:${msg.id}` : `chat:${Date.now()}`
-        if (loggedTextPartIds.has(mid)) return
-        loggedTextPartIds.add(mid)
-        await withMdLock(() => appendToMdLog(userBlock(text)))
+        const mkey = mdKey(ses, mid)
+        if (loggedTextPartIds.has(mkey)) return
+        loggedTextPartIds.add(mkey)
+        await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, userBlock(text)))
       } catch {}
     },
     "experimental.text.complete": async (input, output) => {
-      if (!mdLogFile) return
       try {
+        const ses = extractHookSessionID((input as any)?.sessionID)
+        const mdFile = getMdFile(ses)
+        if (!mdFile || !ses) return
         const text = (output as any).text?.trim()
         if (!text) return
         const partID = (input as any).partID
-        if (partID && loggedTextPartIds.has(partID)) return
-        if (partID) loggedTextPartIds.add(partID)
-        await withMdLock(() => appendToMdLog(assistantBlock(stripSkillBlocks(text))))
+        const pkey = partID ? mdKey(ses, partID) : undefined
+        if (pkey && loggedTextPartIds.has(pkey)) return
+        if (pkey) loggedTextPartIds.add(pkey)
+        await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, assistantBlock(stripSkillBlocks(text))))
       } catch {}
     },
     "tool.execute.before": async (input) => {
-      if (!mdLogFile) return
       try {
+        const ses = extractHookSessionID((input as any)?.sessionID)
+        const mdFile = getMdFile(ses)
+        if (!mdFile || !ses) return
         const toolName = (input as any).tool
         const args = (input as any).args ?? {}
         // Built-in `question` tool is used as fallback when TUI not alive; mirror it.
@@ -798,53 +863,61 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           const ctx2 = args.details?.trim() || undefined
           const opts = Array.isArray(args.options) ? args.options : []
           const callID = (input as any).callID
-          if (callID && loggedToolCallIds.has(`q:${callID}`)) return
-          if (callID) loggedToolCallIds.add(`q:${callID}`)
-          if (q) await withMdLock(() => appendToMdLog(questionCallout("Question", q, ctx2, opts)))
+          const qkey = callID ? mdKey(ses, `q:${callID}`) : undefined
+          if (qkey && loggedToolCallIds.has(qkey)) return
+          if (qkey) loggedToolCallIds.add(qkey)
+          if (q) await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, questionCallout("Question", q, ctx2, opts)))
         }
       } catch {}
     },
     "tool.execute.after": async (input, output) => {
-      if (!mdLogFile) return
       try {
+        const ses = extractHookSessionID((input as any)?.sessionID)
+        const mdFile = getMdFile(ses)
+        if (!mdFile || !ses) return
         const toolName = (input as any).tool
         const callID = (input as any).callID
-        if (callID && loggedToolCallIds.has(`answer:${callID}`)) return
+        const akey = callID ? mdKey(ses, `answer:${callID}`) : undefined
+        if (akey && loggedToolCallIds.has(akey)) return
         if (toolName === "question") {
           const meta: any = (output as any).metadata ?? {}
           let answers: any[] = meta.answers ?? []
           if (!answers.length && (output as any).output) answers = []
           const details: any = { answers, status: "completed" }
-          await withMdLock(() => appendToMdLog(answerCalloutAsk(details)))
-          if (callID) loggedToolCallIds.add(`answer:${callID}`)
+          await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, answerCalloutAsk(details)))
+          if (akey) loggedToolCallIds.add(akey)
         }
       } catch {}
     },
-    // Mirror session to markdown file (best-effort, mirrors pi's md-log)
+    // Mirror session to markdown file (best-effort, mirrors pi's md-log) — 1-1-1 gated
     event: async ({ event }) => {
-      if (!mdLogFile) return
       const t = (event as any).type as string
       const props = (event as any).properties ?? {}
       try {
         if (t === "message.updated") {
           const info: any = props.info
           if (info?.id && info?.role) messageIdToRole.set(info.id, info.role)
+          return
         } else if (t === "message.part.updated") {
           const part: any = props.part
           const delta: string | undefined = props.delta
           if (!part || !part.id) return
+          const ses = extractHookSessionID(part.sessionID, (props as any)?.sessionID, (props.info as any)?.sessionID)
+          const mdFile = getMdFile(ses)
+          if (!mdFile || !ses) return
           if (part.type === "text") {
             if (part.synthetic || part.ignored) return
             const isFinal = !!(part.time?.end !== undefined) || delta === undefined
             if (!isFinal) return
-            if (loggedTextPartIds.has(part.id)) return
+            const pkey = mdKey(ses, part.id)
+            if (loggedTextPartIds.has(pkey)) return
             const text = (part.text || "").trim()
             if (!text) return
             const role = messageIdToRole.get(part.messageID)
             if (role === "user") return
             // Fallback for assistant when experimental.text.complete not fired
-            loggedTextPartIds.add(part.id)
-            await withMdLock(() => appendToMdLog(assistantBlock(stripSkillBlocks(text))))
+            loggedTextPartIds.add(pkey)
+            await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, assistantBlock(stripSkillBlocks(text))))
           }
         }
       } catch {}
@@ -905,6 +978,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           }
           try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8"); slog("quiz wrote durably", pendingPath, "alive", tuiAlive) } catch (e) { slog("quiz write failed", String(e)) }
           try { await (ctx as any).metadata?.({ title: `Quiz: ${qFixed.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
+          const quizSes = (ctx as any).sessionID as string | undefined
           watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
               const dk = !!r?.dontKnow
               const sel = (r?.answers || []).map((a: any) => `${a.index}. ${a.label}`).join(", ") || "(none)"
@@ -912,7 +986,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               const si = (r?.answers || []).map((a: any) => a.index)
               const ok = !dk && si.length === correctIndices.length && si.every((i: number) => cs.has(i))
               const note = r?.note ? `\nNote: ${r.note}` : ""
-              if (mdLogFile) {
+              const qf = quizSes ? getMdFile(quizSes) : undefined
+              if (qf && quizSes) {
                 const details = {
                   status: "completed" as const,
                   answers: r?.answers || [],
@@ -922,15 +997,18 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                   dontKnow: dk,
                   note: r?.note,
                 }
-                void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
+                void withMdFileLock(qf, () => appendToMdLogForSession(quizSes, answerCalloutQuiz(details)))
               }
               return dk
                 ? `[quiz answered] "${qFixed}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}`
                 : `[quiz answered] "${qFixed}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}`
             })
-          // Always mirror question with TRUE shuffled order (pi: tool_execution_update)
-          if (mdLogFile) {
-            try { await withMdLock(() => appendToMdLog(questionCallout("Quiz", qFixed, dFixed?.trim() || undefined, options.map((o) => ({ label: o.label }))))) } catch {}
+          // Always mirror question with TRUE shuffled order (pi: tool_execution_update) — 1-1-1 gated
+          {
+            const qf = quizSes ? getMdFile(quizSes) : undefined
+            if (qf && quizSes) {
+              try { await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, questionCallout("Quiz", qFixed, dFixed?.trim() || undefined, options.map((o) => ({ label: o.label }))))) } catch {}
+            }
           }
           if (tuiAlive) {
             return `[quiz displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
@@ -950,7 +1028,10 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
             const trimmed = (raw as string).trim()
             if (trimmed === "0" || trimmed.toLowerCase() === "i don't know") {
               const msg = `User selected "I don't know" — genuine gap, not a guess.\nCorrect: ${correctStr}\nExplanation: ${eFixed}`
-              if (mdLogFile) await withMdLock(() => appendToMdLog(callout("question", "Quiz — I don't know", [qFixed, trimmed, `Correct: ${correctStr}`, eFixed])))
+              {
+                const qf = quizSes ? getMdFile(quizSes) : undefined
+                if (qf && quizSes) await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, callout("question", "Quiz — I don't know", [qFixed, trimmed, `Correct: ${correctStr}`, eFixed])))
+              }
               return msg
             }
             const nums = trimmed.split(/[,\s]+/).map(s => parseInt(s, 10)).filter(n => !isNaN(n) && n >= 1 && n <= options.length)
@@ -961,7 +1042,10 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
             const verdict = correct ? "correctly" : "incorrectly"
             const result = `User answered ${verdict}.\nSelected: ${selectedStr}\nCorrect: ${correctStr}\nExplanation: ${eFixed}`
               ;(ctx as any).metadata?.({ title: correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", metadata: { correct, correctIndices, explanation: eFixed } })
-            if (mdLogFile) await withMdLock(() => appendToMdLog(callout(correct ? "success" : "failure", correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", [`Q: ${qFixed}`, `Selected: ${selectedStr}`, `Correct: ${correctStr}`, eFixed])))
+            {
+              const qf = quizSes ? getMdFile(quizSes) : undefined
+              if (qf && quizSes) await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, callout(correct ? "success" : "failure", correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", [`Q: ${qFixed}`, `Selected: ${selectedStr}`, `Correct: ${correctStr}`, eFixed])))
+            }
             return result
           }
           const instruction = [
@@ -1029,36 +1113,42 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           const file = path.join(pendingDirPath, `quiz_batch-${id}.json`)
           try { fs.writeFileSync(file, JSON.stringify(payload), "utf8"); slog("quiz_batch wrote durably", file, "alive", isAlive) } catch (e) { slog("quiz_batch write failed", String(e)) }
           try { await (ctx as any).metadata?.({ title: `Quiz batch ${normalized.length}`, metadata: { pendingId: id } }) } catch {}
-          // Mirror each question in batch as a beautiful callout (like single quiz)
-          if (mdLogFile) {
-            for (let i = 0; i < normalized.length; i++) {
-              const q = normalized[i]
-              const label = `Quiz ${i + 1}/${normalized.length}`
-              try { await withMdLock(() => appendToMdLog(questionCallout(label, q.question, q.details?.trim() || undefined, q.options.map((o: any) => ({ label: o.label })))) ) } catch {}
+          const batchSes = (ctx as any).sessionID as string | undefined
+          // Mirror each question in batch as a beautiful callout (like single quiz) — 1-1-1 gated
+          {
+            const bf = batchSes ? getMdFile(batchSes) : undefined
+            if (bf && batchSes) {
+              for (let i = 0; i < normalized.length; i++) {
+                const q = normalized[i]
+                const label = `Quiz ${i + 1}/${normalized.length}`
+                try { await withMdFileLock(bf, () => appendToMdLogForSession(batchSes, questionCallout(label, q.question, q.details?.trim() || undefined, q.options.map((o: any) => ({ label: o.label }))))) } catch {}
+              }
             }
           }
           watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
               const results = r?.results || []
               // Mirror each answer as a beautiful callout (like single quiz) — not just plain text
-              if (mdLogFile) {
-                for (let i = 0; i < normalized.length; i++) {
-                  const q = normalized[i]
-                  const x = results[i] || {}
-                  const details = {
-                    status: "completed" as const,
-                    answers: x.answers || [],
-                    correct: !!x.correct,
-                    correctIndices: q.correctIndices || [],
-                    explanation: q.explanation || "",
-                    dontKnow: !!x.dontKnow,
-                    note: x.note,
+              {
+                const bf = batchSes ? getMdFile(batchSes) : undefined
+                if (bf && batchSes) {
+                  for (let i = 0; i < normalized.length; i++) {
+                    const q = normalized[i]
+                    const x = results[i] || {}
+                    const details = {
+                      status: "completed" as const,
+                      answers: x.answers || [],
+                      correct: !!x.correct,
+                      correctIndices: q.correctIndices || [],
+                      explanation: q.explanation || "",
+                      dontKnow: !!x.dontKnow,
+                      note: x.note,
+                    }
+                    // Use same callout helper as single quiz but with batch label context
+                    try {
+                      // withMdFileLock is async, but watchAndInject buildText is sync — queue without await and let it flush
+                      void withMdFileLock(bf, () => appendToMdLogForSession(batchSes, answerCalloutQuiz(details)))
+                    } catch {}
                   }
-                  const label = `Quiz ${i + 1}/${normalized.length}`
-                  // Use same callout helper as single quiz but with batch label context
-                  try {
-                    // withMdLock is async, but watchAndInject buildText is sync — queue without await and let it flush
-                    void withMdLock(() => appendToMdLog(answerCalloutQuiz(details)))
-                  } catch {}
                 }
               }
               const lines = results.map((x: any, i: number) => {
@@ -1076,39 +1166,59 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           }
       }),
 
-      // ── md_log: link a markdown file ───────────────────────────────────
+      // ── md_log: link a markdown file — 1-1-1 session:link:file ──────────
       md_log: tool({
-        description: "Mirror the session to a markdown file for comfortable reading in Obsidian. The file mirrors user prompts, assistant text, and quiz/question Q&A. Use an existing file; it will be backfilled with history. Use `md_unlog` to stop.",
+        description: "Mirror THIS session to a markdown file for comfortable reading in Obsidian. The link is bound 1-1-1 to this sessionID: resuming the same session auto-restores, a different session stays silent until it links its own file. Use `md_unlog` to stop.",
         args: {
           filepath: tool.schema.string().describe("Existing markdown file to link (relative to worktree or absolute). Must exist."),
         },
         async execute(args, ctx) {
+          const sessionID = (ctx as any).sessionID as string | undefined
+          if (!sessionID) return `md_log error: no sessionID in context — cannot establish 1-1-1 link`
           const resolved = path.isAbsolute(args.filepath) ? args.filepath : path.resolve(ctx.directory, args.filepath)
           if (!fs.existsSync(resolved)) return `File does not exist: ${resolved}`
           if (!fs.statSync(resolved).isFile()) return `Not a file: ${resolved}`
-          mdLogFile = resolved
-          try { fs.mkdirSync(path.dirname(markerPath), { recursive: true }); fs.writeFileSync(markerPath, JSON.stringify({ file: resolved }), "utf-8") } catch {}
-          // Backfill history for this session (like pi: ctx.sessionManager.getEntries() parent chain)
-          let backfilled = 0
-          const sessionID = (ctx as any).sessionID as string | undefined
-          if (sessionID) {
-            try { backfilled = await backfillMdLog(client, sessionID, directory) } catch (e) { slog("backfill error", String(e)) }
+          // Enforce 1-1-1: one file linked to at most one session
+          for (const [ses, meta] of mdLinks) {
+            if (meta.file === resolved && ses !== sessionID) {
+              return `File already linked to session ${ses.slice(0,8)} — 1-1-1 violation. Copy to a new file or md_unlog that session first.`
+            }
           }
-          await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved, backfilled } } })
-          return `Linked: ${resolved} — ${backfilled ? `${backfilled} entries backfilled — ` : ""}future messages will be mirrored. View it rendered in Obsidian for LaTeX/math.`
+          mdLinks.set(sessionID, { file: resolved, directory, linkedAt: Date.now() })
+          saveMdLinksForDirectory(markerPath, directory)
+          // Backfill history for this session only
+          let backfilled = 0
+          try { backfilled = await backfillMdLog(client, sessionID, directory) } catch (e) { slog("backfill error", String(e)) }
+          await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved, backfilled, sessionID } } })
+          return `Linked: ${resolved} to session ${sessionID.slice(0,8)} — ${backfilled ? `${backfilled} entries backfilled — ` : ""}future messages for THIS session will be mirrored. Other sessions stay silent.`
+        },
+      }),
+
+      md_log_status: tool({
+        description: "Show md-log link status for this session and directory.",
+        args: {},
+        async execute(_args, ctx) {
+          const sessionID = (ctx as any).sessionID as string | undefined
+          const own = sessionID ? mdLinks.get(sessionID) : undefined
+          let countDir = 0
+          for (const [, meta] of mdLinks) if (meta.directory === directory) countDir++
+          return `session ${sessionID?.slice(0,8) ?? "(none)"} -> ${own?.file ?? "(no link)"} | links in this directory: ${countDir}`
         },
       }),
 
       md_unlog: tool({
-        description: "Stop mirroring the session to a markdown file.",
+        description: "Stop mirroring THIS session to its markdown file (other sessions unaffected).",
         args: {},
-        async execute() {
-          if (!mdLogFile) return "No file linked"
-          const name = path.basename(mdLogFile)
-          mdLogFile = null
-          try { fs.writeFileSync(markerPath, JSON.stringify({ file: null }), "utf-8") } catch {}
-          await client.app.log({ body: { service: "learn", level: "info", message: `md-log unlinked: ${name}` } })
-          return `Unlinked: ${name}`
+        async execute(_args, ctx) {
+          const sessionID = (ctx as any).sessionID as string | undefined
+          if (!sessionID) return "No session in context"
+          const meta = mdLinks.get(sessionID)
+          if (!meta) return "No file linked for this session"
+          const name = path.basename(meta.file)
+          mdLinks.delete(sessionID)
+          saveMdLinksForDirectory(markerPath, directory)
+          await client.app.log({ body: { service: "learn", level: "info", message: `md-log unlinked: ${name}`, extra: { sessionID } } })
+          return `Unlinked: ${name} from session ${sessionID.slice(0,8)} (other sessions unaffected)`
         },
       }),
 
