@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "@bojackduy/opencode-learn",
-  "version": "1.2.1",
-  "description": "Pi learn system for OpenCode \u2014 Socratic teaching, graded quiz, Obsidian md_log, and visual makers. Port of amosblomqvist/learn (video: How I Use AI to Learn Things) to OpenCode.",
+  "version": "1.2.2",
+  "description": "Pi learn system for OpenCode — Socratic teaching, graded quiz, Obsidian md_log, and visual makers. Port of amosblomqvist/learn (video: How I Use AI to Learn Things) to OpenCode.",
   "type": "module",
   "license": "AGPL-3.0-or-later",
   "private": false,
