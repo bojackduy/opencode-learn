@@ -244,12 +244,31 @@ function answerCalloutQuiz(details: any): string {
   if (details?.explanation) { body.push(""); for (const line of String(details.explanation).split("\n")) body.push(line) }
   return callout(type, title, body)
 }
+function answerCalloutQuestion(questions: any[], answers: string[][]): string {
+  const qs = Array.isArray(questions) ? questions : []
+  const ans = Array.isArray(answers) ? answers : []
+  if (!qs.length) {
+    const flat = ans.map(a => Array.isArray(a) ? a.join(", ") : String(a ?? "")).filter(Boolean)
+    return callout("example", "Answer", flat.length ? flat : ["(no answer)"])
+  }
+  const body = qs.map((q: any, i: number) => {
+    const header = q?.header || `Q${i + 1}`
+    const sel: string[] = Array.isArray(ans[i]) ? ans[i] as string[] : []
+    return `${header}: ${sel.length ? sel.join(", ") : "(no answer)"}`
+  })
+  return callout("example", "Answer", body)
+}
 function answerCalloutAsk(details: any): string {
   const status = details?.status
   if (status === "cancelled") return callout("warning", "Question — cancelled", ["(user skipped)"])
   if (status === "unavailable") return callout("warning", "Question — unavailable", [details?.message || ""])
   const answers: any[] = details?.answers || []
-  const body: string[] = answers.map((a) => { if (a.type === "other") return `Other: ${a.label}`; if (a.type === "text") return a.label; return `${a.index}. ${a.label}` })
+  // Native opencode shape: string[][] (per-question selected labels)
+  if (answers.length && (answers as any[]).every(a => Array.isArray(a))) {
+    const questions: any[] = details?.questions || []
+    return answerCalloutQuestion(questions, answers as string[][])
+  }
+  const body: string[] = answers.map((a) => { if (a.type === "other") return `Other: ${a.label}`; if (a.type === "text") return a.label; if (typeof a === "string") return a; return `${a.index}. ${a.label}` })
   if (body.length === 0) body.push("(no answer)")
   return callout("example", "Answer", body)
 }
@@ -307,6 +326,23 @@ async function backfillMdLog(client: any, sessionID: string, directory: string):
                   blocks.push(answerCalloutQuiz(details))
                 }
               }
+            }
+            continue
+          }
+          if (toolName === "question" && Array.isArray((input as any).questions)) {
+            const qs: any[] = (input as any).questions
+            if (st.status === "pending" || st.status === "running") {
+              qs.forEach((q: any, i: number) => {
+                if (!q?.question) return
+                blocks.push(questionCallout(q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question"), q.question, undefined, q.options ?? []))
+              })
+            } else if (st.status === "completed") {
+              qs.forEach((q: any, i: number) => {
+                if (!q?.question) return
+                blocks.push(questionCallout(q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question"), q.question, undefined, q.options ?? []))
+              })
+              const ans = Array.isArray(meta.answers) ? meta.answers : []
+              blocks.push(answerCalloutAsk({ answers: ans, questions: qs, status: "completed" }))
             }
             continue
           }
@@ -849,24 +885,28 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, assistantBlock(stripSkillBlocks(text))))
       } catch {}
     },
-    "tool.execute.before": async (input) => {
+    "tool.execute.before": async (input, output) => {
       try {
         const ses = extractHookSessionID((input as any)?.sessionID)
         const mdFile = getMdFile(ses)
         if (!mdFile || !ses) return
         const toolName = (input as any).tool
-        const args = (input as any).args ?? {}
-        // Built-in `question` tool is used as fallback when TUI not alive; mirror it.
-        // `ask_user_question` is already mirrored inside its own execute (with correct TUI handling), so skip to avoid duplicate.
+        // NOTE: per Hooks type, before-hook args live in output.args (input only has tool/sessionID/callID).
+        const args = (output as any)?.args ?? (input as any).args ?? {}
+        // Native `question` tool shape: {questions: [{question, header, options, multiple}]}
         if (toolName === "question") {
-          const q = args.question || args.header || ""
-          const ctx2 = args.details?.trim() || undefined
-          const opts = Array.isArray(args.options) ? args.options : []
           const callID = (input as any).callID
           const qkey = callID ? mdKey(ses, `q:${callID}`) : undefined
           if (qkey && loggedToolCallIds.has(qkey)) return
           if (qkey) loggedToolCallIds.add(qkey)
-          if (q) await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, questionCallout("Question", q, ctx2, opts)))
+          const qs: any[] = Array.isArray(args.questions) ? args.questions
+            : (args.question ? [{ question: args.question, header: args.header, options: args.options ?? [] }] : [])
+          for (let i = 0; i < qs.length; i++) {
+            const q = qs[i]
+            if (!q?.question) continue
+            const label = q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question")
+            await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, questionCallout(label, q.question, undefined, q.options ?? [])))
+          }
         }
       } catch {}
     },
@@ -880,10 +920,20 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         const akey = callID ? mdKey(ses, `answer:${callID}`) : undefined
         if (akey && loggedToolCallIds.has(akey)) return
         if (toolName === "question") {
-          const meta: any = (output as any).metadata ?? {}
-          let answers: any[] = meta.answers ?? []
-          if (!answers.length && (output as any).output) answers = []
-          const details: any = { answers, status: "completed" }
+          const meta: any = (output as any)?.metadata ?? {}
+          const inArgs: any = (input as any)?.args ?? {}
+          const qs: any[] = Array.isArray(inArgs.questions) ? inArgs.questions : []
+          let answers: any = meta.answers
+          if (!Array.isArray(answers) || !answers.length) {
+            const outText = typeof (output as any)?.output === "string" ? ((output as any).output as string).trim() : ""
+            if (outText) {
+              await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, callout("example", "Answer", [outText.slice(0, 500)])))
+              if (akey) loggedToolCallIds.add(akey)
+              return
+            }
+            answers = []
+          }
+          const details: any = { answers, questions: qs, status: "completed" }
           await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, answerCalloutAsk(details)))
           if (akey) loggedToolCallIds.add(akey)
         }
