@@ -875,12 +875,13 @@ export const tui: TuiPlugin = async (api) => {
           }
         }
       } catch {}
-      // Server owns lifecycle: it unlinks the pending file after successful inject.
-      // Do NOT delete pending here — deleting it destroys recovery context if the server hasn't consumed the response yet.
+      // TUI owns dialog lifecycle — always delete pending + close immediately so Enter never appears to "do nothing",
+      // regardless of whether another (possibly stale/old-code) opencode process is also running.
+      try { fs.unlinkSync(full) } catch {}
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
-      // Watchdog: if the response is still unconsumed after 8s, re-touch to retrigger the server watch + log loudly.
+      // Watchdog: if the response is still unconsumed (server didn't fire) after 8s, re-touch to retrigger the watch + log loudly.
       // Safe: server claims via atomic rename, so a rewrite can never cause double-inject.
       setTimeout(() => {
         try {
@@ -910,7 +911,7 @@ export const tui: TuiPlugin = async (api) => {
           } catch {}
         }
       } catch {}
-      // Server owns lifecycle: it unlinks the pending file after consuming the cancelled response.
+      try { fs.unlinkSync(full) } catch {}
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)

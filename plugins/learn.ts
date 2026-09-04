@@ -554,7 +554,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
       closeWatcher()
       return
     }
-    // Success: server owns lifecycle — consume claim + pending (TUI no longer deletes pending)
+    // Success: consume claim + defensively try pending too (TUI is the primary owner of pending deletion)
     try { fs.unlinkSync(claimPath) } catch {}
     for (const p of pendingCandidates) try { fs.unlinkSync(p) } catch {}
     closeWatcher()
@@ -564,7 +564,10 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     } catch {}
   }
   try {
-    const w = fs.watch(dir, (_e, filename) => { if (filename === `response-${id}.json`) void fire() })
+    // Fire on ANY directory event, not just exact filename match — atomic tmp+rename writes can report
+    // a different filename (or no filename) on some fs.watch backends (notably macOS FSEvents). The claim
+    // rename inside fire() makes this safe to call spuriously: if respPath doesn't exist yet, it just no-ops.
+    const w = fs.watch(dir, () => { void fire() })
     w.on("error", () => {})
     activeWatchers.set(id, w)
   } catch {}
@@ -803,14 +806,20 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, isIDK, classifySessionID: (llmRes as any)?.sessionID, note: data.note, at: Date.now() }
       try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8"); slog("classify response written", data.id, inferred.join(",")) } catch {}
     }
+    const sweep = () => {
+      try {
+        for (const f of fs.readdirSync(dir).filter(f => f.startsWith("classify-") && !f.startsWith("classify-response-"))) {
+          void processClassify(f)
+        }
+      } catch {}
+    }
     // Initial sweep
+    sweep()
     try {
-      for (const f of fs.readdirSync(dir).filter(f => f.startsWith("classify-") && !f.startsWith("classify-response-"))) {
-        void processClassify(f)
-      }
-    } catch {}
-    try {
-      const w = fs.watch(dir, (_e, filename) => { if (filename) void processClassify(filename) })
+      // Re-scan on ANY directory event rather than trusting the reported filename — atomic tmp+rename
+      // writes (used by the TUI) can report a different filename (or none) on some fs.watch backends
+      // (notably macOS FSEvents), which would otherwise silently drop classify requests.
+      const w = fs.watch(dir, () => sweep())
       w.on("error", () => {})
       // Keep watcher alive; store to avoid GC? No need.
     } catch {}
