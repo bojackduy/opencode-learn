@@ -482,14 +482,39 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
   if (!sessionID) { slog("watchAndInject no sessionID", id); return }
   const dir = pendingDir(directory)
   const respPath = path.join(dir, `response-${id}.json`)
-  const fire = async () => {
+  const claimPath = path.join(dir, `response-${id}.claim-${process.pid}.json`)
+  const pendingCandidates = [path.join(dir, `quiz-${id}.json`), path.join(dir, `quiz_batch-${id}.json`)]
+  const closeWatcher = () => { const w = activeWatchers.get(id); if (w) { try { w.close() } catch {}; activeWatchers.delete(id) } }
+  const fire = async (attempt = 0): Promise<void> => {
+    // Atomic single-consumer claim: exactly one process proceeds (fixes double-inject across processes)
+    try { fs.renameSync(respPath, claimPath) } catch { closeWatcher(); return } // already claimed/consumed → stand down
     let data: any
-    try { data = JSON.parse(fs.readFileSync(respPath, "utf8")) } catch { return }
-    try { fs.unlinkSync(respPath) } catch {}
-    const w = activeWatchers.get(id); if (w) { try { w.close() } catch {}; activeWatchers.delete(id) }
-    slog("watchAndInject fire", id, JSON.stringify(data).slice(0,400))
-    const effectiveSessionID = (data as any)?.sessionID || sessionID
-    const text = data?.cancelled ? `[cancelled] user dismissed the popup for ${id}` : buildText(data.result)
+    try {
+      data = JSON.parse(fs.readFileSync(claimPath, "utf8"))
+    } catch (e) {
+      if (attempt < 5) {
+        await new Promise(r => setTimeout(r, 120))
+        try { fs.renameSync(claimPath, respPath) } catch {}
+        await new Promise(r => setTimeout(r, 60))
+        return fire(attempt + 1)
+      }
+      slog("watchAndInject UNREADABLE response, parked", id, String(e).slice(0,160))
+      try { fs.renameSync(claimPath, path.join(dir, `response-${id}.poisoned-${Date.now()}.json`)) } catch {}
+      closeWatcher()
+      return
+    }
+    let text: string
+    let effectiveSessionID: string
+    try {
+      slog("watchAndInject fire", id, JSON.stringify(data).slice(0,400))
+      effectiveSessionID = (data as any)?.sessionID || sessionID
+      text = data?.cancelled ? `[cancelled] user dismissed the popup for ${id}` : buildText(data.result)
+    } catch (e) {
+      slog("watchAndInject buildText ERROR, parked", id, String(e).slice(0,200))
+      try { fs.renameSync(claimPath, path.join(dir, `response-${id}.poisoned-${Date.now()}.json`)) } catch {}
+      closeWatcher()
+      return
+    }
     // opencode-loop sdk.js:24 — SDK returns {data,error}, it does NOT throw. Must inspect .error.
     const sdkCall = async (method: any, ...argsList: any[]) => {
       let firstErr: any
@@ -512,23 +537,39 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     ]
     slog("watchAndInject injecting", id, effectiveSessionID, text.slice(0,300))
     let ok = false
+    let firstErr: any
     // loopd host-adapter.ts:100 — promptAsync wakes the session (fire-and-forget turn)
     if (client?.session?.promptAsync) {
-      try { await sdkCall(client.session.promptAsync.bind(client.session), ...shapes); ok = true } catch {}
+      try { await sdkCall(client.session.promptAsync.bind(client.session), ...shapes); ok = true } catch (e) { firstErr = e }
     }
     if (!ok && client?.session?.prompt) {
-      try { await sdkCall(client.session.prompt.bind(client.session), ...shapes); ok = true } catch {}
+      try { await sdkCall(client.session.prompt.bind(client.session), ...shapes); ok = true } catch (e) { firstErr = firstErr || e }
     }
+    if (!ok) {
+      slog("watchAndInject inject FAILED, preserved", id, effectiveSessionID, String(firstErr).slice(0,200))
+      try { fs.renameSync(claimPath, path.join(dir, `response-${id}.failed-${Date.now()}.json`)) } catch {}
+      try {
+        await client.app.log({ body: { service: "learn", level: "error", message: `inject FAILED for ${effectiveSessionID} (orig ${sessionID})`, extra: { id } } })
+      } catch {}
+      closeWatcher()
+      return
+    }
+    // Success: server owns lifecycle — consume claim + pending (TUI no longer deletes pending)
+    try { fs.unlinkSync(claimPath) } catch {}
+    for (const p of pendingCandidates) try { fs.unlinkSync(p) } catch {}
+    closeWatcher()
+    slog("watchAndInject consumed", id, effectiveSessionID)
     try {
-      await client.app.log({ body: { service: "learn", level: ok ? "info" : "error", message: ok ? `injected into ${effectiveSessionID}` : `inject FAILED for ${effectiveSessionID} (orig ${sessionID})`, extra: { id } } })
+      await client.app.log({ body: { service: "learn", level: "info", message: `injected into ${effectiveSessionID}`, extra: { id } } })
     } catch {}
   }
-  if (fs.existsSync(respPath)) { slog("watchAndInject fast-path", id); void fire(); return }
   try {
-    const w = fs.watch(dir, (_e, filename) => { if (filename === `response-${id}.json` && fs.existsSync(respPath)) void fire() })
+    const w = fs.watch(dir, (_e, filename) => { if (filename === `response-${id}.json`) void fire() })
     w.on("error", () => {})
     activeWatchers.set(id, w)
   } catch {}
+  // Recheck after arming to close the event gap (claim makes double-fire safe)
+  if (fs.existsSync(respPath)) { slog("watchAndInject fast-path", id); void fire(); return }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -780,6 +821,21 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
   try {
     const dir = pendingDir(directory)
     if (fs.existsSync(dir)) {
+      // 1) Requeue stale claims from consumers that died mid-flight (>30s old, no live response)
+      for (const f of fs.readdirSync(dir).filter(x => x.includes(".claim-") && x.endsWith(".json"))) {
+        try {
+          const m = f.match(/^response-(.+)\.claim-.*\.json$/)
+          if (!m) continue
+          const rid = m[1]!
+          const target = path.join(dir, `response-${rid}.json`)
+          const age = Date.now() - fs.statSync(path.join(dir, f)).mtimeMs
+          if (age > 30000 && !fs.existsSync(target)) {
+            fs.renameSync(path.join(dir, f), target)
+            slog("watchAndInject requeued stale claim", rid)
+          }
+        } catch {}
+      }
+      // 2) Re-arm pending quizzes (fast-path inside watchAndInject consumes any waiting response)
       for (const f of fs.readdirSync(dir).filter(x => x.endsWith(".json") && !x.startsWith("response-") && !x.startsWith(".") && !x.startsWith("classify"))) {
         try {
           const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
@@ -826,6 +882,19 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                 return `[question answered] "${j.question}" -> ${txt}`
               }
             })
+          }
+        } catch {}
+      }
+      // 3) Park legacy orphans: response with no pending context (pre-fix leftovers) — can't rebuild inject text, park loudly instead of rotting silently
+      for (const f of fs.readdirSync(dir).filter(x => x.startsWith("response-") && x.endsWith(".json") && !x.includes(".claim-") && !x.includes(".poisoned") && !x.includes(".failed") && !x.includes(".orphaned"))) {
+        try {
+          const m = f.match(/^response-(.+)\.json$/)
+          if (!m) continue
+          const rid = m[1]!
+          const hasPending = fs.existsSync(path.join(dir, `quiz-${rid}.json`)) || fs.existsSync(path.join(dir, `quiz_batch-${rid}.json`))
+          if (!hasPending) {
+            fs.renameSync(path.join(dir, f), path.join(dir, `response-${rid}.orphaned-${Date.now()}.json`))
+            slog("watchAndInject orphaned response parked (no pending context)", rid)
           }
         } catch {}
       }

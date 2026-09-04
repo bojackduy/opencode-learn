@@ -53,6 +53,14 @@ import { tmpdir } from "node:os"
 const TUI_LOG = path.join(tmpdir(), "learn-tui.log")
 function tlog(...a: any[]) { try { fs.appendFileSync(TUI_LOG, `[${new Date().toISOString()}] ${a.map(x=> typeof x==="string"? x : JSON.stringify(x)).join(" ")}\n`) } catch {} }
 function ensureDir(dir: string) { try { fs.mkdirSync(dir, { recursive: true }) } catch {} }
+function writeJsonAtomic(filePath: string, data: any) {
+  // Atomic handoff: readers never observe partial JSON (tmp + rename is atomic on POSIX)
+  try {
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
+    fs.writeFileSync(tmp, JSON.stringify(data), "utf8")
+    fs.renameSync(tmp, filePath)
+  } catch { try { fs.writeFileSync(filePath, JSON.stringify(data), "utf8") } catch {} }
+}
 function decodeQuizText(s: string): string {
   if (!s || typeof s !== "string") return s
   if (!s.includes("\\")) return s
@@ -184,7 +192,7 @@ function QuizDialog(props: {
         const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
         const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
         const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
-        fs.writeFileSync(path.join(pDir, `classify-${props.request.id}.json`), JSON.stringify(pendingClassify), "utf8")
+        writeJsonAtomic(path.join(pDir, `classify-${props.request.id}.json`), pendingClassify)
         tlog("QuizDialog classify request", props.request.id, note().trim().slice(0, 50))
         // Poll for classify-response
         const respPath = path.join(pDir, `classify-response-${props.request.id}.json`)
@@ -609,7 +617,7 @@ function QuizBatchDialog(props: {
           const cid = `${props.request.id}-${idx()}`
           const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
           const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
-          fs.writeFileSync(path.join(pDir, `classify-${cid}.json`), JSON.stringify(pendingClassify), "utf8")
+          writeJsonAtomic(path.join(pDir, `classify-${cid}.json`), pendingClassify)
           tlog("QuizBatchDialog classify request", cid, note().trim().slice(0, 50))
           const respPath = path.join(pDir, `classify-response-${cid}.json`)
           let attempts = 0
@@ -778,8 +786,11 @@ export const tui: TuiPlugin = async (api) => {
     if (api.ui.dialog.open) return
     let files: string[] = []
     try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort() } catch { return }
-    // Session-distinct: only show pending for current session
-    const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean) as Array<{f: string, j: any}>
+    // Session-distinct: only show pending for current session.
+    // Skip answered-pending (a response file exists, server is consuming): prevents re-popup after answer.
+    const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean).filter(x => {
+      try { return !fs.existsSync(path.join(pendingDir, `response-${x!.j.id}.json`)) } catch { return true }
+    }) as Array<{f: string, j: any}>
     const pick = matching.find(x => x.j.sessionID === curSid) || matching.find(x => !x.j.sessionID)
     if (!pick) return
     const file = pick.f
@@ -803,7 +814,9 @@ export const tui: TuiPlugin = async (api) => {
     currentBySession.set(curSid, current)
     const done = async (result: any) => {
       const respPath = path.join(pendingDir, `response-${data!.id}.json`)
-      try { fs.writeFileSync(respPath, JSON.stringify({ id: data!.id, type: data!.type, result, sessionID: (data as any).sessionID, at: Date.now() }), "utf8") } catch {}
+      const answerId = data!.id
+      tlog("learn-tui answered", (data as any).type, answerId, JSON.stringify(result).slice(0, 160))
+      writeJsonAtomic(respPath, { id: data!.id, type: data!.type, result, sessionID: (data as any).sessionID, at: Date.now() })
       // Non-blocking wake: inject answer as new user prompt so agent continues (no timeout, no polling waste)
       try {
         const sessionID = (data as any).sessionID
@@ -862,14 +875,26 @@ export const tui: TuiPlugin = async (api) => {
           }
         }
       } catch {}
-      try { fs.unlinkSync(full) } catch {}
+      // Server owns lifecycle: it unlinks the pending file after successful inject.
+      // Do NOT delete pending here — deleting it destroys recovery context if the server hasn't consumed the response yet.
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
+      // Watchdog: if the response is still unconsumed after 8s, re-touch to retrigger the server watch + log loudly.
+      // Safe: server claims via atomic rename, so a rewrite can never cause double-inject.
+      setTimeout(() => {
+        try {
+          if (fs.existsSync(respPath)) {
+            tlog("learn-tui response NOT consumed, re-touching", answerId)
+            try { writeJsonAtomic(respPath, JSON.parse(fs.readFileSync(respPath, "utf8"))) } catch {}
+          }
+        } catch {}
+      }, 8000)
     }
     const cancel = async () => {
       const respPath = path.join(pendingDir, `response-${data!.id}.json`)
-      try { fs.writeFileSync(respPath, JSON.stringify({ id: data!.id, type: data!.type, cancelled: true, sessionID: (data as any).sessionID, at: Date.now() }), "utf8") } catch {}
+      tlog("learn-tui cancelled", (data as any).type, data!.id)
+      writeJsonAtomic(respPath, { id: data!.id, type: data!.type, cancelled: true, sessionID: (data as any).sessionID, at: Date.now() })
       try {
         const sid = (data as any).sessionID
         if (sid) {
@@ -885,7 +910,7 @@ export const tui: TuiPlugin = async (api) => {
           } catch {}
         }
       } catch {}
-      try { fs.unlinkSync(full) } catch {}
+      // Server owns lifecycle: it unlinks the pending file after consuming the cancelled response.
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
