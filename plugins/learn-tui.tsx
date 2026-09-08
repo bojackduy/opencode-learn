@@ -787,11 +787,32 @@ export const tui: TuiPlugin = async (api) => {
     }
   }
 
+  // Cross-process single-popup lock: if the same session is open in more than one opencode
+  // window, each runs its own copy of this TUI plugin and independently polls the same
+  // pendingDir. Without this, two windows could both open the SAME quiz dialog and let the
+  // user answer twice — the second answer overwrites the (already-consumed) response file with
+  // nobody left watching it, so it silently rots as an orphan and never reaches the session
+  // ("the next quiz doesn't inject"). Only the window that wins this lock may show the dialog.
+  const popupLockPath = (id: string) => path.join(pendingDir, `opening-${id}.lock`)
+  const tryClaimPopup = (id: string): boolean => {
+    const p = popupLockPath(id)
+    try { fs.writeFileSync(p, String(process.pid), { flag: "wx" }); return true } catch {}
+    try {
+      const age = Date.now() - fs.statSync(p).mtimeMs
+      if (age > 20000) { fs.writeFileSync(p, String(process.pid), "utf8"); return true }
+    } catch {
+      try { fs.writeFileSync(p, String(process.pid), { flag: "wx" }); return true } catch {}
+    }
+    return false
+  }
+  const refreshPopupClaim = (id: string) => { try { fs.writeFileSync(popupLockPath(id), String(process.pid), "utf8") } catch {} }
+  const releasePopupClaim = (id: string) => { try { fs.unlinkSync(popupLockPath(id)) } catch {} }
+
   const processPending = () => {
     const curSid = getCurrentSessionID()
     if (!curSid) return
     let current = currentBySession.get(curSid) as { id: string; type: string } | undefined
-    if (current) return
+    if (current) { refreshPopupClaim(current.id); return }
     if (api.ui.dialog.open) return
     let files: string[] = []
     try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort() } catch { return }
@@ -817,6 +838,12 @@ export const tui: TuiPlugin = async (api) => {
         if (!exists) (data as any).sessionID = curSid
       }
     } catch {}
+    if (!tryClaimPopup(data.id)) {
+      // Another opencode window (same session open elsewhere) already owns this popup —
+      // don't show a second copy of it here, and don't answer it from this process.
+      tlog("processPending popup already claimed elsewhere", data.id)
+      return
+    }
     current = { id: data.id, type: data.type }
     currentBySession.set(curSid, current)
     const done = async (result: any) => {
@@ -884,6 +911,7 @@ export const tui: TuiPlugin = async (api) => {
       } catch {}
       // Keep the pending payload until the server confirms injection. It is the recovery context
       // needed to rebuild the prompt if either process exits after the answer is written.
+      releasePopupClaim(answerId)
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
@@ -918,13 +946,14 @@ export const tui: TuiPlugin = async (api) => {
         }
       } catch {}
       // Keep the pending payload until the server consumes the cancellation response.
+      releasePopupClaim(data!.id)
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
     }
     if (data.type === "quiz") { tlog("processPending quiz", data.id); api.ui.dialog.replace(() => <QuizDialog api={api} request={data as QuizPending} onSubmit={done} onCancel={cancel} />) }
     else if (data.type === "quiz_batch") { tlog("processPending quiz_batch", data.id, (data as QuizBatchPending).quizzes.length); api.ui.dialog.replace(() => <QuizBatchDialog api={api} request={data as QuizBatchPending} onSubmit={done} onCancel={cancel} />) }
-    else { tlog("processPending unknown", (data as any).type, data.id); try { fs.unlinkSync(full) } catch {}; currentBySession.delete(curSid); return }
+    else { tlog("processPending unknown", (data as any).type, data.id); releasePopupClaim(data.id); try { fs.unlinkSync(full) } catch {}; currentBySession.delete(curSid); return }
     try { api.ui.dialog.setSize("large") } catch {}
   }
 

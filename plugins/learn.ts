@@ -138,7 +138,7 @@ function decodeQuizText(s: string | undefined): string | undefined {
 // md-log helpers (ported from .pi/extensions/md-log.ts)
 // 1-1-1 model: session : link : log file. No global file.
 // ────────────────────────────────────────────────────────────────────────────
-type MdLinkMeta = { file: string; directory: string; linkedAt: number }
+type MdLinkMeta = { file: string; directory: string; linkedAt: number; backfilledUntil?: string }
 const mdLinks = new Map<string, MdLinkMeta>() // sessionID -> link
 const mdFileLocks = new Map<string, Promise<void>>()
 function withMdFileLock<T>(file: string, fn: () => T | Promise<T>): Promise<T> {
@@ -183,7 +183,7 @@ function loadMdLinks(markerPath: string, directory: string) {
     for (const [ses, v] of Object.entries<any>(links)) {
       const f = (v as any)?.file ?? (typeof v === "string" ? v : undefined)
       if (typeof ses === "string" && typeof f === "string" && fs.existsSync(f)) {
-        mdLinks.set(ses, { file: f, directory: (v as any)?.directory || directory, linkedAt: (v as any)?.linkedAt || Date.now() })
+        mdLinks.set(ses, { file: f, directory: (v as any)?.directory || directory, linkedAt: (v as any)?.linkedAt || Date.now(), backfilledUntil: (v as any)?.backfilledUntil })
         n++
       }
     }
@@ -272,17 +272,32 @@ function answerCalloutAsk(details: any): string {
   if (body.length === 0) body.push("(no answer)")
   return callout("example", "Answer", body)
 }
-async function backfillMdLog(client: any, sessionID: string, directory: string): Promise<number> {
+async function backfillMdLog(client: any, sessionID: string, directory: string, markerPath: string): Promise<number> {
   const mdFile = getMdFile(sessionID)
   if (!mdFile || !sessionID) return 0
+  const linkMeta = mdLinks.get(sessionID)
+  const already = linkMeta?.backfilledUntil
   try {
     const res: any = await client.session.messages({ path: { id: sessionID }, query: { directory } })
     const data: any = res?.data ?? res
-    const entries: any[] = Array.isArray(data) ? data : []
-    if (!entries.length) return 0
+    const allEntries: any[] = Array.isArray(data) ? data : []
+    if (!allEntries.length) return 0
+    // Idempotency: skip everything up to (and including) the last message already backfilled,
+    // so re-linking the same file (md_log called again) never re-dumps history already written.
+    let entries = allEntries
+    if (already) {
+      const idx = allEntries.findIndex((e) => e?.info?.id === already)
+      // If the watermark message can't be found (pruned/compacted history), bail out rather
+      // than risk re-appending everything — live hooks still capture new messages going forward.
+      if (idx < 0) return 0
+      entries = allEntries.slice(idx + 1)
+      if (!entries.length) return 0
+    }
     const blocks: string[] = []
+    let lastID: string | undefined = already
     for (const entry of entries) {
       const info: any = entry.info
+      if (info?.id) lastID = info.id
       const parts: any[] = entry.parts ?? []
       if (!info || !info.role) continue
       if (info.role === "user") {
@@ -387,6 +402,12 @@ async function backfillMdLog(client: any, sessionID: string, directory: string):
         fs.writeFileSync(mdFile2, current + prefix + blocks.join("\n\n") + "\n", "utf-8")
       }
     }
+    // Persist the watermark whenever we've examined new entries, even if none produced a block,
+    // so a repeated md_log call never re-scans (and never re-appends) the same history again.
+    if (lastID && lastID !== already) {
+      mdLinks.set(sessionID, { ...(linkMeta as MdLinkMeta), file: mdFile, directory, backfilledUntil: lastID })
+      saveMdLinksForDirectory(markerPath, directory)
+    }
     return blocks.length
   } catch (e) {
     slog("backfill failed", String(e))
@@ -475,6 +496,27 @@ async function waitForResponse(directory: string, id: string, abort: AbortSignal
   })
 }
 
+// Cross-process single-writer lock: multiple opencode processes (separate windows/tabs) can be
+// attached to the same project directory, and each independently re-arms durable pending quizzes
+// on its own startup. Without this, every process spins up its own fs.watch/poll for the same id,
+// which is wasteful and — combined with the TUI-side popup lock below — is what caused a stray
+// duplicate answer to go unwatched (the "second recovered quiz never injects" bug).
+function ownerLockPath(dir: string, id: string) { return path.join(dir, `owner-${id}.lock`) }
+function acquireOwnerLock(dir: string, id: string): boolean {
+  const p = ownerLockPath(dir, id)
+  const payload = JSON.stringify({ pid: process.pid, at: Date.now() })
+  try { fs.writeFileSync(p, payload, { flag: "wx" }); return true } catch {}
+  try {
+    const age = Date.now() - fs.statSync(p).mtimeMs
+    if (age > 15000) { fs.writeFileSync(p, payload, "utf8"); return true }
+  } catch {
+    try { fs.writeFileSync(p, payload, { flag: "wx" }); return true } catch {}
+  }
+  return false
+}
+function refreshOwnerLock(dir: string, id: string) { try { fs.writeFileSync(ownerLockPath(dir, id), JSON.stringify({ pid: process.pid, at: Date.now() }), "utf8") } catch {} }
+function releaseOwnerLock(dir: string, id: string) { try { fs.unlinkSync(ownerLockPath(dir, id)) } catch {} }
+
 // Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
 const activeWatchers = new Map<string, () => void>()
 function watchAndInject(client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
@@ -482,6 +524,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
   if (!sessionID) { slog("watchAndInject no sessionID", id); return }
   activeWatchers.get(id)?.()
   const dir = pendingDir(directory)
+  if (!acquireOwnerLock(dir, id)) { slog("watchAndInject lock busy, another process owns this id", id); return }
   const respPath = path.join(dir, `response-${id}.json`)
   const claimPath = path.join(dir, `response-${id}.claim-${process.pid}.json`)
   const pendingCandidates = [path.join(dir, `quiz-${id}.json`), path.join(dir, `quiz_batch-${id}.json`)]
@@ -494,6 +537,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     try { watcher?.close() } catch {}
     if (pollTimer) clearInterval(pollTimer)
     if (activeWatchers.get(id) === closeWatcher) activeWatchers.delete(id)
+    releaseOwnerLock(dir, id)
   }
   activeWatchers.set(id, closeWatcher)
   const fire = async (attempt = 0): Promise<void> => {
@@ -586,6 +630,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
   // fs.watch is lossy by design. Polling keeps persisted answers moving after a TUI/server restart
   // even when the filesystem event is dropped.
   pollTimer = setInterval(() => {
+    refreshOwnerLock(dir, id)
     if (fs.existsSync(respPath)) { void fire(); return }
     if (!pendingCandidates.some((p) => fs.existsSync(p)) && !fs.existsSync(claimPath)) closeWatcher()
   }, 500)
@@ -1330,11 +1375,16 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               return `File already linked to session ${ses.slice(0,8)} — 1-1-1 violation. Copy to a new file or md_unlog that session first.`
             }
           }
-          mdLinks.set(sessionID, { file: resolved, directory, linkedAt: Date.now() })
+          // Re-linking the SAME file for this session (e.g. md_log called again after a
+          // restart/reconnect) must preserve the backfill watermark — otherwise every re-link
+          // would re-dump the entire session history into the file a second time.
+          const existingMeta = mdLinks.get(sessionID)
+          const preservedWatermark = existingMeta?.file === resolved ? existingMeta.backfilledUntil : undefined
+          mdLinks.set(sessionID, { file: resolved, directory, linkedAt: Date.now(), backfilledUntil: preservedWatermark })
           saveMdLinksForDirectory(markerPath, directory)
           // Backfill history for this session only
           let backfilled = 0
-          try { backfilled = await backfillMdLog(client, sessionID, directory) } catch (e) { slog("backfill error", String(e)) }
+          try { backfilled = await backfillMdLog(client, sessionID, directory, markerPath) } catch (e) { slog("backfill error", String(e)) }
           await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved, backfilled, sessionID } } })
           return `Linked: ${resolved} to session ${sessionID.slice(0,8)} — ${backfilled ? `${backfilled} entries backfilled — ` : ""}future messages for THIS session will be mirrored. Other sessions stay silent.`
         },
