@@ -558,13 +558,13 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     }
     if (!ok) {
       slog("watchAndInject inject FAILED, preserved", id, effectiveSessionID, String(firstErr).slice(0,200))
+      closeWatcher()
       try { fs.renameSync(claimPath, respPath) } catch {
         try { fs.renameSync(claimPath, path.join(dir, `response-${id}.failed-${Date.now()}.json`)) } catch {}
       }
       try {
         await client.app.log({ body: { service: "learn", level: "error", message: `inject FAILED for ${effectiveSessionID} (orig ${sessionID})`, extra: { id } } })
       } catch {}
-      closeWatcher()
       return
     }
     // Success: consume claim + defensively try pending too (TUI is the primary owner of pending deletion)
