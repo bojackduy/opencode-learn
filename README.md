@@ -115,6 +115,8 @@ quiz_batch(quizzes=[{question:"…", options:[…], correctAnswer:["Red","Blue"]
 ```
 Single → TUI popup `QuizDialog` (single/multi + `I don't know` + note). Batch → deck `1/3→3/3` `QuizBatchDialog` (same 4-state `hit/miss/false-alarm/correct-rejection` solid `bg` inverted). Both durable `pendingDir` `.opencode/learn-pending` — kill `opencode` mid-popup → re-show on restart.
 
+Quiz dialogs are asynchronous. The agent must call `quiz` or `quiz_batch` alone, end that assistant turn once the dialog is displayed, and continue only after the TUI injects the learner's answer.
+
 Open forks: native `question` (single/multi `Other`).
 
 **Visual — one correct picture**

@@ -778,6 +778,15 @@ export const tui: TuiPlugin = async (api) => {
     return null
   }
 
+  const hasAnswerArtifact = (id: string): boolean => {
+    const response = `response-${id}`
+    try {
+      return fs.readdirSync(pendingDir).some((file) => file === `${response}.json` || file.startsWith(`${response}.claim-`))
+    } catch {
+      return false
+    }
+  }
+
   const processPending = () => {
     const curSid = getCurrentSessionID()
     if (!curSid) return
@@ -788,9 +797,7 @@ export const tui: TuiPlugin = async (api) => {
     try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort() } catch { return }
     // Session-distinct: only show pending for current session.
     // Skip answered-pending (a response file exists, server is consuming): prevents re-popup after answer.
-    const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean).filter(x => {
-      try { return !fs.existsSync(path.join(pendingDir, `response-${x!.j.id}.json`)) } catch { return true }
-    }) as Array<{f: string, j: any}>
+    const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean).filter(x => !hasAnswerArtifact(x!.j.id)) as Array<{f: string, j: any}>
     const pick = matching.find(x => x.j.sessionID === curSid) || matching.find(x => !x.j.sessionID)
     if (!pick) return
     const file = pick.f
@@ -875,9 +882,8 @@ export const tui: TuiPlugin = async (api) => {
           }
         }
       } catch {}
-      // TUI owns dialog lifecycle — always delete pending + close immediately so Enter never appears to "do nothing",
-      // regardless of whether another (possibly stale/old-code) opencode process is also running.
-      try { fs.unlinkSync(full) } catch {}
+      // Keep the pending payload until the server confirms injection. It is the recovery context
+      // needed to rebuild the prompt if either process exits after the answer is written.
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
@@ -911,7 +917,7 @@ export const tui: TuiPlugin = async (api) => {
           } catch {}
         }
       } catch {}
-      try { fs.unlinkSync(full) } catch {}
+      // Keep the pending payload until the server consumes the cancellation response.
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)

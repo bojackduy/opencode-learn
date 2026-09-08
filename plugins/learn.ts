@@ -476,18 +476,29 @@ async function waitForResponse(directory: string, id: string, abort: AbortSignal
 }
 
 // Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
-const activeWatchers = new Map<string, fs.FSWatcher>()
+const activeWatchers = new Map<string, () => void>()
 function watchAndInject(client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
   slog("watchAndInject start", id, sessionID)
   if (!sessionID) { slog("watchAndInject no sessionID", id); return }
+  activeWatchers.get(id)?.()
   const dir = pendingDir(directory)
   const respPath = path.join(dir, `response-${id}.json`)
   const claimPath = path.join(dir, `response-${id}.claim-${process.pid}.json`)
   const pendingCandidates = [path.join(dir, `quiz-${id}.json`), path.join(dir, `quiz_batch-${id}.json`)]
-  const closeWatcher = () => { const w = activeWatchers.get(id); if (w) { try { w.close() } catch {}; activeWatchers.delete(id) } }
+  let watcher: fs.FSWatcher | undefined
+  let pollTimer: ReturnType<typeof setInterval> | undefined
+  let closed = false
+  const closeWatcher = () => {
+    if (closed) return
+    closed = true
+    try { watcher?.close() } catch {}
+    if (pollTimer) clearInterval(pollTimer)
+    if (activeWatchers.get(id) === closeWatcher) activeWatchers.delete(id)
+  }
+  activeWatchers.set(id, closeWatcher)
   const fire = async (attempt = 0): Promise<void> => {
     // Atomic single-consumer claim: exactly one process proceeds (fixes double-inject across processes)
-    try { fs.renameSync(respPath, claimPath) } catch { closeWatcher(); return } // already claimed/consumed → stand down
+    try { fs.renameSync(respPath, claimPath) } catch { return } // no answer yet, or another process claimed it
     let data: any
     try {
       data = JSON.parse(fs.readFileSync(claimPath, "utf8"))
@@ -547,7 +558,9 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     }
     if (!ok) {
       slog("watchAndInject inject FAILED, preserved", id, effectiveSessionID, String(firstErr).slice(0,200))
-      try { fs.renameSync(claimPath, path.join(dir, `response-${id}.failed-${Date.now()}.json`)) } catch {}
+      try { fs.renameSync(claimPath, respPath) } catch {
+        try { fs.renameSync(claimPath, path.join(dir, `response-${id}.failed-${Date.now()}.json`)) } catch {}
+      }
       try {
         await client.app.log({ body: { service: "learn", level: "error", message: `inject FAILED for ${effectiveSessionID} (orig ${sessionID})`, extra: { id } } })
       } catch {}
@@ -567,10 +580,15 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     // Fire on ANY directory event, not just exact filename match — atomic tmp+rename writes can report
     // a different filename (or no filename) on some fs.watch backends (notably macOS FSEvents). The claim
     // rename inside fire() makes this safe to call spuriously: if respPath doesn't exist yet, it just no-ops.
-    const w = fs.watch(dir, () => { void fire() })
-    w.on("error", () => {})
-    activeWatchers.set(id, w)
+    watcher = fs.watch(dir, () => { void fire() })
+    watcher.on("error", () => {})
   } catch {}
+  // fs.watch is lossy by design. Polling keeps persisted answers moving after a TUI/server restart
+  // even when the filesystem event is dropped.
+  pollTimer = setInterval(() => {
+    if (fs.existsSync(respPath)) { void fire(); return }
+    if (!pendingCandidates.some((p) => fs.existsSync(p)) && !fs.existsSync(claimPath)) closeWatcher()
+  }, 500)
   // Recheck after arming to close the event gap (claim makes double-fire safe)
   if (fs.existsSync(respPath)) { slog("watchAndInject fast-path", id); void fire(); return }
 }
@@ -1054,9 +1072,9 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
     tool: {
       // ── quiz: graded question ────────────────────────────────────────
       quiz: tool({
-        description: "Ask the user a GRADED question with a known correct answer, then grade and give feedback. Unlike the native `question` tool (which collects preferences with no right answer), `quiz` has a correct answer, marks selection right/wrong, reveals correct answer, and shows explanation. Use to assess understanding before teaching and for retrieval practice after. Options-only: single/multi-select plus auto 'I don't know'. No free-text. For non-graded questions use the native `question` tool.",
+        description: "Ask the user a GRADED question with a known correct answer, then grade and give feedback. Unlike the native `question` tool (which collects preferences with no right answer), `quiz` has a correct answer, marks selection right/wrong, reveals the correct answer, and shows an explanation. The TUI interaction is asynchronous, so call `quiz` ALONE in an assistant turn: never call it in parallel or in the same response with native `question`, another `quiz`, `quiz_batch`, or any other user-input tool. When the result says displayed/waiting, end the turn immediately; the answer will be injected as a new turn. Only call native `question` after `quiz` if its result explicitly requests the no-TUI fallback. Use to assess understanding before teaching and for retrieval practice after. Options-only: single/multi-select plus auto 'I don't know'. No free-text. For non-graded questions use the native `question` tool.",
         args: {
-          question: tool.schema.string().describe("Single quiz question to ask. One per call."),
+          question: tool.schema.string().describe("Single quiz question to ask. Call this tool alone; do not combine it with another user-input tool in the same turn."),
           details: tool.schema.string().optional().describe("Extra context shown under question."),
           options: tool.schema.array(tool.schema.object({
             label: tool.schema.string().describe("Display label"),
@@ -1139,7 +1157,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
             }
           }
           if (tuiAlive) {
-            return `[quiz displayed in TUI — waiting for your answer in the popup. I'll continue once you respond.]`
+            return `[quiz displayed in TUI - waiting for the user's answer in the popup. STOP this assistant turn now. Do not call \`question\`, another tool, or ask another question in text. The answer will be injected as a new turn.]`
           }
           // ── Fallback: console TTY (NEVER inside opencode TUI — readline steals raw mode + mouse SGR `^[[<35;...M` and garbles alt-screen)
           // Inside opencode `OPENCODE=1` is always set, so skip readline and use instruction fallback that works with native `question` tool.
@@ -1199,7 +1217,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
 
       // ── quiz_batch: optional deck — quiz 1/3 → 2/3 → 3/3 in one dialog, one inject
       quiz_batch: tool({
-        description: "Batch version of quiz — shows 2-8 graded questions as a deck (Quiz 1/3 → 2/3 → 3/3) in one beautiful TUI, then one combined inject. Use when you want multiple probes without separate tool calls. Each entry has same schema as quiz.",
+        description: "Batch version of quiz - shows 2-8 graded questions as a deck (Quiz 1/3 to 2/3 to 3/3) in one TUI, then injects one combined answer. The TUI interaction is asynchronous, so call `quiz_batch` ALONE in an assistant turn: never call it in parallel or in the same response with native `question`, `quiz`, another `quiz_batch`, or any other user-input tool. When the result says displayed/waiting, end the turn immediately; the answers will be injected as a new turn. Use when you want multiple non-adaptive checks in one deck. Each entry has the same schema as quiz.",
         args: {
           quizzes: tool.schema.array(tool.schema.object({
             question: tool.schema.string(),
@@ -1289,8 +1307,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               return `[quiz_batch answered] ${normalized.length} quizzes\n` + lines
             })
             slog("quiz_batch watchAndInject armed", id, "alive", isAlive)
-            if (isAlive) return `[quiz batch displayed in TUI — ${normalized.length} quizzes as deck Quiz 1/${normalized.length} → ${normalized.length}/${normalized.length}. Answer all, then one combined inject.]`
-            else return `[quiz batch displayed durably — TUI not alive yet, will appear on restart. Answer all, then one combined inject.]`
+            if (isAlive) return `[quiz batch displayed in TUI - ${normalized.length} quizzes as deck Quiz 1/${normalized.length} to ${normalized.length}/${normalized.length}. STOP this assistant turn now. Do not call \`question\`, another tool, or ask another question in text. The answers will be injected as a new turn.]`
+            else return `[quiz batch stored durably - TUI not alive yet, so it will appear on restart. STOP this assistant turn now. Do not call \`question\`, another tool, or ask another question in text. The answers will be injected after the user completes the deck.]`
           }
       }),
 
