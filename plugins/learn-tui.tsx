@@ -756,10 +756,18 @@ function QuizBatchDialog(props: {
 }
 
 export const tui: TuiPlugin = async (api) => {
-  const dir = api.state.path.directory || api.state.path.worktree || process.cwd()
+  // Guard the very first state access: if a future opencode version reshapes the TUI API
+  // object, a synchronous throw here would kill the whole plugin with zero trace (no
+  // heartbeat, no log line) — exactly the silent-death signature. Fall back to cwd.
+  let dir: string
+  try {
+    const p: any = (api as any)?.state?.path
+    dir = p?.directory || p?.worktree || process.cwd()
+  } catch { dir = process.cwd() }
   const pendingDir = path.join(dir, PENDING_DIR)
   ;(globalThis as any).__learnPendingDir = pendingDir
   ensureDir(pendingDir)
+  tlog("learn-tui init", `dir=${pendingDir}`, `pid=${process.pid}`)
   const heartbeatPath = path.join(pendingDir, ".tui-alive")
   try { fs.writeFileSync(heartbeatPath, String(Date.now()), "utf8") } catch {}
   const hbTimer = setInterval(() => { try { fs.writeFileSync(heartbeatPath, String(Date.now()), "utf8") } catch {} }, 2000)
@@ -834,6 +842,24 @@ export const tui: TuiPlugin = async (api) => {
     if (api.ui.dialog.open) return
     let files: string[] = []
     try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort() } catch { return }
+    // Expire pendings answered long ago via fallback (same 24h TTL as the server re-arm):
+    // never pop a quiz the session moved past hours ago just because a TUI attached late.
+    // Archive-then-rescan so an expired entry can't block a newer live quiz behind it.
+    try {
+      for (const f of files) {
+        try {
+          const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any
+          const ts = j?.timestamp
+          if (typeof ts === "number" && Date.now() - ts > 24 * 60 * 60 * 1000) {
+            const expDir = path.join(pendingDir, "expired")
+            try { fs.mkdirSync(expDir, { recursive: true }) } catch {}
+            fs.renameSync(path.join(pendingDir, f), path.join(expDir, `${Date.now()}-${f}`))
+            tlog("pending expired, archived", (j as any)?.id || f)
+          }
+        } catch {}
+      }
+      files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort()
+    } catch {}
     // Session-distinct: only show pending for current session.
     // Skip answered-pending (a response file exists, server is consuming): prevents re-popup after answer.
     const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean).filter(x => !hasAnswerArtifact(x!.j.id)) as Array<{f: string, j: any}>

@@ -517,6 +517,30 @@ function acquireOwnerLock(dir: string, id: string): boolean {
 function refreshOwnerLock(dir: string, id: string) { try { fs.writeFileSync(ownerLockPath(dir, id), JSON.stringify({ pid: process.pid, at: Date.now() }), "utf8") } catch {} }
 function releaseOwnerLock(dir: string, id: string) { try { fs.unlinkSync(ownerLockPath(dir, id)) } catch {} }
 
+// Pending quizzes answered via the no-TUI fallback (native question / manual chat) leave a
+// pending file nobody will ever answer through the popup. Without expiry these rot forever:
+// re-armed on every (re)start, and popped confusingly if a TUI attaches hours later, long
+// after the session moved on. Quiz execute never blocks on the TUI (the no-TUI path returns
+// the native-question fallback immediately), so a pending older than the TTL with no response
+// is definitionally obsolete — archive it instead of re-arming. (TUI pickup applies the same
+// TTL; see processPending in learn-tui.tsx.)
+const PENDING_TTL_MS = 24 * 60 * 60 * 1000
+function isPendingExpired(j: any): boolean {
+  try {
+    const ts = (j as any)?.timestamp
+    if (typeof ts !== "number") return false
+    return Date.now() - ts > PENDING_TTL_MS
+  } catch { return false }
+}
+function archiveExpiredPending(dir: string, f: string) {
+  try {
+    const expDir = path.join(dir, "expired")
+    try { fs.mkdirSync(expDir, { recursive: true }) } catch {}
+    fs.renameSync(path.join(dir, f), path.join(expDir, `${Date.now()}-${f}`))
+    slog("pending expired, archived", f)
+  } catch {}
+}
+
 // Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
 const activeWatchers = new Map<string, () => void>()
 function watchAndInject(client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
@@ -911,6 +935,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       for (const f of fs.readdirSync(dir).filter(x => x.endsWith(".json") && !x.startsWith("response-") && !x.startsWith(".") && !x.startsWith("classify"))) {
         try {
           const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
+          if (isPendingExpired(j)) { archiveExpiredPending(dir, f); continue }
           if (j?.id && j?.sessionID) {
             watchAndInject(client, directory, j.id, j.sessionID, (r: any) => {
               if (j.type === "quiz") {
@@ -1117,7 +1142,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
     tool: {
       // ── quiz: graded question ────────────────────────────────────────
       quiz: tool({
-        description: "Ask the user a GRADED question with a known correct answer, then grade and give feedback. Unlike the native `question` tool (which collects preferences with no right answer), `quiz` has a correct answer, marks selection right/wrong, reveals the correct answer, and shows an explanation. The TUI interaction is asynchronous, so call `quiz` ALONE in an assistant turn: never call it in parallel or in the same response with native `question`, another `quiz`, `quiz_batch`, or any other user-input tool. When the result says displayed/waiting, end the turn immediately; the answer will be injected as a new turn. Only call native `question` after `quiz` if its result explicitly requests the no-TUI fallback. Use to assess understanding before teaching and for retrieval practice after. Options-only: single/multi-select plus auto 'I don't know'. No free-text. For non-graded questions use the native `question` tool.",
+        description: "Ask the user a GRADED question with a known correct answer, then grade and give feedback. Unlike the native `question` tool (which collects preferences with no right answer), `quiz` has a correct answer, marks selection right/wrong, reveals the correct answer, and shows an explanation. The TUI interaction is asynchronous, so call `quiz` ALONE in an assistant turn: never call it in parallel or in the same response with native `question`, another `quiz`, `quiz_batch`, or any other user-input tool. When the result says displayed/waiting, end the turn immediately; the answer will be injected as a new turn. Never call the native `question` tool for a quiz — there is no two-step flow. If no popup is available, the quiz result itself contains the question to ask in plain chat text. Use to assess understanding before teaching and for retrieval practice after. Options-only: single/multi-select plus auto 'I don't know'. No free-text. For non-graded questions use the native `question` tool.",
         args: {
           question: tool.schema.string().describe("Single quiz question to ask. Call this tool alone; do not combine it with another user-input tool in the same turn."),
           details: tool.schema.string().optional().describe("Extra context shown under question."),
@@ -1239,21 +1264,19 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
             }
             return result
           }
+          // No-TUI path: single-prompt contract. NEVER route through the native `question`
+          // tool here — that produces the quiz-plus-question double prompt, and there is no
+          // "2-step flow": a quiz is one question, asked once, in plain text.
           const instruction = [
-            `[quiz ready — awaiting user answer via \`question\` tool]`,
+            `[quiz — no popup available, asking directly in chat]`,
             `Question: ${qFixed}`,
             dFixed ? `Details: ${dFixed}` : null,
-            `Options (display order, already shuffled):`,
-            ...options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""} (value="${o.value}")`),
-            `Correct indices: ${correctIndices.join(", ")} (Correct values: ${correctStr})`,
-            `Explanation (reveal AFTER answer): ${eFixed}`,
-            `Mode: ${args.multiSelect ? "multi-select (exact set)" : "single-select"}`,
+            ...options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`),
+            `0. I don't know`,
             ``,
-            `INSTRUCTION FOR LLM: Call the built-in \`question\` tool with:`,
-            `  header: "Quiz"`,
-            `  question: "${qFixed.replace(/"/g, '\\"')}"`,
-            `  options: [${options.map(o => `{label:"${o.label.replace(/"/g, '\\"')}", description:"${(o.description ?? "").replace(/"/g, '\\"')}"}`).join(", ")}]`,
-            `Then compare the user's selected labels to correct indices [${correctIndices.join(", ")}]. Grade as ${args.multiSelect ? "exact-set match" : "single match"}, show ✓/✗, reveal Correct: ${correctStr}, and Explanation. An 'I don't know' maps to dontKnow (genuine gap).`,
+            `INSTRUCTION FOR LLM: ask the question above IN YOUR REPLY TEXT, exactly as written (numbered options, ending with the "I don't know" line). Do NOT call the \`question\` tool, another \`quiz\`/\`quiz_batch\`, or any other tool — just write the question and wait for the user's reply.`,
+            `When they reply, compare their numbers/labels to correct indices [${correctIndices.join(", ")}] (correct: ${correctStr}). Grade as ${args.multiSelect ? "exact-set match" : "single match"}, show ✓/✗, reveal Correct: ${correctStr}, then the explanation below. Treat 0/"I don't know" as a genuine gap, not a guess.`,
+            `Explanation (reveal ONLY after they answer): ${eFixed}`,
           ].filter(Boolean).join("\n")
             ;(ctx as any).metadata?.({ title: `Quiz: ${qFixed.slice(0, 40)}`, metadata: { correctIndices, explanation: eFixed, options: options.map((o, i) => ({ index: i + 1, label: o.label })) } })
           return instruction
@@ -1262,7 +1285,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
 
       // ── quiz_batch: optional deck — quiz 1/3 → 2/3 → 3/3 in one dialog, one inject
       quiz_batch: tool({
-        description: "Batch version of quiz - shows 2-8 graded questions as a deck (Quiz 1/3 to 2/3 to 3/3) in one TUI, then injects one combined answer. The TUI interaction is asynchronous, so call `quiz_batch` ALONE in an assistant turn: never call it in parallel or in the same response with native `question`, `quiz`, another `quiz_batch`, or any other user-input tool. When the result says displayed/waiting, end the turn immediately; the answers will be injected as a new turn. Use when you want multiple non-adaptive checks in one deck. Each entry has the same schema as quiz.",
+        description: "Batch version of quiz - shows 2-8 graded questions as a deck (Quiz 1/3 to 2/3 to 3/3) in one TUI, then injects one combined answer. The TUI interaction is asynchronous, so call `quiz_batch` ALONE in an assistant turn: never call it in parallel or in the same response with native `question`, `quiz`, another `quiz_batch`, or any other user-input tool. When the result says displayed/waiting, end the turn immediately; the answers will be injected as a new turn. Never call the native `question` tool for a quiz batch — there is no two-step flow. If no popup is available, the result itself contains the questions to ask in plain chat text. Use when you want multiple non-adaptive checks in one deck. Each entry has the same schema as quiz.",
         args: {
           quizzes: tool.schema.array(tool.schema.object({
             question: tool.schema.string(),
@@ -1353,7 +1376,25 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
             })
             slog("quiz_batch watchAndInject armed", id, "alive", isAlive)
             if (isAlive) return `[quiz batch displayed in TUI - ${normalized.length} quizzes as deck Quiz 1/${normalized.length} to ${normalized.length}/${normalized.length}. STOP this assistant turn now. Do not call \`question\`, another tool, or ask another question in text. The answers will be injected as a new turn.]`
-            else return `[quiz batch stored durably - TUI not alive yet, so it will appear on restart. STOP this assistant turn now. Do not call \`question\`, another tool, or ask another question in text. The answers will be injected after the user completes the deck.]`
+            // No-TUI path: single-prompt contract (same rationale as single quiz above —
+            // waiting for an inject that can never come would stall the session, and routing
+            // through the native `question` tool produces the double prompt).
+            const askAll = normalized.map((q: any, qi: number) => {
+              const lines = [`Q${qi + 1}/${normalized.length}: ${q.question}`]
+              if (q.details?.trim()) lines.push(q.details.trim())
+              q.options.forEach((o: any, i: number) => lines.push(`${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ""}`))
+              lines.push(`0. I don't know`)
+              lines.push(`(hidden correct indices for grading only: ${(q.correctIndices || []).join(",")})`)
+              return lines.join("\n")
+            }).join("\n\n")
+            const explainAll = normalized.map((q: any, qi: number) => `Q${qi + 1} explanation (reveal ONLY after they answer): ${q.explanation}`).join("\n")
+            return [
+              `[quiz batch — no popup available, asking directly in chat]`,
+              askAll,
+              ``,
+              `INSTRUCTION FOR LLM: ask ALL questions above IN YOUR REPLY TEXT, exactly as written. Do NOT call the \`question\` tool, another \`quiz\`/\`quiz_batch\`, or any other tool — just write them and wait for the user's reply. Grade each answer against its hidden correct indices (${normalized.map((q: any) => (q.multiSelect ? "exact-set" : "single")).join(", ")}), show ✓/✗ per question with Correct + Explanation. Treat 0/"I don't know" as a genuine gap.`,
+              explainAll,
+            ].join("\n")
           }
       }),
 
