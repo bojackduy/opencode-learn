@@ -812,14 +812,36 @@ export const tui: TuiPlugin = async (api) => {
     const curSid = getCurrentSessionID()
     if (!curSid) return
     let current = currentBySession.get(curSid) as { id: string; type: string } | undefined
-    if (current) { refreshPopupClaim(current.id); return }
+    if (current) {
+      // Self-heal: the tracked dialog may have been dismissed through a path other than
+      // done()/cancel() (session/tab switch, TUI reconnect, dialog replaced externally),
+      // or its pending file may have been consumed externally. A stuck entry would block
+      // ALL future quizzes for this session forever — release it and rediscover below.
+      const pendingStillExists = (() => { try { return fs.readdirSync(pendingDir).some((f) => f === `quiz-${current!.id}.json` || f === `quiz_batch-${current!.id}.json`) } catch { return true } })()
+      if (!pendingStillExists) {
+        tlog("processPending stale current cleared (pending gone)", current.id)
+        releasePopupClaim(current.id)
+        currentBySession.delete(curSid)
+        current = undefined
+      } else if (api.ui.dialog.open) { refreshPopupClaim(current.id); return }
+      else {
+        tlog("processPending stale current cleared (dialog no longer open)", current.id)
+        releasePopupClaim(current.id)
+        currentBySession.delete(curSid)
+        current = undefined
+      }
+    }
     if (api.ui.dialog.open) return
     let files: string[] = []
     try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort() } catch { return }
     // Session-distinct: only show pending for current session.
     // Skip answered-pending (a response file exists, server is consuming): prevents re-popup after answer.
     const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean).filter(x => !hasAnswerArtifact(x!.j.id)) as Array<{f: string, j: any}>
-    const pick = matching.find(x => x.j.sessionID === curSid) || matching.find(x => !x.j.sessionID)
+    // Newest-first: when several quizzes stack up for the same session (e.g. earlier ones
+    // answered manually in chat after a popup failure), the LATEST quiz is the live one the
+    // agent is waiting on. Alphabetical order would keep re-showing the oldest stuck quiz.
+    const byNewest = [...matching].sort((a, b) => (((b as any).j?.timestamp || 0) as number) - (((a as any).j?.timestamp || 0) as number))
+    const pick = byNewest.find(x => x.j.sessionID === curSid) || byNewest.find(x => !x.j.sessionID)
     if (!pick) return
     const file = pick.f
     const full = path.join(pendingDir, file)
