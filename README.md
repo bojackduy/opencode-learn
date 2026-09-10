@@ -58,8 +58,14 @@ Add to **both** configs (opencode needs server + TUI):
 ```
 **`~/.config/opencode/tui.json`** — TUI (`learn-tui`):
 ```jsonc
-{ "plugin": ["@bojackduy/opencode-learn/tui"] }
+{ "plugin": ["@bojackduy/opencode-learn"] }
 ```
+Use the **bare package name** in both files, not `@bojackduy/opencode-learn/tui`/`/server` —
+opencode already picks the right export (`./tui` vs `./server`) based on which host loads it.
+A scoped-package spec with a `/tui` or `/server` suffix is silently broken: `npm-package-arg`
+parses the second slash as a local directory reference instead of a package+subpath reference,
+so the plugin never resolves or activates, with **no error logged anywhere**.
+
 Restart OpenCode. Verify `/md_log`, `quiz`, `write_mermaid` appear in tool list.
 
 Local checkout:

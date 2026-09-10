@@ -101,10 +101,13 @@ async function configurePlugins(isUninstall) {
       } else {
         // Keep non-learn plugins, add/update learn
         next = plugins.filter(v => !isLearnPluginSpec(v))
-        // Determine if this is tui.json vs opencode.json
-        const isTui = name.startsWith("tui.")
-        if (isTui) next.push(`${packageName}/tui`)
-        else next.push(packageName)
+        // Both tui.json and opencode.json use the bare package name: "@scope/name/tui" is
+        // silently broken for SCOPED packages — npm-package-arg parses a scoped spec with a
+        // second slash as a local "directory" reference instead of a package+subpath
+        // reference, so it never resolves and the plugin never activates (no error logged).
+        // The loader already picks the "./tui" vs "./server" export from package.json
+        // automatically based on which host (tui vs server) loads it.
+        next.push(packageName)
         // Deduplicate
         next = [...new Set(next)]
       }
@@ -113,8 +116,7 @@ async function configurePlugins(isUninstall) {
       if (!findRootProperty(source, "plugin") && !isUninstall) {
         const eol = source.includes("\r\n") ? "\r\n" : "\n"
         const indent = "  "
-        const isTui = name.startsWith("tui.")
-        const spec = isTui ? `${packageName}/tui` : packageName
+        const spec = packageName
         const pluginStr = `,\n${indent}"plugin": ${formatPluginArray([spec], indent, eol)}`
         // Insert before final }
         const lastBrace = source.lastIndexOf("}")
@@ -127,8 +129,7 @@ async function configurePlugins(isUninstall) {
       if (e?.code !== "ENOENT") throw new Error(`Could not inspect ${target}: ${e.message}`)
       if (!isUninstall) {
         // Create new config file if it doesn't exist
-        const isTui = name.startsWith("tui.")
-        const spec = isTui ? `${packageName}/tui` : packageName
+        const spec = packageName
         // Only create opencode.jsonc and tui.jsonc by default
         if ((name === "opencode.jsonc" || name === "tui.jsonc") && !isUninstall) {
           const content = `{\n  "plugin": ["${spec}"]\n}\n`
@@ -219,7 +220,7 @@ async function installOrUpdate() {
   console.log(`  Agents: ${agentsCount} (researcher, mermaid-maker, svg-maker, classify)`)
   console.log(`  Skills: ${skillsCount} (teach, visualize, marker-pdf-parser, notebooklm-lecture-notes)`)
   if (commandsCount) console.log(`  Commands: ${commandsCount}`)
-  console.log(`  Plugin: ${packageName} (server) + ${packageName}/tui (TUI)`)
+  console.log(`  Plugin: ${packageName} (server + TUI)`)
   console.log("\nRestart OpenCode to load plugins.")
   console.log("  /md_log <file>  — mirror to Obsidian")
   console.log("  quiz / quiz_batch — graded checks")
