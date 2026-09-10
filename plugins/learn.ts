@@ -496,26 +496,14 @@ async function waitForResponse(directory: string, id: string, abort: AbortSignal
   })
 }
 
-// Cross-process single-writer lock: multiple opencode processes (separate windows/tabs) can be
-// attached to the same project directory, and each independently re-arms durable pending quizzes
-// on its own startup. Without this, every process spins up its own fs.watch/poll for the same id,
-// which is wasteful and — combined with the TUI-side popup lock below — is what caused a stray
-// duplicate answer to go unwatched (the "second recovered quiz never injects" bug).
-function ownerLockPath(dir: string, id: string) { return path.join(dir, `owner-${id}.lock`) }
-function acquireOwnerLock(dir: string, id: string): boolean {
-  const p = ownerLockPath(dir, id)
-  const payload = JSON.stringify({ pid: process.pid, at: Date.now() })
-  try { fs.writeFileSync(p, payload, { flag: "wx" }); return true } catch {}
-  try {
-    const age = Date.now() - fs.statSync(p).mtimeMs
-    if (age > 15000) { fs.writeFileSync(p, payload, "utf8"); return true }
-  } catch {
-    try { fs.writeFileSync(p, payload, { flag: "wx" }); return true } catch {}
-  }
-  return false
-}
-function refreshOwnerLock(dir: string, id: string) { try { fs.writeFileSync(ownerLockPath(dir, id), JSON.stringify({ pid: process.pid, at: Date.now() }), "utf8") } catch {} }
-function releaseOwnerLock(dir: string, id: string) { try { fs.unlinkSync(ownerLockPath(dir, id)) } catch {} }
+// Single-consumer arbitration lives ENTIRELY in fire()'s atomic claim rename
+// (response-<id>.json -> response-<id>.claim-<pid>.json): exactly one process can win it,
+// so every live process may supervise every pending id with no coordination. An earlier
+// revision gated supervision behind an owner lock file; that created an abandonment race
+// (startup loser bailed permanently, winner died mid-watch, inject failure closed the only
+// watcher) that silently dropped answers after restarts. The lock is deliberately gone —
+// fewer mechanisms, fewer races. TUI-side popup ownership (opening-<id>.lock) is unaffected:
+// it prevents double-ANSWERS, a different mechanism from double-inject.
 
 // Pending quizzes answered via the no-TUI fallback (native question / manual chat) leave a
 // pending file nobody will ever answer through the popup. Without expiry these rot forever:
@@ -548,25 +536,34 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
   if (!sessionID) { slog("watchAndInject no sessionID", id); return }
   activeWatchers.get(id)?.()
   const dir = pendingDir(directory)
-  if (!acquireOwnerLock(dir, id)) { slog("watchAndInject lock busy, another process owns this id", id); return }
   const respPath = path.join(dir, `response-${id}.json`)
   const claimPath = path.join(dir, `response-${id}.claim-${process.pid}.json`)
   const pendingCandidates = [path.join(dir, `quiz-${id}.json`), path.join(dir, `quiz_batch-${id}.json`)]
   let watcher: fs.FSWatcher | undefined
   let pollTimer: ReturnType<typeof setInterval> | undefined
   let closed = false
+  // Consecutive inject-failure backoff: never hot-loop the SDK while preserving the answer.
+  // A rewritten response file (TUI watchdog re-touch) resets the streak for an early retry.
+  let failCount = 0
+  let nextAllowedAt = 0
+  let lastSeenMtime = 0
   const closeWatcher = () => {
     if (closed) return
     closed = true
     try { watcher?.close() } catch {}
     if (pollTimer) clearInterval(pollTimer)
     if (activeWatchers.get(id) === closeWatcher) activeWatchers.delete(id)
-    releaseOwnerLock(dir, id)
   }
   activeWatchers.set(id, closeWatcher)
   const fire = async (attempt = 0): Promise<void> => {
+    if (closed) return
+    try {
+      const mtime = fs.statSync(respPath).mtimeMs
+      if (mtime !== lastSeenMtime) { lastSeenMtime = mtime; failCount = 0; nextAllowedAt = 0 }
+    } catch { return } // no answer yet
+    if (Date.now() < nextAllowedAt) return // backing off after inject failure; response stays put
     // Atomic single-consumer claim: exactly one process proceeds (fixes double-inject across processes)
-    try { fs.renameSync(respPath, claimPath) } catch { return } // no answer yet, or another process claimed it
+    try { fs.renameSync(respPath, claimPath) } catch { return } // another process claimed it first
     let data: any
     try {
       data = JSON.parse(fs.readFileSync(claimPath, "utf8"))
@@ -625,13 +622,16 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
       try { await sdkCall(client.session.prompt.bind(client.session), ...shapes); ok = true } catch (e) { firstErr = firstErr || e }
     }
     if (!ok) {
-      slog("watchAndInject inject FAILED, preserved", id, effectiveSessionID, String(firstErr).slice(0,200))
-      closeWatcher()
+      // NEVER abandon: keep supervising so a later retry (or another live process) delivers.
+      // Closing the watcher here used to strand the preserved response with nobody watching.
+      failCount++
+      nextAllowedAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(failCount, 5))
+      slog("watchAndInject inject FAILED, preserved", id, effectiveSessionID, `retry in ~${Math.round((nextAllowedAt - Date.now()) / 1000)}s`, String(firstErr).slice(0,200))
       try { fs.renameSync(claimPath, respPath) } catch {
         try { fs.renameSync(claimPath, path.join(dir, `response-${id}.failed-${Date.now()}.json`)) } catch {}
       }
       try {
-        await client.app.log({ body: { service: "learn", level: "error", message: `inject FAILED for ${effectiveSessionID} (orig ${sessionID})`, extra: { id } } })
+        await client.app.log({ body: { service: "learn", level: "error", message: `inject FAILED for ${effectiveSessionID} (orig ${sessionID}), will retry`, extra: { id } } })
       } catch {}
       return
     }
@@ -654,7 +654,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
   // fs.watch is lossy by design. Polling keeps persisted answers moving after a TUI/server restart
   // even when the filesystem event is dropped.
   pollTimer = setInterval(() => {
-    refreshOwnerLock(dir, id)
+    if (closed) return
     if (fs.existsSync(respPath)) { void fire(); return }
     if (!pendingCandidates.some((p) => fs.existsSync(p)) && !fs.existsSync(claimPath)) closeWatcher()
   }, 500)
@@ -917,6 +917,12 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
   try {
     const dir = pendingDir(directory)
     if (fs.existsSync(dir)) {
+      // 0) Retired mechanism cleanup: owner-*.lock files belong to the removed owner-lock
+      // gate (single-consumer arbitration is the atomic claim rename now). Delete them so a
+      // dead owner's leftovers can never confuse future logic.
+      for (const f of fs.readdirSync(dir).filter(x => x.startsWith("owner-") && x.endsWith(".lock"))) {
+        try { fs.unlinkSync(path.join(dir, f)) } catch {}
+      }
       // 1) Requeue stale claims from consumers that died mid-flight (>30s old, no live response)
       for (const f of fs.readdirSync(dir).filter(x => x.includes(".claim-") && x.endsWith(".json"))) {
         try {
