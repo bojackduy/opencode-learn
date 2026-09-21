@@ -10,6 +10,7 @@ const result = await Bun.build({
     "@opentui/core",
     "@opentui/solid",
     "solid-js",
+    "solid-js/dist/solid.js",
   ],
   plugins: [solidPlugin],
 })

@@ -3,7 +3,8 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import type { Plugin as TuiV2 } from "@opencode/plugin/tui"
 import { createSignal, onCleanup, For, Show, createEffect } from "solid-js"
-import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
+import { onCleanup as onCleanupV2, onMount as onMountV2 } from "solid-js/dist/solid.js"
+import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/solid"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { watch } from "node:fs"
@@ -98,6 +99,499 @@ type QuizBatchPending = {
 type Pending = QuizPending | QuizBatchPending
 
 function prevent(e: any) { try { e.preventDefault?.(); e.stopPropagation?.() } catch {} }
+
+// OpenCode registers its global viewport shortcuts before plugin dialogs mount.
+// A regular useKeyboard listener therefore sees arrows only after the viewport
+// has already scrolled. Prepending the dialog listener lets stopPropagation()
+// claim handled keys before OpenCode's listener runs.
+function useDialogKeyboard(callback: (event: any) => void) {
+  const renderer = useRenderer()
+  const handle = (event: any) => {
+    try {
+      callback(event)
+    } finally {
+      // Imperative renderable mutations mark nodes dirty, but the v2 host does
+      // not always schedule a frame for plugin-owned nodes. Without this, the
+      // answer changes internally while the old cursor remains on screen.
+      renderer.requestRender()
+    }
+  }
+  onMountV2(() => renderer.keyInput.prependListener("keypress", handle))
+  onCleanupV2(() => renderer.keyInput.off("keypress", handle))
+}
+
+type QuizResult = {
+  answers: Array<{ label: string; value: string; index: number }>
+  dontKnow: boolean
+}
+
+// V2 deliberately uses only box/text primitives. The v1 dialog contains
+// markdown/input/scrollbox trees that OpenTUI 0.5 can mount for keyboard
+// handling while failing to paint because an empty text node reaches a box.
+// V2 keeps the full select -> feedback -> confirm flow (explanation review
+// with manual scrolling before anything is sent back) using only safe nodes.
+function wrapQuizLines(s: string, width = 76): string[] {
+  const out: string[] = []
+  for (const para of String(s ?? "").split("\n")) {
+    if (!para.trim()) { out.push(""); continue }
+    let line = ""
+    for (const word of para.split(/\s+/)) {
+      if (!word) continue
+      const next = line ? `${line} ${word}` : word
+      if (next.length > width) {
+        if (line) out.push(line)
+        line = word
+      } else line = next
+    }
+    if (line) out.push(line)
+  }
+  return out.length ? out : [""]
+}
+
+// Fully imperative V2 dialog: OpenTUI's host renderer and this bundle resolve
+// different solid-js module instances, so fine-grained signal updates never
+// reach the screen (state moves, pixels don't). Everything below mutates
+// renderables directly via refs — the only update path that works here.
+export function V2QuizDialog(props: {
+  request: QuizPending
+  theme: Record<string, any>
+  onSubmit: (result: QuizResult) => void
+  onCancel: () => void
+}) {
+  const multi = !!props.request.multiSelect
+  const correctSet = new Set(props.request.correctIndices)
+  const allRows = [...props.request.options, { label: "I don't know", value: "__dont_know__", index: props.request.options.length + 1 }]
+  const explLines = wrapQuizLines(decodeQuizText(props.request.explanation).trim() || "No explanation provided.")
+  const visibleCount = 8
+  const maxScroll = Math.max(0, explLines.length - visibleCount)
+
+  let cursorIdx = 0
+  const selectedSet = new Set<number>()
+  let phaseStr: "select" | "feedback" = "select"
+  let fb: { correct: boolean; selectedIndices: number[]; dontKnow: boolean } | null = null
+  let pendingRes: QuizResult | null = null
+  let scrollOff = 0
+
+  let rootBox: any = null
+  let headerBox: any = null
+  let headerTitle: any = null
+  let selectBox: any = null
+  let feedbackBox: any = null
+  const rowBoxes: any[] = []
+  const rowTexts: any[] = []
+  const reviewTexts: any[] = []
+  let reviewBox: any = null
+  let correctText: any = null
+  let explanationText: any = null
+  let scrollCueText: any = null
+
+  const rowLabel = (index: number) => {
+    const option = allRows[index]!
+    const focused = cursorIdx === index
+    const checked = index < props.request.options.length && selectedSet.has(index)
+    return `${focused ? ">" : " "} ${multi && index < props.request.options.length ? (checked ? "[x]" : "[ ]") : `${index + 1}.`} ${option.label}`
+  }
+  const paintRows = () => {
+    allRows.forEach((_option, index) => {
+      const focused = cursorIdx === index
+      if (rowBoxes[index]) rowBoxes[index].backgroundColor = focused ? props.theme.backgroundElement : props.theme.backgroundPanel
+      if (rowTexts[index]) {
+        rowTexts[index].fg = focused ? props.theme.accent : props.theme.text
+        rowTexts[index].content = rowLabel(index)
+      }
+    })
+  }
+  const visibleExplanation = () => explLines.slice(scrollOff, scrollOff + visibleCount).join("\n") || " "
+  const cueText = () => {
+    if (explLines.length <= visibleCount) return "Enter to send to AI  ·  Esc cancel"
+    if (scrollOff <= 0) return `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`
+    if (scrollOff >= maxScroll) return "▲ more above — u to scroll · Enter to send"
+    return `▲ more above · ▼ more below (${scrollOff}/${maxScroll}) — d/u to scroll · Enter to send`
+  }
+  const paintScroll = () => {
+    if (explanationText) explanationText.content = visibleExplanation()
+    if (scrollCueText) scrollCueText.content = cueText()
+  }
+  const reviewLine = (i: number) => {
+    const idx = i + 1
+    const opt = props.request.options[i]!
+    const isSelected = fb?.selectedIndices.includes(idx) ?? false
+    const isCorrect = correctSet.has(idx)
+    let marker = " "
+    let color = props.theme.textMuted
+    if (fb?.dontKnow) {
+      marker = isCorrect ? "✓" : " "
+      color = isCorrect ? props.theme.success : props.theme.textMuted
+    } else if (isSelected && isCorrect) { marker = "✓"; color = props.theme.success }
+    else if (isSelected && !isCorrect) { marker = "✗"; color = props.theme.error }
+    else if (!isSelected && isCorrect) { marker = "○"; color = props.theme.warning }
+    return { text: `${marker} ${idx}. ${opt.label || "—"}`, color }
+  }
+  const paintReview = () => {
+    props.request.options.forEach((_opt, i) => {
+      const line = reviewLine(i)
+      if (reviewTexts[i]) {
+        reviewTexts[i].content = line.text
+        reviewTexts[i].fg = line.color
+      }
+    })
+    if (correctText) correctText.content = `Correct: ${props.request.correctIndices.map((n) => `${n}. ${props.request.options[n - 1]?.label || "—"}`).join(", ") || "—"}`
+    paintScroll()
+  }
+  const paintHeader = () => {
+    const bg = phaseStr === "feedback"
+      ? (fb?.correct ? props.theme.success : fb?.dontKnow ? props.theme.warning : props.theme.error)
+      : props.theme.accent
+    const title = phaseStr === "feedback"
+      ? (fb?.correct ? "✓  CORRECT" : fb?.dontKnow ? "○  I DON'T KNOW" : "✗  INCORRECT")
+      : (multi ? "☑  QUIZ · MULTI-SELECT" : "●  QUIZ · SINGLE")
+    if (rootBox) rootBox.borderColor = bg
+    if (headerBox) headerBox.backgroundColor = bg
+    if (reviewBox) reviewBox.borderColor = bg
+    if (headerTitle) headerTitle.content = title
+  }
+
+  const submitSelect = () => {
+    if (phaseStr !== "select") return
+    if (cursorIdx === props.request.options.length) {
+      pendingRes = { answers: [], dontKnow: true }
+      fb = { correct: false, selectedIndices: [], dontKnow: true }
+    } else {
+      const indices = multi ? [...selectedSet] : [cursorIdx]
+      if (multi && indices.length === 0) return
+      const answers = indices.map((i) => {
+        const option = props.request.options[i]!
+        return { label: option.label, value: option.value ?? option.label, index: i + 1 }
+      })
+      const selectedIndices = answers.map((a) => a.index)
+      const correct = selectedIndices.length === props.request.correctIndices.length &&
+        selectedIndices.every((n) => correctSet.has(n)) &&
+        props.request.correctIndices.every((n) => selectedIndices.includes(n))
+      pendingRes = { answers, dontKnow: false }
+      fb = { correct, selectedIndices, dontKnow: false }
+    }
+    scrollOff = 0
+    phaseStr = "feedback"
+    paintHeader()
+    paintReview()
+    if (selectBox) selectBox.visible = false
+    if (feedbackBox) feedbackBox.visible = true
+  }
+
+  const scrollBy = (delta: number) => {
+    scrollOff = Math.max(0, Math.min(maxScroll, scrollOff + delta))
+    paintScroll()
+  }
+
+  useDialogKeyboard((event: any) => {
+    const key = String(event.name || event.sequence || "").toLowerCase()
+    const seq = event.sequence || ""
+    if (phaseStr === "feedback") {
+      if (key === "d" || seq === "\x04" || key === "pagedown" || seq === "\x1b[6~") { prevent(event); scrollBy(4); return }
+      if (key === "u" || seq === "\x15" || key === "pageup" || seq === "\x1b[5~") { prevent(event); scrollBy(-4); return }
+      if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); scrollBy(1); return }
+      if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); scrollBy(-1); return }
+      if (key === "enter" || key === "return" || seq === "\r") { prevent(event); if (pendingRes) props.onSubmit(pendingRes); return }
+      if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+      return
+    }
+    if (key === "up" || key === "k" || seq === "\x1b[A") {
+      prevent(event)
+      cursorIdx = Math.max(0, cursorIdx - 1)
+      paintRows()
+      return
+    }
+    if (key === "down" || key === "j" || seq === "\x1b[B") {
+      prevent(event)
+      cursorIdx = Math.min(allRows.length - 1, cursorIdx + 1)
+      paintRows()
+      return
+    }
+    if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+    if (key === "space" || seq === " ") {
+      prevent(event)
+      if (!multi) return submitSelect()
+      if (cursorIdx === props.request.options.length) return submitSelect()
+      if (selectedSet.has(cursorIdx)) selectedSet.delete(cursorIdx)
+      else selectedSet.add(cursorIdx)
+      paintRows()
+      return
+    }
+    if (key === "enter" || key === "return" || seq === "\r") { prevent(event); submitSelect() }
+  })
+
+  const questionText = decodeQuizText(props.request.question).trim() || "Quiz question"
+  const detailsText = props.request.details ? decodeQuizText(props.request.details).trim() || "Choose the best answer." : "Choose the best answer."
+
+  return (
+    <box ref={(element: any) => rootBox = element} flexDirection="column" border={true} borderColor={props.theme.accent} backgroundColor={props.theme.backgroundPanel} padding={1} gap={1}>
+      <box ref={(element: any) => headerBox = element} flexDirection="row" justifyContent="space-between" backgroundColor={props.theme.accent} paddingLeft={1} paddingRight={1}>
+        <text ref={(element: any) => headerTitle = element} fg={props.theme.background} bold>{multi ? "☑  QUIZ · MULTI-SELECT" : "●  QUIZ · SINGLE"}</text>
+        <text fg={props.theme.background}>learn</text>
+      </box>
+      <text fg={props.theme.text} bold wrapMode="wrap">{questionText}</text>
+      <text fg={props.theme.textMuted} wrapMode="wrap">{detailsText}</text>
+      <box ref={(element: any) => selectBox = element} flexDirection="column" gap={0}>
+        {allRows.map((option, index) => (
+          <box ref={(element: any) => rowBoxes[index] = element} backgroundColor={index === 0 ? props.theme.backgroundElement : props.theme.backgroundPanel} paddingLeft={1} paddingRight={1}>
+            <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${multi && index < props.request.options.length ? "[ ]" : `${index + 1}.`} ${option.label}`}</text>
+          </box>
+        ))}
+        <text fg={props.theme.textMuted}>{multi ? "UP/DOWN move  SPACE toggle  ENTER review  ESC cancel" : "UP/DOWN move  ENTER review  ESC cancel"}</text>
+      </box>
+      <box ref={(element: any) => { feedbackBox = element; if (element) element.visible = false }} flexDirection="column" gap={1}>
+        <box ref={(element: any) => reviewBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.accent} backgroundColor={props.theme.background} padding={1}>
+          {props.request.options.map((opt, i) => (
+            <text ref={(element: any) => reviewTexts[i] = element} fg={props.theme.textMuted} wrapMode="wrap">{`  ${i + 1}. ${opt.label || "—"}`}</text>
+          ))}
+          <text ref={(element: any) => correctText = element} fg={props.theme.textMuted}>{`Correct: ${props.request.correctIndices.map((n) => `${n}. ${props.request.options[n - 1]?.label || "—"}`).join(", ") || "—"}`}</text>
+        </box>
+        <box flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} backgroundColor={props.theme.backgroundPanel} padding={1}>
+          <text fg={props.theme.textMuted} bold>EXPLANATION</text>
+          <text ref={(element: any) => explanationText = element} fg={props.theme.text} wrapMode="wrap">{explLines.slice(0, visibleCount).join("\n") || " "}</text>
+          <text ref={(element: any) => scrollCueText = element} fg={props.theme.warning} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text>
+        </box>
+        <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
+      </box>
+    </box>
+  )
+}
+
+function V2QuizBatchDialog(props: {
+  request: QuizBatchPending
+  theme: Record<string, any>
+  onSubmit: (result: { results: Array<QuizResult & { correct: boolean }> }) => void
+  onCancel: () => void
+}) {
+  const quizzes = props.request.quizzes
+  const maxOpts = Math.max(...quizzes.map((q) => q.options.length))
+  const visibleCount = 8
+  const results: Array<QuizResult & { correct: boolean }> = []
+
+  let qIdx = 0
+  let cursorIdx = 0
+  let selectedSet = new Set<number>()
+  let phaseStr: "select" | "feedback" = "select"
+  let fb: { correct: boolean; selectedIndices: number[]; dontKnow: boolean } | null = null
+  let pendingRes: QuizResult | null = null
+  let scrollOff = 0
+  let explLines: string[] = []
+  let maxScroll = 0
+
+  let rootBox: any = null
+  let headerBox: any = null
+  let headerTitle: any = null
+  let quizPos: any = null
+  let questionText: any = null
+  let detailsText: any = null
+  let selectBox: any = null
+  let feedbackBox: any = null
+  const rowBoxes: any[] = []
+  const rowTexts: any[] = []
+  const reviewTexts: any[] = []
+  let reviewBox: any = null
+  let correctText: any = null
+  let explanationText: any = null
+  let scrollCueText: any = null
+
+  const cur = () => quizzes[qIdx]!
+  const curMulti = () => !!cur().multiSelect
+  const curCorrect = () => new Set(cur().correctIndices)
+  const rowCount = () => cur().options.length + 1
+
+  const rowLabel = (index: number) => {
+    const q = cur()
+    const label = index < q.options.length ? q.options[index]!.label : "I don't know"
+    const focused = cursorIdx === index
+    const checked = index < q.options.length && selectedSet.has(index)
+    return `${focused ? ">" : " "} ${curMulti() && index < q.options.length ? (checked ? "[x]" : "[ ]") : `${index + 1}.`} ${label}`
+  }
+  const paintRows = () => {
+    for (let index = 0; index <= maxOpts; index++) {
+      const live = index < rowCount()
+      if (rowBoxes[index]) rowBoxes[index].visible = live
+      if (!live) continue
+      const focused = cursorIdx === index
+      if (rowBoxes[index]) rowBoxes[index].backgroundColor = focused ? props.theme.backgroundElement : props.theme.backgroundPanel
+      if (rowTexts[index]) {
+        rowTexts[index].fg = focused ? props.theme.accent : props.theme.text
+        rowTexts[index].content = rowLabel(index)
+      }
+    }
+  }
+  const visExpl = () => explLines.slice(scrollOff, scrollOff + visibleCount).join("\n") || " "
+  const cue = () => {
+    if (explLines.length <= visibleCount) return "Enter to send to AI  ·  Esc cancel"
+    if (scrollOff <= 0) return `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`
+    if (scrollOff >= maxScroll) return "▲ more above — u to scroll · Enter to send"
+    return `▲ more above · ▼ more below (${scrollOff}/${maxScroll}) — d/u to scroll · Enter to send`
+  }
+  const paintScroll = () => {
+    if (explanationText) explanationText.content = visExpl()
+    if (scrollCueText) scrollCueText.content = cue()
+  }
+  const paintReview = () => {
+    const q = cur()
+    for (let i = 0; i < maxOpts; i++) {
+      const live = i < q.options.length
+      if (reviewTexts[i]) reviewTexts[i].visible = live
+      if (!live) continue
+      const idx = i + 1
+      const isSelected = fb?.selectedIndices.includes(idx) ?? false
+      const isCorrect = curCorrect().has(idx)
+      let marker = " "
+      let color = props.theme.textMuted
+      if (fb?.dontKnow) { marker = isCorrect ? "✓" : " "; color = isCorrect ? props.theme.success : props.theme.textMuted }
+      else if (isSelected && isCorrect) { marker = "✓"; color = props.theme.success }
+      else if (isSelected && !isCorrect) { marker = "✗"; color = props.theme.error }
+      else if (!isSelected && isCorrect) { marker = "○"; color = props.theme.warning }
+      reviewTexts[i].content = `${marker} ${idx}. ${q.options[i]!.label || "—"}`
+      reviewTexts[i].fg = color
+    }
+    if (correctText) correctText.content = `Correct: ${q.correctIndices.map((n) => `${n}. ${q.options[n - 1]?.label || "—"}`).join(", ") || "—"}`
+    paintScroll()
+  }
+  const paintHeader = () => {
+    const bg = phaseStr === "feedback"
+      ? (fb?.correct ? props.theme.success : fb?.dontKnow ? props.theme.warning : props.theme.error)
+      : props.theme.accent
+    const title = phaseStr === "feedback"
+      ? (fb?.correct ? "✓  CORRECT" : fb?.dontKnow ? "○  I DON'T KNOW" : "✗  INCORRECT")
+      : (curMulti() ? "☑  QUIZ · MULTI-SELECT" : "●  QUIZ · SINGLE")
+    if (rootBox) rootBox.borderColor = bg
+    if (headerBox) headerBox.backgroundColor = bg
+    if (reviewBox) reviewBox.borderColor = bg
+    if (headerTitle) headerTitle.content = title
+    if (quizPos) quizPos.content = `Q ${qIdx + 1}/${quizzes.length}`
+  }
+  const loadQuiz = (i: number) => {
+    qIdx = i
+    cursorIdx = 0
+    selectedSet = new Set()
+    phaseStr = "select"
+    fb = null
+    pendingRes = null
+    scrollOff = 0
+    const q = cur()
+    explLines = wrapQuizLines(decodeQuizText(q.explanation).trim() || "No explanation provided.")
+    maxScroll = Math.max(0, explLines.length - visibleCount)
+    if (questionText) questionText.content = decodeQuizText(q.question).trim() || "Quiz question"
+    if (detailsText) detailsText.content = q.details ? decodeQuizText(q.details).trim() || "Choose the best answer." : "Choose the best answer."
+    paintHeader()
+    paintRows()
+    if (selectBox) selectBox.visible = true
+    if (feedbackBox) feedbackBox.visible = false
+  }
+  const submitSelect = () => {
+    if (phaseStr !== "select") return
+    const q = cur()
+    if (cursorIdx === q.options.length) {
+      pendingRes = { answers: [], dontKnow: true }
+      fb = { correct: false, selectedIndices: [], dontKnow: true }
+    } else {
+      const indices = curMulti() ? [...selectedSet] : [cursorIdx]
+      if (curMulti() && indices.length === 0) return
+      const answers = indices.map((n) => {
+        const option = q.options[n]!
+        return { label: option.label, value: option.value ?? option.label, index: n + 1 }
+      })
+      const selectedIndices = answers.map((a) => a.index)
+      const correct = selectedIndices.length === q.correctIndices.length &&
+        selectedIndices.every((n) => curCorrect().has(n)) &&
+        q.correctIndices.every((n) => selectedIndices.includes(n))
+      pendingRes = { answers, dontKnow: false }
+      fb = { correct, selectedIndices, dontKnow: false }
+    }
+    scrollOff = 0
+    phaseStr = "feedback"
+    paintHeader()
+    paintReview()
+    if (selectBox) selectBox.visible = false
+    if (feedbackBox) feedbackBox.visible = true
+  }
+  const confirmFeedback = () => {
+    if (!pendingRes) return
+    const q = cur()
+    const sel = pendingRes.answers.map((a) => a.index)
+    const correct = !pendingRes.dontKnow && sel.length === q.correctIndices.length && sel.every((n) => curCorrect().has(n))
+    results.push({ ...pendingRes, correct })
+    if (qIdx + 1 >= quizzes.length) props.onSubmit({ results })
+    else loadQuiz(qIdx + 1)
+  }
+  const scrollBy = (delta: number) => {
+    scrollOff = Math.max(0, Math.min(maxScroll, scrollOff + delta))
+    paintScroll()
+  }
+
+  useDialogKeyboard((event: any) => {
+    const key = String(event.name || event.sequence || "").toLowerCase()
+    const seq = event.sequence || ""
+    if (phaseStr === "feedback") {
+      if (key === "d" || seq === "\x04" || key === "pagedown" || seq === "\x1b[6~") { prevent(event); scrollBy(4); return }
+      if (key === "u" || seq === "\x15" || key === "pageup" || seq === "\x1b[5~") { prevent(event); scrollBy(-4); return }
+      if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); scrollBy(1); return }
+      if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); scrollBy(-1); return }
+      if (key === "enter" || key === "return" || seq === "\r") { prevent(event); confirmFeedback(); return }
+      if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+      return
+    }
+    if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); cursorIdx = Math.max(0, cursorIdx - 1); paintRows(); return }
+    if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); cursorIdx = Math.min(rowCount() - 1, cursorIdx + 1); paintRows(); return }
+    if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+    if (key === "space" || seq === " ") {
+      prevent(event)
+      if (!curMulti()) return submitSelect()
+      if (cursorIdx === cur().options.length) return submitSelect()
+      if (selectedSet.has(cursorIdx)) selectedSet.delete(cursorIdx)
+      else selectedSet.add(cursorIdx)
+      paintRows()
+      return
+    }
+    if (key === "enter" || key === "return" || seq === "\r") { prevent(event); submitSelect() }
+  })
+
+  const first = quizzes[0]!
+  const firstRows: string[] = [...first.options.map((o) => o.label), "I don't know"]
+  explLines = wrapQuizLines(decodeQuizText(first.explanation).trim() || "No explanation provided.")
+  maxScroll = Math.max(0, explLines.length - visibleCount)
+
+  return (
+    <box ref={(element: any) => rootBox = element} flexDirection="column" border={true} borderColor={props.theme.accent} backgroundColor={props.theme.backgroundPanel} padding={1} gap={1}>
+      <box ref={(element: any) => headerBox = element} flexDirection="row" justifyContent="space-between" backgroundColor={props.theme.accent} paddingLeft={1} paddingRight={1}>
+        <text ref={(element: any) => headerTitle = element} fg={props.theme.background} bold>{first.multiSelect ? "☑  QUIZ · MULTI-SELECT" : "●  QUIZ · SINGLE"}</text>
+        <text ref={(element: any) => quizPos = element} fg={props.theme.background}>Q 1/{quizzes.length}</text>
+      </box>
+      <text ref={(element: any) => questionText = element} fg={props.theme.text} bold wrapMode="wrap">{decodeQuizText(first.question).trim() || "Quiz question"}</text>
+      <text ref={(element: any) => detailsText = element} fg={props.theme.textMuted} wrapMode="wrap">{first.details ? decodeQuizText(first.details).trim() || "Choose the best answer." : "Choose the best answer."}</text>
+      <box ref={(element: any) => selectBox = element} flexDirection="column" gap={0}>
+        {Array.from({ length: maxOpts + 1 }, (_v, index) => {
+          const live = index < first.options.length + 1
+          const label = index < first.options.length ? first.options[index]!.label : "I don't know"
+          return (
+            <box ref={(element: any) => { rowBoxes[index] = element; if (element && !live) element.visible = false }} backgroundColor={index === 0 ? props.theme.backgroundElement : props.theme.backgroundPanel} paddingLeft={1} paddingRight={1}>
+              <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${first.multiSelect && index < first.options.length ? "[ ]" : `${index + 1}.`} ${label}`}</text>
+            </box>
+          )
+        })}
+        <text fg={props.theme.textMuted}>UP/DOWN move  SPACE toggle  ENTER review  ESC cancel</text>
+      </box>
+      <box ref={(element: any) => { feedbackBox = element; if (element) element.visible = false }} flexDirection="column" gap={1}>
+        <box ref={(element: any) => reviewBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.accent} backgroundColor={props.theme.background} padding={1}>
+          {Array.from({ length: maxOpts }, (_v, i) => (
+            <text ref={(element: any) => reviewTexts[i] = element} fg={props.theme.textMuted} wrapMode="wrap">{`  ${i + 1}. ${first.options[i]?.label || "—"}`}</text>
+          ))}
+          <text ref={(element: any) => correctText = element} fg={props.theme.textMuted}>{`Correct: ${first.correctIndices.map((n) => `${n}. ${first.options[n - 1]?.label || "—"}`).join(", ") || "—"}`}</text>
+        </box>
+        <box flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} backgroundColor={props.theme.backgroundPanel} padding={1}>
+          <text fg={props.theme.textMuted} bold>EXPLANATION</text>
+          <text ref={(element: any) => explanationText = element} fg={props.theme.text} wrapMode="wrap">{explLines.slice(0, visibleCount).join("\n") || " "}</text>
+          <text ref={(element: any) => scrollCueText = element} fg={props.theme.warning} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text>
+        </box>
+        <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
+      </box>
+    </box>
+  )
+}
 
 function QuizDialog(props: {
   api: Parameters<TuiPlugin>[0]
@@ -765,6 +1259,17 @@ const tui: TuiPlugin = async (api) => {
     const p: any = (api as any)?.state?.path
     dir = p?.directory || p?.worktree || process.cwd()
   } catch { dir = process.cwd() }
+  // Never watch from inside the pending dir itself (e.g. TUI launched with a
+  // weird cwd): that nests learn-pending under itself and silently misses
+  // every quiz with zero trace. Walk up to the real project dir instead.
+  try {
+    const tail1 = `${path.sep}.opencode${path.sep}learn-pending`
+    const tail2 = `${path.sep}.opencode`
+    let fixed = dir
+    while (fixed.endsWith(tail1) || fixed.endsWith(tail2)) fixed = path.dirname(fixed)
+    if (fixed !== dir) tlog("learn-tui watch dir adjusted", dir, "->", fixed)
+    dir = fixed
+  } catch {}
   const pendingDir = path.join(dir, PENDING_DIR)
   ;(globalThis as any).__learnPendingDir = pendingDir
   ensureDir(pendingDir)
@@ -787,10 +1292,10 @@ const tui: TuiPlugin = async (api) => {
     return null
   }
 
-  const hasAnswerArtifact = (id: string): boolean => {
+  const hasAnswerArtifact = (dir: string, id: string): boolean => {
     const response = `response-${id}`
     try {
-      return fs.readdirSync(pendingDir).some((file) => file === `${response}.json` || file.startsWith(`${response}.claim-`))
+      return fs.readdirSync(dir).some((file) => file === `${response}.json` || file.startsWith(`${response}.claim-`))
     } catch {
       return false
     }
@@ -802,9 +1307,9 @@ const tui: TuiPlugin = async (api) => {
   // user answer twice — the second answer overwrites the (already-consumed) response file with
   // nobody left watching it, so it silently rots as an orphan and never reaches the session
   // ("the next quiz doesn't inject"). Only the window that wins this lock may show the dialog.
-  const popupLockPath = (id: string) => path.join(pendingDir, `opening-${id}.lock`)
-  const tryClaimPopup = (id: string): boolean => {
-    const p = popupLockPath(id)
+  const popupLockPath = (dir: string, id: string) => path.join(dir, `opening-${id}.lock`)
+  const tryClaimPopup = (dir: string, id: string): boolean => {
+    const p = popupLockPath(dir, id)
     try { fs.writeFileSync(p, String(process.pid), { flag: "wx" }); return true } catch {}
     try {
       const age = Date.now() - fs.statSync(p).mtimeMs
@@ -814,64 +1319,115 @@ const tui: TuiPlugin = async (api) => {
     }
     return false
   }
-  const refreshPopupClaim = (id: string) => { try { fs.writeFileSync(popupLockPath(id), String(process.pid), "utf8") } catch {} }
-  const releasePopupClaim = (id: string) => { try { fs.unlinkSync(popupLockPath(id)) } catch {} }
+  const refreshPopupClaim = (dir: string, id: string) => { try { fs.writeFileSync(popupLockPath(dir, id), String(process.pid), "utf8") } catch {} }
+  const releasePopupClaim = (dir: string, id: string) => { try { fs.unlinkSync(popupLockPath(dir, id)) } catch {} }
 
+  // Watch dirs: the TUI's own cwd pending dir PLUS the current session's
+  // project pending dir. Attaching to a session from a different cwd
+  // (opencode -s ...) otherwise watches an empty dir and misses every quiz
+  // with zero trace. Response/lock files always live next to the quiz file.
+  const normalizeWatchDir = (d: string): string => {
+    try {
+      const tail1 = `${path.sep}.opencode${path.sep}learn-pending`
+      const tail2 = `${path.sep}.opencode`
+      let fixed = d
+      while (fixed.endsWith(tail1) || fixed.endsWith(tail2)) fixed = path.dirname(fixed)
+      return fixed
+    } catch { return d }
+  }
+  const watchDirs = (curSid: string): string[] => {
+    const dirs = [pendingDir]
+    try {
+      const sessDir = (api.state as any)?.session?.get?.(curSid)?.directory
+      if (typeof sessDir === "string" && sessDir) {
+        const pd = path.join(normalizeWatchDir(sessDir), PENDING_DIR)
+        if (pd !== pendingDir) dirs.push(pd)
+      }
+    } catch {}
+    return dirs
+  }
+
+  // One-line-why logging: silent early-returns are what make "no popup"
+  // undiagnosable. Log only when the reason CHANGES to avoid spam.
+  let lastWhy = ""
+  const why = (s: string) => {
+    if (s !== lastWhy) { lastWhy = s; tlog("processPending", s) }
+  }
   const processPending = () => {
     const curSid = getCurrentSessionID()
-    if (!curSid) return
-    let current = currentBySession.get(curSid) as { id: string; type: string } | undefined
+    if (!curSid) { why("no-session"); return }
+    let current = currentBySession.get(curSid) as { id: string; type: string; dir: string } | undefined
     if (current) {
       // Self-heal: the tracked dialog may have been dismissed through a path other than
       // done()/cancel() (session/tab switch, TUI reconnect, dialog replaced externally),
       // or its pending file may have been consumed externally. A stuck entry would block
       // ALL future quizzes for this session forever — release it and rediscover below.
-      const pendingStillExists = (() => { try { return fs.readdirSync(pendingDir).some((f) => f === `quiz-${current!.id}.json` || f === `quiz_batch-${current!.id}.json`) } catch { return true } })()
+      const cdir = current.dir || pendingDir
+      const pendingStillExists = (() => { try { return fs.readdirSync(cdir).some((f) => f === `quiz-${current!.id}.json` || f === `quiz_batch-${current!.id}.json`) } catch { return true } })()
       if (!pendingStillExists) {
         tlog("processPending stale current cleared (pending gone)", current.id)
-        releasePopupClaim(current.id)
+        releasePopupClaim(cdir, current.id)
         currentBySession.delete(curSid)
         current = undefined
-      } else if (api.ui.dialog.open) { refreshPopupClaim(current.id); return }
+      } else if (api.ui.dialog.open) { refreshPopupClaim(cdir, current.id); return }
       else {
         tlog("processPending stale current cleared (dialog no longer open)", current.id)
-        releasePopupClaim(current.id)
+        releasePopupClaim(cdir, current.id)
         currentBySession.delete(curSid)
         current = undefined
       }
     }
-    if (api.ui.dialog.open) return
-    let files: string[] = []
-    try { files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort() } catch { return }
+    if (api.ui.dialog.open) { why("open-external"); return }
+    const dirs = watchDirs(curSid)
+    const isQuizFile = (f: string) => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")
+    let files: Array<{ f: string; dir: string }> = []
+    try {
+      for (const d of dirs) {
+        try {
+          for (const f of fs.readdirSync(d).filter(isQuizFile).sort()) files.push({ f, dir: d })
+        } catch {}
+      }
+    } catch { why(`unreadable-dir ${pendingDir}`); return }
     // Expire pendings answered long ago via fallback (same 24h TTL as the server re-arm):
     // never pop a quiz the session moved past hours ago just because a TUI attached late.
     // Archive-then-rescan so an expired entry can't block a newer live quiz behind it.
     try {
-      for (const f of files) {
+      for (const { f, dir: d } of files) {
         try {
-          const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any
+          const j = JSON.parse(fs.readFileSync(path.join(d, f), "utf8")) as any
           const ts = j?.timestamp
           if (typeof ts === "number" && Date.now() - ts > 24 * 60 * 60 * 1000) {
-            const expDir = path.join(pendingDir, "expired")
+            const expDir = path.join(d, "expired")
             try { fs.mkdirSync(expDir, { recursive: true }) } catch {}
-            fs.renameSync(path.join(pendingDir, f), path.join(expDir, `${Date.now()}-${f}`))
+            fs.renameSync(path.join(d, f), path.join(expDir, `${Date.now()}-${f}`))
             tlog("pending expired, archived", (j as any)?.id || f)
           }
         } catch {}
       }
-      files = fs.readdirSync(pendingDir).filter(f => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")).sort()
+      files = []
+      for (const d of dirs) {
+        try {
+          for (const f of fs.readdirSync(d).filter(isQuizFile).sort()) files.push({ f, dir: d })
+        } catch {}
+      }
     } catch {}
     // Session-distinct: only show pending for current session.
     // Skip answered-pending (a response file exists, server is consuming): prevents re-popup after answer.
-    const matching = files.map(f => { try { const j = JSON.parse(fs.readFileSync(path.join(pendingDir, f), "utf8")) as any; return { f, j } } catch { return null } }).filter(Boolean).filter(x => !hasAnswerArtifact(x!.j.id)) as Array<{f: string, j: any}>
+    const matching = files.map(({ f, dir: d }) => { try { const j = JSON.parse(fs.readFileSync(path.join(d, f), "utf8")) as any; return { f, j, dir: d } } catch { return null } }).filter(Boolean).filter(x => !hasAnswerArtifact(x!.dir, x!.j.id)) as Array<{f: string, j: any, dir: string}>
     // Newest-first: when several quizzes stack up for the same session (e.g. earlier ones
     // answered manually in chat after a popup failure), the LATEST quiz is the live one the
     // agent is waiting on. Alphabetical order would keep re-showing the oldest stuck quiz.
     const byNewest = [...matching].sort((a, b) => (((b as any).j?.timestamp || 0) as number) - (((a as any).j?.timestamp || 0) as number))
     const pick = byNewest.find(x => x.j.sessionID === curSid) || byNewest.find(x => !x.j.sessionID)
-    if (!pick) return
+    if (!pick) {
+      why(matching.length
+        ? `session-mismatch cur=${curSid.slice(0, 8)} files=[${matching.slice(0, 3).map(x => `${x.f}:${String(x.j.sessionID || "none").slice(0, 8)}`).join(",")}]`
+        : `empty-scan ${pendingDir}`)
+      return
+    }
     const file = pick.f
-    const full = path.join(pendingDir, file)
+    const pickDir = pick.dir || pendingDir
+    const full = path.join(pickDir, file)
     let data: Pending | null = null
     try { data = JSON.parse(fs.readFileSync(full, "utf8")) as Pending } catch { try { fs.unlinkSync(full) } catch {}; return }
     if (!data || !data.id) { try { fs.unlinkSync(full) } catch {}; return }
@@ -887,16 +1443,16 @@ const tui: TuiPlugin = async (api) => {
         if (!exists) (data as any).sessionID = curSid
       }
     } catch {}
-    if (!tryClaimPopup(data.id)) {
+    if (!tryClaimPopup(pickDir, data.id)) {
       // Another opencode window (same session open elsewhere) already owns this popup —
       // don't show a second copy of it here, and don't answer it from this process.
       tlog("processPending popup already claimed elsewhere", data.id)
       return
     }
-    current = { id: data.id, type: data.type }
+    current = { id: data.id, type: data.type, dir: pickDir }
     currentBySession.set(curSid, current)
     const done = async (result: any) => {
-      const respPath = path.join(pendingDir, `response-${data!.id}.json`)
+      const respPath = path.join(pickDir, `response-${data!.id}.json`)
       const answerId = data!.id
       tlog("learn-tui answered", (data as any).type, answerId, JSON.stringify(result).slice(0, 160))
       writeJsonAtomic(respPath, { id: data!.id, type: data!.type, result, sessionID: (data as any).sessionID, at: Date.now() })
@@ -960,7 +1516,7 @@ const tui: TuiPlugin = async (api) => {
       } catch {}
       // Keep the pending payload until the server confirms injection. It is the recovery context
       // needed to rebuild the prompt if either process exits after the answer is written.
-      releasePopupClaim(answerId)
+      releasePopupClaim(pickDir, answerId)
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
@@ -976,7 +1532,7 @@ const tui: TuiPlugin = async (api) => {
       }, 8000)
     }
     const cancel = async () => {
-      const respPath = path.join(pendingDir, `response-${data!.id}.json`)
+      const respPath = path.join(pickDir, `response-${data!.id}.json`)
       tlog("learn-tui cancelled", (data as any).type, data!.id)
       writeJsonAtomic(respPath, { id: data!.id, type: data!.type, cancelled: true, sessionID: (data as any).sessionID, at: Date.now() })
       try {
@@ -995,14 +1551,25 @@ const tui: TuiPlugin = async (api) => {
         }
       } catch {}
       // Keep the pending payload until the server consumes the cancellation response.
-      releasePopupClaim(data!.id)
+      releasePopupClaim(pickDir, data!.id)
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       setTimeout(processPending, 150)
     }
-    if (data.type === "quiz") { tlog("processPending quiz", data.id); api.ui.dialog.replace(() => <QuizDialog api={api} request={data as QuizPending} onSubmit={done} onCancel={cancel} />) }
-    else if (data.type === "quiz_batch") { tlog("processPending quiz_batch", data.id, (data as QuizBatchPending).quizzes.length); api.ui.dialog.replace(() => <QuizBatchDialog api={api} request={data as QuizBatchPending} onSubmit={done} onCancel={cancel} />) }
-    else { tlog("processPending unknown", (data as any).type, data.id); releasePopupClaim(data.id); try { fs.unlinkSync(full) } catch {}; currentBySession.delete(curSid); return }
+    const v2Theme = (api as any).v2Theme as Record<string, any> | undefined
+    if (data.type === "quiz") {
+      tlog("processPending quiz", data.id)
+      api.ui.dialog.replace(() => v2Theme
+        ? <V2QuizDialog request={data as QuizPending} theme={v2Theme} onSubmit={done} onCancel={cancel} />
+        : <QuizDialog api={api} request={data as QuizPending} onSubmit={done} onCancel={cancel} />)
+    }
+    else if (data.type === "quiz_batch") {
+      tlog("processPending quiz_batch", data.id, (data as QuizBatchPending).quizzes.length)
+      api.ui.dialog.replace(() => v2Theme
+        ? <V2QuizBatchDialog request={data as QuizBatchPending} theme={v2Theme} onSubmit={done} onCancel={cancel} />
+        : <QuizBatchDialog api={api} request={data as QuizBatchPending} onSubmit={done} onCancel={cancel} />)
+    }
+    else { tlog("processPending unknown", (data as any).type, data.id); releasePopupClaim(pickDir, data.id); try { fs.unlinkSync(full) } catch {}; currentBySession.delete(curSid); return }
     try { api.ui.dialog.setSize("large") } catch {}
   }
 
@@ -1022,67 +1589,92 @@ const tui: TuiPlugin = async (api) => {
 // route.current, state.session.get, dialog open/replace/setSize/clear,
 // toast, client.session.prompt (flat shape first, envelope fallbacks), and
 // event.on("session.status") → execution started/succeeded.
-function adaptThemeV2(theme: TuiV2.Context["theme"]): Record<string, string> {
-  const t = (theme ?? {}) as any
-  const text = t.text ?? {}
-  const fb = text.feedback ?? {}
-  const bg = t.background ?? {}
-  const surface = bg.surface ?? {}
-  const diff = t.diff ?? {}
-  const diffText = diff.text ?? {}
-  const diffBg = diff.background ?? {}
-  const diffHi = diff.highlight ?? {}
-  const diffLn = diff.lineNumber ?? {}
-  const syntax = t.syntax ?? {}
-  const md = t.markdown ?? {}
-  const dv = (v: unknown, fallback: string) => (typeof v === "string" ? v : fallback)
-  const base = dv(text.default, "#ffffff")
-  const muted = dv(text.subdued, "#888888")
+// The V2 dialog receives only concrete ColorInput leaves (strings or RGBA),
+// never nested theme bags. Keeping RGBA intact matters because OpenTUI uses
+// its color intent to represent the terminal's default foreground/background.
+// Real v2 ResolvedTheme shape (from production log):
+// hue:{gray|red|...|accent|...}, text:{base|muted|action|formfield|feedback},
+// background:{base|raised|...}, border:{base}, diff/syntax/markdown subtrees.
+// Leaves are hex strings or RGBA instances (live) / {buffer:{0,1,2}} (JSON),
+// sometimes wrapped in {light,dark} pairs or {100..900} ramps.
+export function adaptThemeV2(theme: TuiV2.Context["theme"], _mode?: string): Record<string, any> {
+  const source = (theme ?? {}) as any
+  const t = typeof source.surface === "function" ? source.surface("dialog") : source
+  const textObj: any = t.text ?? {}
+  const bgObj: any = t.background ?? {}
+  const fb: any = textObj.feedback ?? {}
+  const bgFb: any = bgObj.feedback ?? {}
+  const diff: any = t.diff ?? {}
+  const syntax: any = t.syntax ?? {}
+  const md: any = t.markdown ?? {}
+  const value = (fallback: any, ...candidates: any[]) => candidates.find((candidate) => candidate !== undefined && candidate !== null) ?? fallback
+  const base = value("#ffffff", typeof t.text === "string" ? t.text : undefined, textObj.base)
+  const muted = value("#888888", t.textMuted, textObj.muted)
+  const bgDefault = value("#000000", typeof t.background === "string" ? t.background : undefined, bgObj.base)
+  const primaryText = textObj.action?.primary?.base
+  const primaryBg = bgObj.action?.primary?.base
   return {
     text: base,
     textMuted: muted,
-    primary: base,
-    accent: base,
-    success: dv(fb.success?.default, "#22c55e"),
-    warning: dv(fb.warning?.default, "#eab308"),
-    error: dv(fb.error?.default, "#ef4444"),
-    info: dv(fb.info?.default, base),
-    background: dv(bg.default, "#000000"),
-    backgroundPanel: dv(surface.overlay, dv(bg.default, "#000000")),
-    backgroundElement: dv(surface.offset, dv(bg.default, "#000000")),
-    diffAdded: dv(diffText.added, base),
-    diffRemoved: dv(diffText.removed, base),
-    diffContext: dv(diffText.context, muted),
-    diffAddedBg: dv(diffBg.added, dv(bg.default, "#000000")),
-    diffRemovedBg: dv(diffBg.removed, dv(bg.default, "#000000")),
-    diffContextBg: dv(diffBg.context, dv(bg.default, "#000000")),
-    diffHighlightAdded: dv(diffHi.added, base),
-    diffHighlightRemoved: dv(diffHi.removed, base),
-    diffLineNumber: dv(diffLn.text, muted),
-    diffAddedLineNumberBg: dv(diffLn.background?.added, dv(bg.default, "#000000")),
-    diffRemovedLineNumberBg: dv(diffLn.background?.removed, dv(bg.default, "#000000")),
-    syntaxComment: dv(syntax.comment, muted),
-    syntaxKeyword: dv(syntax.keyword, base),
-    syntaxFunction: dv(syntax.function, base),
-    syntaxVariable: dv(syntax.variable, base),
-    syntaxString: dv(syntax.string, base),
-    syntaxNumber: dv(syntax.number, base),
-    syntaxType: dv(syntax.type, base),
-    syntaxOperator: dv(syntax.operator, base),
-    syntaxPunctuation: dv(syntax.punctuation, muted),
-    markdownText: dv(md.text, base),
-    markdownHeading: dv(md.heading, base),
-    markdownLink: dv(md.link, base),
-    markdownLinkText: dv(md.linkText, base),
-    markdownCode: dv(md.code, base),
-    markdownBlockQuote: dv(md.blockQuote, muted),
-    markdownEmph: dv(md.emphasis, base),
-    markdownStrong: dv(md.strong, base),
-    markdownListItem: dv(md.listItem, base),
+    primary: value(base, t.primary, primaryText),
+    accent: value(base, t.accent, primaryText),
+    success: value("#22c55e", t.success, fb.success?.base, bgFb.success?.base),
+    warning: value("#eab308", t.warning, fb.warning?.base, bgFb.warning?.base),
+    error: value("#ef4444", t.error, fb.error?.base, bgFb.error?.base),
+    info: value(base, t.info, fb.info?.base, bgFb.info?.base),
+    background: bgDefault,
+    backgroundPanel: value(bgDefault, t.backgroundPanel, bgObj.raised?.base),
+    backgroundElement: value(bgDefault, t.backgroundElement, primaryBg, bgObj.raised?.high),
+    backgroundMenu: value(bgDefault, t.backgroundMenu, bgObj.raised?.high),
+    border: value(muted, typeof t.border === "string" ? t.border : undefined, t.border?.base),
+    borderActive: value(base, t.borderActive, primaryText, t.accent),
+    borderSubtle: value(muted, t.borderSubtle, t.border?.base),
+    diffAdded: value(base, diff.text?.added),
+    diffRemoved: value(base, diff.text?.removed),
+    diffContext: value(muted, diff.text?.context),
+    diffAddedBg: value(bgDefault, diff.background?.added),
+    diffRemovedBg: value(bgDefault, diff.background?.removed),
+    diffContextBg: value(bgDefault, diff.background?.context),
+    diffHighlightAdded: value(base, diff.highlight?.added),
+    diffHighlightRemoved: value(base, diff.highlight?.removed),
+    diffLineNumber: value(muted, diff.lineNumber?.text, diff.lineNumber),
+    diffAddedLineNumberBg: value(bgDefault, diff.lineNumber?.background?.added),
+    diffRemovedLineNumberBg: value(bgDefault, diff.lineNumber?.background?.removed),
+    syntaxComment: value(muted, syntax.comment),
+    syntaxKeyword: value(base, syntax.keyword),
+    syntaxFunction: value(base, syntax.function),
+    syntaxVariable: value(base, syntax.variable),
+    syntaxString: value(base, syntax.string),
+    syntaxNumber: value(base, syntax.number),
+    syntaxType: value(base, syntax.type),
+    syntaxOperator: value(base, syntax.operator),
+    syntaxPunctuation: value(muted, syntax.punctuation),
+    markdownText: value(base, md.text),
+    markdownHeading: value(base, md.heading),
+    markdownLink: value(base, md.link),
+    markdownLinkText: value(base, md.linkText),
+    markdownCode: value(base, md.code),
+    markdownBlockQuote: value(muted, md.blockQuote),
+    markdownEmph: value(base, md.emphasis),
+    markdownStrong: value(base, md.strong),
+    markdownListItem: value(base, md.listItem),
   }
 }
 
 const v2setup: TuiV2.Definition["setup"] = async (ctx) => {
+  try {
+    const tv: any = ctx.theme ?? {}
+    const summary = Object.keys(tv).map((k) => {
+      const v = tv[k]
+      if (typeof v === "string") return `${k}=${JSON.stringify(String(v).slice(0, 24))}`
+      if (v && typeof v === "object") {
+        if (typeof (v as any).r === "number") return `${k}:RGBA`
+        try { return `${k}:keys(${Object.keys(v).join("|").slice(0, 120)})` } catch { return `${k}:object?` }
+      }
+      return `${k}:${typeof v}`
+    })
+    tlog("v2 theme shape", summary.join(" "))
+  } catch {}
   const directory = ctx.location?.directory ?? ctx.data.location.default().directory
   const cleanups: Array<() => void> = []
   let dialogOpen = false
@@ -1093,9 +1685,10 @@ const v2setup: TuiV2.Definition["setup"] = async (ctx) => {
     } catch {}
   }
   const facade = {
+    v2Theme: adaptThemeV2(ctx.theme, ctx.themeMode),
     theme: {
       get current() {
-        return adaptThemeV2(ctx.theme)
+        return adaptThemeV2(ctx.theme, ctx.themeMode)
       },
     },
     route: {
@@ -1118,8 +1711,15 @@ const v2setup: TuiV2.Definition["setup"] = async (ctx) => {
           return dialogOpen
         },
         replace: (render: () => unknown) => {
-          dialogOpen = true
-          ctx.ui.dialog.show(render as () => import("@opentui/solid").JSX.Element)
+          try {
+            ctx.ui.dialog.show(render as () => import("@opentui/solid").JSX.Element, () => {
+              dialogOpen = false
+            })
+            dialogOpen = true
+          } catch (e) {
+            dialogOpen = false
+            tlog("v2 dialog.show failed", String(e).slice(0, 300))
+          }
         },
         setSize: (size: "medium" | "large" | "xlarge") => ctx.ui.dialog.set({ size }),
         clear: closeDialog,
