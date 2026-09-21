@@ -8,7 +8,8 @@
     "strict": false,
     "noImplicitAny": false,
     "types": [
-      "node"
+      "node",
+      "bun"
     ]
   },
   "include": [

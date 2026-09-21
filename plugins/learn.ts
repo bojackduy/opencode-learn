@@ -1,5 +1,6 @@
 import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
+import type { Plugin as V2Plugin } from "@opencode/plugin"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { tmpdir } from "node:os"
@@ -1581,7 +1582,266 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
   }
 }
 
+// ─── V2 (opencode v2 core) ───────────────────────────────────────────────────
+// The 1500-line v1 engine above is reused untouched: v2 setup builds a small
+// v1-shaped client shim over the v2 session domain and invokes the same
+// `server()` factory, then bridges its hooks object into v2 registrations.
+//
+// Deliberate degradations (all fail-soft inside the engine):
+// - `config` (agent injection) is skipped: v2's agent editor has no add, and
+//   the real definitions live in .opencode/agents/*.md anyway.
+// - `experimental.text.complete` is skipped: the engine's own
+//   message.part.updated fallback covers assistant text (see flushText below).
+// - create() drops parentID (v2 has none) and prompt() drops the `classify`
+//   agent override (v2 prompt takes no agent): llmClassify fails soft to the
+//   heuristic classifier in both cases.
+// - backfill maps only user/assistant text through the shim; quiz tool-state
+//   replay may be lossy in v2. Live hooks capture going forward regardless.
+
+type V2ShimSession = {
+  messages: (input: any) => Promise<{ data: Array<{ info: any; parts: any[] }> }>
+  create: (input: any) => Promise<{ data: { id: string } }>
+  prompt: (input: any) => Promise<{ data: Record<string, never> }>
+  promptAsync: (input: any) => Promise<{ data: Record<string, never> }>
+}
+
+function v2TextOf(parts: any): string {
+  const list = Array.isArray(parts) ? parts : []
+  return list
+    .filter((p: any) => p?.type === "text" && typeof p?.text === "string")
+    .map((p: any) => p.text as string)
+    .join("\n")
+}
+
+function toV1Entries(messages: any[]): Array<{ info: any; parts: any[] }> {
+  const out: Array<{ info: any; parts: any[] }> = []
+  for (const m of messages) {
+    const type = (m as any)?.type ?? (m as any)?.role
+    const id = (m as any)?.id ?? (m as any)?.messageID
+    if (!id) continue
+    if (type === "user" || type === "session.message.user") {
+      const text = v2TextOf((m as any)?.content ?? (m as any)?.parts) || ((m as any)?.text ?? "")
+      out.push({ info: { id, role: "user", content: text }, parts: [{ type: "text", text }] })
+    } else if (type === "assistant" || type === "session.message.assistant") {
+      const content = (m as any)?.content ?? (m as any)?.parts ?? []
+      const parts: any[] = []
+      for (const p of Array.isArray(content) ? content : []) {
+        if (p?.type === "text" && typeof p?.text === "string") parts.push({ type: "text", text: p.text })
+        else if (typeof p?.type === "string" && p.type.includes("tool"))
+          parts.push({ type: "tool", tool: p.name ?? p.tool, state: p.state ?? { status: "completed", input: p.input, output: p.output } })
+      }
+      out.push({ info: { id, role: "assistant" }, parts })
+    }
+  }
+  return out
+}
+
+function createV2ClientShim(context: V2Plugin.Context) {
+  const session: V2ShimSession = {
+    async messages(input: any) {
+      const sessionID = input?.path?.id ?? input?.path?.sessionID ?? input?.sessionID
+      const list = await context.session.context({ sessionID })
+      return { data: toV1Entries(Array.isArray(list) ? list : []) }
+    },
+    async create(input: any) {
+      const body = input?.body ?? input ?? {}
+      const res = await context.session.create({
+        title: body.title ?? "learn session",
+        location: { directory: context.location.directory },
+      } as never)
+      const id = (res as { id?: string })?.id
+      if (!id) throw new Error("v2 session.create returned no id")
+      return { data: { id } }
+    },
+    async prompt(input: any) {
+      const sessionID = input?.path?.id ?? input?.path?.sessionID ?? input?.sessionID
+      const parts = input?.body?.parts ?? input?.parts
+      const text = v2TextOf(parts) || (typeof input?.text === "string" ? input.text : "")
+      await context.session.prompt({ sessionID, text } as never)
+      return { data: {} }
+    },
+    async promptAsync(input: any) {
+      return session.prompt(input)
+    },
+  }
+  return {
+    app: {
+      log: (init: any) => {
+        const message = init?.body?.message
+        if (message) console.error(`[learn] ${message}`)
+      },
+    },
+    session,
+    // v2 merges config model overrides into model.list(); nothing to enrich.
+    config: { get: async () => ({ data: { provider: {} } }) },
+  }
+}
+
+function toV2Tool(id: string, definition: { description: string; args: any; execute: (args: any, context: any) => Promise<any> }, directory: string) {
+  return {
+    name: id,
+    description: definition.description,
+    input: tool.schema.object(definition.args),
+    async execute(input: unknown, context: { sessionID: string; agent: string; messageID: string; id: string }) {
+      const result = await definition.execute(input, {
+        sessionID: context.sessionID,
+        agent: context.agent,
+        messageID: context.messageID,
+        directory,
+        worktree: directory,
+        abort: new AbortController().signal,
+        metadata() {},
+        async ask() {},
+      })
+      if (typeof result === "string") return { content: result }
+      return {
+        content: result.output,
+        metadata: {
+          ...result.metadata,
+          ...(result.title ? { title: result.title } : {}),
+        },
+      }
+    },
+  }
+}
+
+function normalizeV2Event(event: any) {
+  const data = event?.data && typeof event.data === "object" ? event.data : {}
+  const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
+  const as = (value: unknown) => value as { type: string; properties: Record<string, unknown> }
+  switch (event?.type) {
+    case "session.created":
+      return as({ type: "session.created", properties: { info: { id: sessionID, parentID: data.parentID } } })
+    case "session.deleted":
+      return as({ type: "session.deleted", properties: { info: { id: sessionID } } })
+    case "session.idle":
+      return as({ type: "session.idle", properties: { sessionID } })
+    case "session.compaction.ended":
+      return as({ type: "session.compacted", properties: { sessionID } })
+    case "session.step.started":
+      return as({
+        type: "message.updated",
+        properties: { info: { id: data.assistantMessageID, sessionID, role: "assistant", providerID: data.model?.providerID } },
+      })
+    default:
+      return null
+  }
+}
+
+const setup = async (context: V2Plugin.Context) => {
+  const directory = context.location.directory
+  const hooks = await server({ client: createV2ClientShim(context), directory } as never, undefined)
+  const registrations: Array<{ dispose(): Promise<void> }> = []
+  const eventController = new AbortController()
+  let disposed = false
+  // Latest assistant text per message; flushed as one final part on
+  // step end / idle so the md log captures it exactly once.
+  const pendingText = new Map<string, { sessionID: string; messageID: string; text: string }>()
+
+  const cleanup = async () => {
+    if (disposed) return
+    disposed = true
+    eventController.abort()
+    await Promise.allSettled(registrations.reverse().map((r) => r.dispose()))
+    await (hooks as { dispose?: () => Promise<void> }).dispose?.()
+  }
+
+  const flushText = async (sessionID: string) => {
+    for (const [key, pending] of [...pendingText]) {
+      if (pending.sessionID !== sessionID) continue
+      pendingText.delete(key)
+      if (!pending.text.trim()) continue
+      await (hooks as any).event?.({
+        event: {
+          type: "message.part.updated",
+          properties: {
+            part: { type: "text", id: pending.messageID, sessionID, messageID: pending.messageID, text: pending.text, time: { end: Date.now() } },
+          },
+        },
+      })
+    }
+  }
+
+  try {
+    registrations.push(
+      await context.tool.transform((editor) => {
+        for (const [id, definition] of Object.entries((hooks as any).tool ?? {})) {
+          editor.add(toV2Tool(id, definition as { description: string; args: any; execute: (args: any, context: any) => Promise<any> }, directory))
+        }
+      }),
+    )
+    registrations.push(
+      await context.tool.hook("execute.before", async (input) => {
+        await (hooks as any)["tool.execute.before"]?.(
+          { tool: input.tool, sessionID: input.sessionID, callID: input.id },
+          { args: input.input },
+        )
+      }),
+    )
+    registrations.push(
+      await context.tool.hook("execute.after", async (input) => {
+        const output = input.status === "completed" ? input.result : { content: JSON.stringify(input.error) }
+        await (hooks as any)["tool.execute.after"]?.(
+          { tool: input.tool, sessionID: input.sessionID, callID: input.id, args: input.input },
+          {
+            title: "",
+            output: typeof output.content === "string" ? output.content : JSON.stringify(output.content ?? ""),
+            metadata: output.metadata ?? {},
+          },
+        )
+      }),
+    )
+    // v2's prompt payload carries no agent/model/message parts; resolve the
+    // session's selection and synthesize the v1 chat.message input shape.
+    registrations.push(
+      await context.session.hook("prompt", async (input: any) => {
+        const sessionID = input?.sessionID
+        if (!sessionID) return
+        let info: any
+        try {
+          info = await context.session.get({ sessionID })
+        } catch {}
+        const text = typeof input?.prompt === "string" ? input.prompt : input?.prompt?.text ?? ""
+        const messageID = input?.messageID ?? `chat:${Date.now()}`
+        await (hooks as any)["chat.message"]?.(
+          { sessionID },
+          { message: { id: messageID, sessionID, content: text }, parts: text ? [{ type: "text", text }] : [] },
+        )
+        void info
+      }),
+    )
+
+    void (async () => {
+      try {
+        for await (const event of context.event.subscribe({ signal: eventController.signal })) {
+          const type = event?.type as string | undefined
+          const data = event?.data && typeof event.data === "object" ? (event.data as Record<string, any>) : {}
+          if (type === "session.message.content.updated" && typeof data.sessionID === "string" && typeof data.messageID === "string") {
+            const text = v2TextOf(data.content)
+            if (text) pendingText.set(`${data.sessionID}:${data.messageID}`, { sessionID: data.sessionID, messageID: data.messageID, text })
+            continue
+          }
+          if ((type === "session.step.ended" || type === "session.idle") && typeof data.sessionID === "string") {
+            await flushText(data.sessionID)
+            continue
+          }
+          const normalized = normalizeV2Event(event)
+          if (normalized) await (hooks as any).event?.({ event: normalized })
+        }
+      } catch {
+        // Aborted on cleanup; teardown is handled there.
+      }
+    })()
+
+    return cleanup
+  } catch (error) {
+    await cleanup()
+    throw error
+  }
+}
+
 export default {
   id: "learn",
   server,
-} satisfies PluginModule & { id: string }
+  setup,
+} satisfies PluginModule & V2Plugin.Plugin

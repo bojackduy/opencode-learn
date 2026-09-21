@@ -1,6 +1,7 @@
 // @ts-nocheck
 /** @jsxImportSource @opentui/solid */
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
+import type { Plugin as TuiV2 } from "@opencode/plugin/tui"
 import { createSignal, onCleanup, For, Show, createEffect } from "solid-js"
 import { useKeyboard, useTerminalDimensions } from "@opentui/solid"
 import * as fs from "node:fs"
@@ -755,7 +756,7 @@ function QuizBatchDialog(props: {
   )
 }
 
-export const tui: TuiPlugin = async (api) => {
+const tui: TuiPlugin = async (api) => {
   // Guard the very first state access: if a future opencode version reshapes the TUI API
   // object, a synchronous throw here would kill the whole plugin with zero trace (no
   // heartbeat, no log line) — exactly the silent-death signature. Fall back to cwd.
@@ -1014,7 +1015,167 @@ export const tui: TuiPlugin = async (api) => {
   api.ui.toast({ message: "learn TUI ready — beautiful quiz + question", variant: "info", duration: 2200 })
 }
 
+// ─── V2 (opencode v2 TUI) ───────────────────────────────────────────────────
+// The 1000-line v1 `tui()` closure above is reused untouched: v2 setup builds
+// a small v1-shaped facade and invokes it. Only the calls it actually makes
+// are mapped: theme.current (defensive — render-time throw crashes the TUI),
+// route.current, state.session.get, dialog open/replace/setSize/clear,
+// toast, client.session.prompt (flat shape first, envelope fallbacks), and
+// event.on("session.status") → execution started/succeeded.
+function adaptThemeV2(theme: TuiV2.Context["theme"]): Record<string, string> {
+  const t = (theme ?? {}) as any
+  const text = t.text ?? {}
+  const fb = text.feedback ?? {}
+  const bg = t.background ?? {}
+  const surface = bg.surface ?? {}
+  const diff = t.diff ?? {}
+  const diffText = diff.text ?? {}
+  const diffBg = diff.background ?? {}
+  const diffHi = diff.highlight ?? {}
+  const diffLn = diff.lineNumber ?? {}
+  const syntax = t.syntax ?? {}
+  const md = t.markdown ?? {}
+  const dv = (v: unknown, fallback: string) => (typeof v === "string" ? v : fallback)
+  const base = dv(text.default, "#ffffff")
+  const muted = dv(text.subdued, "#888888")
+  return {
+    text: base,
+    textMuted: muted,
+    primary: base,
+    accent: base,
+    success: dv(fb.success?.default, "#22c55e"),
+    warning: dv(fb.warning?.default, "#eab308"),
+    error: dv(fb.error?.default, "#ef4444"),
+    info: dv(fb.info?.default, base),
+    background: dv(bg.default, "#000000"),
+    backgroundPanel: dv(surface.overlay, dv(bg.default, "#000000")),
+    backgroundElement: dv(surface.offset, dv(bg.default, "#000000")),
+    diffAdded: dv(diffText.added, base),
+    diffRemoved: dv(diffText.removed, base),
+    diffContext: dv(diffText.context, muted),
+    diffAddedBg: dv(diffBg.added, dv(bg.default, "#000000")),
+    diffRemovedBg: dv(diffBg.removed, dv(bg.default, "#000000")),
+    diffContextBg: dv(diffBg.context, dv(bg.default, "#000000")),
+    diffHighlightAdded: dv(diffHi.added, base),
+    diffHighlightRemoved: dv(diffHi.removed, base),
+    diffLineNumber: dv(diffLn.text, muted),
+    diffAddedLineNumberBg: dv(diffLn.background?.added, dv(bg.default, "#000000")),
+    diffRemovedLineNumberBg: dv(diffLn.background?.removed, dv(bg.default, "#000000")),
+    syntaxComment: dv(syntax.comment, muted),
+    syntaxKeyword: dv(syntax.keyword, base),
+    syntaxFunction: dv(syntax.function, base),
+    syntaxVariable: dv(syntax.variable, base),
+    syntaxString: dv(syntax.string, base),
+    syntaxNumber: dv(syntax.number, base),
+    syntaxType: dv(syntax.type, base),
+    syntaxOperator: dv(syntax.operator, base),
+    syntaxPunctuation: dv(syntax.punctuation, muted),
+    markdownText: dv(md.text, base),
+    markdownHeading: dv(md.heading, base),
+    markdownLink: dv(md.link, base),
+    markdownLinkText: dv(md.linkText, base),
+    markdownCode: dv(md.code, base),
+    markdownBlockQuote: dv(md.blockQuote, muted),
+    markdownEmph: dv(md.emphasis, base),
+    markdownStrong: dv(md.strong, base),
+    markdownListItem: dv(md.listItem, base),
+  }
+}
+
+const v2setup: TuiV2.Definition["setup"] = async (ctx) => {
+  const directory = ctx.location?.directory ?? ctx.data.location.default().directory
+  const cleanups: Array<() => void> = []
+  let dialogOpen = false
+  const closeDialog = () => {
+    dialogOpen = false
+    try {
+      ctx.ui.dialog.clear()
+    } catch {}
+  }
+  const facade = {
+    theme: {
+      get current() {
+        return adaptThemeV2(ctx.theme)
+      },
+    },
+    route: {
+      get current() {
+        const r = ctx.ui.router.current()
+        return r.type === "session"
+          ? { name: "session", params: { sessionID: r.sessionID } }
+          : { name: r.type, params: {} }
+      },
+    },
+    state: {
+      path: { directory },
+      session: {
+        get: (id: string) => ctx.data.session.get(id),
+      },
+    },
+    ui: {
+      dialog: {
+        get open() {
+          return dialogOpen
+        },
+        replace: (render: () => unknown) => {
+          dialogOpen = true
+          ctx.ui.dialog.show(render as () => import("@opentui/solid").JSX.Element)
+        },
+        setSize: (size: "medium" | "large" | "xlarge") => ctx.ui.dialog.set({ size }),
+        clear: closeDialog,
+      },
+      toast: (t: { message: string; variant?: "info" | "success" | "warning" | "error"; duration?: number }) =>
+        ctx.ui.toast.show(t),
+    },
+    client: {
+      session: {
+        prompt: async (input: any) => {
+          const flat = {
+            sessionID: input?.path?.sessionID ?? input?.path?.id ?? input?.sessionID,
+            text: input?.body?.prompt?.text,
+          }
+          const parts = input?.body?.parts ?? input?.parts
+          const text =
+            typeof flat.text === "string" && flat.text
+              ? flat.text
+              : Array.isArray(parts)
+                ? parts.filter((p: any) => p?.type === "text").map((p: any) => p.text ?? "").join("\n")
+                : ""
+          const sid = flat.sessionID
+          try {
+            return await (ctx.client as any).session.prompt({ sessionID: sid, text })
+          } catch {
+            return await (ctx.client as any).session.prompt(input)
+          }
+        },
+      },
+    },
+    event: {
+      on: (name: string, callback: () => void) => {
+        if (name === "session.status") {
+          const unsubs = [ctx.data.on("session.execution.started", callback), ctx.data.on("session.execution.succeeded", callback)]
+          return () => void unsubs.forEach((un) => un())
+        }
+        return (ctx.data.on as (type: any, handler: () => void) => () => void)(name, callback)
+      },
+    },
+    lifecycle: {
+      onDispose: (fn: () => void) => void cleanups.push(fn),
+    },
+  }
+  await tui(facade as never)
+  return () => {
+    closeDialog()
+    for (const fn of cleanups.splice(0)) {
+      try {
+        fn()
+      } catch {}
+    }
+  }
+}
+
 export default {
   id: "learn-tui",
   tui,
-} satisfies TuiPluginModule & { id: string }
+  setup: v2setup,
+} satisfies TuiPluginModule & { id: string; setup: typeof v2setup }
