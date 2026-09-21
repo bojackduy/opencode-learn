@@ -30,7 +30,10 @@ function makeCtx(dir: string, onShow: (render: () => any) => void, sessionDir?: 
     keymap: { layer: () => {}, mode: { push: () => () => {} } },
     data: {
       location: { default: () => ({ directory: dir }) },
-      session: { get: () => (sessionDir ? { directory: sessionDir } : undefined) },
+      // Real v2 SessionInfo shape: no flat `directory`, only
+      // `location.directory` (+ projectID). A flat `{ directory }` here would
+      // hide a repeat of the home-vs-project watch bug.
+      session: { get: () => (sessionDir ? { projectID: "proj_probe", location: { directory: sessionDir } } : undefined) },
       on: () => () => {},
     },
     client: { session: {} },

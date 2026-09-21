@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { adaptThemeV2 } from "./learn-tui"
+import { adaptThemeV2 } from "./learn-v2"
 
 // Mirrors the production v2 ResolvedTheme shape observed in learn-tui.log:
 // nested bags with the exact resolved action/raised/feedback token shape.
