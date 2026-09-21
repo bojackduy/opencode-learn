@@ -20,8 +20,10 @@ function useDialogKeyboard(callback: (event: any) => void) {
       renderer.requestRender()
     }
   }
+  const detach = () => { try { renderer.keyInput.off("keypress", handle) } catch {} }
   onMount(() => renderer.keyInput.prependListener("keypress", handle))
-  onCleanup(() => renderer.keyInput.off("keypress", handle))
+  onCleanup(detach)
+  return detach
 }
 function wrapQuizLines(s: string, width = 76): string[] {
   const out: string[] = []
@@ -176,7 +178,17 @@ export function V2QuizDialog(props: {
     paintScroll()
   }
 
-  useDialogKeyboard((event: any) => {
+  // Self-detach: the v2 host does not guarantee unmount on dialog.clear(),
+  // and onCleanup alone would leave this prepended listener swallowing
+  // enter/space/j/k/arrows after the quiz is answered — the user then can't
+  // chat. Detaching at submit/cancel time makes key release not depend on
+  // host unmount behavior.
+  let closed = false
+  let detachKeys: () => void = () => {}
+  const finishSubmit = (fn: () => void) => { if (closed) return; closed = true; try { detachKeys() } catch {} fn() }
+  const finishCancel = () => { if (closed) return; closed = true; try { detachKeys() } catch {}; props.onCancel() }
+  detachKeys = useDialogKeyboard((event: any) => {
+    if (closed) return
     const key = String(event.name || event.sequence || "").toLowerCase()
     const seq = event.sequence || ""
     if (phaseStr === "feedback") {
@@ -184,8 +196,8 @@ export function V2QuizDialog(props: {
       if (key === "u" || seq === "\x15" || key === "pageup" || seq === "\x1b[5~") { prevent(event); scrollBy(-4); return }
       if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); scrollBy(1); return }
       if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); scrollBy(-1); return }
-      if (key === "enter" || key === "return" || seq === "\r") { prevent(event); if (pendingRes) props.onSubmit(pendingRes); return }
-      if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+      if (key === "enter" || key === "return" || seq === "\r") { prevent(event); finishSubmit(() => { if (pendingRes) props.onSubmit(pendingRes) }); return }
+      if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
       return
     }
     if (key === "up" || key === "k" || seq === "\x1b[A") {
@@ -200,7 +212,7 @@ export function V2QuizDialog(props: {
       paintRows()
       return
     }
-    if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+    if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
     if (key === "space" || seq === " ") {
       prevent(event)
       if (!multi) return submitSelect()
@@ -408,7 +420,10 @@ function V2QuizBatchDialog(props: {
     const sel = pendingRes.answers.map((a) => a.index)
     const correct = !pendingRes.dontKnow && sel.length === q.correctIndices.length && sel.every((n) => curCorrect().has(n))
     results.push({ ...pendingRes, correct })
-    if (qIdx + 1 >= quizzes.length) props.onSubmit({ results })
+    // Terminal submit only: non-terminal confirms loadQuiz() into the next
+    // question and must keep the keys. Detach here so chat works even if the
+    // host never unmounts the dialog after clear().
+    if (qIdx + 1 >= quizzes.length) { closed = true; try { detachKeys() } catch {}; props.onSubmit({ results }) }
     else loadQuiz(qIdx + 1)
   }
   const scrollBy = (delta: number) => {
@@ -416,7 +431,13 @@ function V2QuizBatchDialog(props: {
     paintScroll()
   }
 
-  useDialogKeyboard((event: any) => {
+  // Same self-detach contract as the single dialog (see above): keys must be
+  // released at dialog end, not at host unmount.
+  let closed = false
+  let detachKeys: () => void = () => {}
+  const finishCancel = () => { if (closed) return; closed = true; try { detachKeys() } catch {}; props.onCancel() }
+  detachKeys = useDialogKeyboard((event: any) => {
+    if (closed) return
     const key = String(event.name || event.sequence || "").toLowerCase()
     const seq = event.sequence || ""
     if (phaseStr === "feedback") {
@@ -425,12 +446,12 @@ function V2QuizBatchDialog(props: {
       if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); scrollBy(1); return }
       if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); scrollBy(-1); return }
       if (key === "enter" || key === "return" || seq === "\r") { prevent(event); confirmFeedback(); return }
-      if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+      if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
       return
     }
     if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); cursorIdx = Math.max(0, cursorIdx - 1); paintRows(); return }
     if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); cursorIdx = Math.min(rowCount() - 1, cursorIdx + 1); paintRows(); return }
-    if (key === "escape" || key === "esc") { prevent(event); props.onCancel(); return }
+    if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
     if (key === "space" || seq === " ") {
       prevent(event)
       if (!curMulti()) return submitSelect()

@@ -112,6 +112,7 @@ describe("V2QuizDialog visual", () => {
         expect(movedFrame).toContain("> 2. He had excellent straw-tegy")
         expect(movedFrame).not.toContain("> 1. He bribed a crow")
         expect(hostScrolls).toBe(0)
+        const hostScrollsAfterSelect = hostScrolls
         expect(requestedFrames).toBeGreaterThan(0)
         keyInput.emit("keypress", key("return"))
         await setup.renderOnce()
@@ -133,6 +134,21 @@ describe("V2QuizDialog visual", () => {
           if (!answered) await new Promise((r) => setTimeout(r, 100))
         }
         expect(answered).toBe(true)
+
+        // Regression: after submit the dialog must release its keys even if
+        // the host never unmounts it. A surviving prepended listener would
+        // keep swallowing enter/j/k/arrows and the user couldn't chat.
+        const respPath = path.join(pendingDir, `response-${QUIZ_ID}.json`)
+        const mtime = fs.statSync(respPath).mtimeMs
+        const afterEnter = key("return")
+        keyInput.emit("keypress", afterEnter)
+        await setup.renderOnce()
+        expect(afterEnter.defaultPrevented).toBe(false)
+        expect(afterEnter.propagationStopped).toBe(false)
+        expect(fs.statSync(respPath).mtimeMs).toBe(mtime)
+        keyInput.emit("keypress", key("down"))
+        await setup.renderOnce()
+        expect(hostScrolls).toBe(hostScrollsAfterSelect + 1)
       } finally {
         await cleanup()
         fs.rmSync(dir, { recursive: true, force: true })
