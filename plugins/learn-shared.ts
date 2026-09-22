@@ -68,8 +68,10 @@ export type QuizResult = {
 // The only seam between this file and a host's UI layer: each host injects its
 // own dialog components, and nothing solid-shaped crosses back into here.
 export type QuizRenderers = {
-  quiz: (request: QuizPending, onSubmit: (result: any) => void, onCancel: () => void) => unknown
-  batch: (request: QuizBatchPending, onSubmit: (result: any) => void, onCancel: () => void) => unknown
+  // dir is the pending dir the quiz file lives in — responses, locks, and
+  // classify requests must all be written next to it.
+  quiz: (request: QuizPending, dir: string, onSubmit: (result: any) => void, onCancel: () => void) => unknown
+  batch: (request: QuizBatchPending, dir: string, onSubmit: (result: any) => void, onCancel: () => void) => unknown
 }
 export async function runPendingLoop(api: any, renderers: QuizRenderers) {
   // Guard the very first state access: if a future opencode version reshapes the TUI API
@@ -379,11 +381,11 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     }
     if (data.type === "quiz") {
       tlog("processPending quiz", data.id)
-      api.ui.dialog.replace(() => renderers.quiz(data as QuizPending, done, cancel))
+      api.ui.dialog.replace(() => renderers.quiz(data as QuizPending, pickDir, done, cancel))
     }
     else if (data.type === "quiz_batch") {
       tlog("processPending quiz_batch", data.id, (data as QuizBatchPending).quizzes.length)
-      api.ui.dialog.replace(() => renderers.batch(data as QuizBatchPending, done, cancel))
+      api.ui.dialog.replace(() => renderers.batch(data as QuizBatchPending, pickDir, done, cancel))
     }
     else { tlog("processPending unknown", (data as any).type, data.id); releasePopupClaim(pickDir, data.id); try { fs.unlinkSync(full) } catch {}; currentBySession.delete(curSid); return }
     try { api.ui.dialog.setSize("large") } catch {}

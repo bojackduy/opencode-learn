@@ -160,6 +160,89 @@ describe("V2QuizDialog visual", () => {
     }
   }, 30000)
 
+  test("note typing triggers AI classify and maps the answer", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "learn-note-"))
+    const pendingDir = path.join(dir, ".opencode", "learn-pending")
+    fs.mkdirSync(pendingDir, { recursive: true })
+
+    let shown: (() => any) | undefined
+    const ctx = makeCtx(dir, (render) => {
+      shown = render
+    })
+    const cleanup = await (plugin as any).setup(ctx)
+    try {
+      fs.writeFileSync(
+        path.join(pendingDir, `quiz-${QUIZ_ID}.json`),
+        JSON.stringify({
+          id: QUIZ_ID,
+          type: "quiz",
+          question: "Where was he outstanding?",
+          options: [{ label: "in the office" }, { label: "in his field" }],
+          correctIndices: [2],
+          explanation: "Out standing in a field.",
+          sessionID: "ses_probe",
+        }),
+      )
+      const deadline = Date.now() + 5000
+      while (!shown && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100))
+      expect(shown).toBeDefined()
+
+      const setup = await testRender(shown!, { width: 100, height: 32 })
+      try {
+        await setup.renderOnce()
+        const keyInput = (setup.renderer as any).keyInput
+        const mk = (name: string, sequence: string) => new KeyEvent({
+          name, sequence, raw: sequence, ctrl: false, meta: false, shift: false,
+          option: false, number: false, eventType: "press", source: "raw",
+        })
+        // Tab into the note editor and type free text (no option chosen).
+        keyInput.emit("keypress", mk("tab", "\t"))
+        await setup.renderOnce()
+        for (const ch of "crops") keyInput.emit("keypress", mk(ch, ch))
+        await setup.renderOnce()
+        expect(setup.captureCharFrame()).toContain("crops")
+        // Enter sends the note for AI classification.
+        keyInput.emit("keypress", mk("return", ""))
+        await setup.renderOnce()
+        const reqPath = path.join(pendingDir, `classify-${QUIZ_ID}.json`)
+        const reqDeadline = Date.now() + 5000
+        while (!fs.existsSync(reqPath) && Date.now() < reqDeadline) await new Promise((r) => setTimeout(r, 100))
+        expect(fs.existsSync(reqPath)).toBe(true)
+        expect(JSON.parse(fs.readFileSync(reqPath, "utf8")).note).toBe("crops")
+        // Simulate the server's classify watcher answering.
+        fs.writeFileSync(path.join(pendingDir, `classify-response-${QUIZ_ID}.json`), JSON.stringify({
+          id: QUIZ_ID, inferredIndices: [2], semanticCorrect: true, reason: "crops grow in a field",
+        }))
+        const fbDeadline = Date.now() + 8000
+        let fb = ""
+        while (Date.now() < fbDeadline) {
+          await setup.renderOnce()
+          await Bun.sleep(200)
+          fb = setup.captureCharFrame()
+          if (fb.includes("CORRECT")) break
+        }
+        expect(fb).toContain("CORRECT")
+        expect(fb).toContain("Your note: crops")
+        // Confirm sends the mapped answer back, note attached.
+        keyInput.emit("keypress", mk("return", ""))
+        await setup.renderOnce()
+        const respPath = path.join(pendingDir, `response-${QUIZ_ID}.json`)
+        const respDeadline = Date.now() + 5000
+        while (!fs.existsSync(respPath) && Date.now() < respDeadline) await new Promise((r) => setTimeout(r, 100))
+        const resp = JSON.parse(fs.readFileSync(respPath, "utf8"))
+        expect(resp.result.answers).toEqual([{ label: "in his field", value: "in his field", index: 2 }])
+        expect(resp.result.note).toBe("crops")
+      } finally {
+        await cleanup()
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    } finally {
+      try {
+        await cleanup()
+      } catch {}
+    }
+  }, 30000)
+
   test("finds quiz in the session project dir when cwd differs", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "learn-render-cwd-"))
     const sessDir = fs.mkdtempSync(path.join(os.tmpdir(), "learn-render-proj-"))

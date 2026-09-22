@@ -713,7 +713,7 @@ function QuizBatchDialog(props: {
 export const tui: TuiPlugin = async (api) => {
   tlog("v1 tui enter")
   return runPendingLoop(api, {
-    quiz: (request, onSubmit, onCancel) => <QuizDialog api={api} request={request} onSubmit={onSubmit} onCancel={onCancel} />,
-    batch: (request, onSubmit, onCancel) => <QuizBatchDialog api={api} request={request} onSubmit={onSubmit} onCancel={onCancel} />,
+    quiz: (request, _dir, onSubmit, onCancel) => <QuizDialog api={api} request={request} onSubmit={onSubmit} onCancel={onCancel} />,
+    batch: (request, _dir, onSubmit, onCancel) => <QuizBatchDialog api={api} request={request} onSubmit={onSubmit} onCancel={onCancel} />,
   })
 }

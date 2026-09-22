@@ -6,7 +6,9 @@
 import type { Plugin as TuiV2 } from "@opencode/plugin/tui"
 import { onCleanup, onMount } from "solid-js/dist/solid.js"
 import { useRenderer } from "@opentui/solid"
-import { decodeQuizText, prevent, runPendingLoop, tlog } from "./learn-shared"
+import * as fs from "node:fs"
+import * as path from "node:path"
+import { decodeQuizText, prevent, runPendingLoop, tlog, writeJsonAtomic } from "./learn-shared"
 import type { QuizBatchPending, QuizPending, QuizResult } from "./learn-shared"
 function useDialogKeyboard(callback: (event: any) => void) {
   const renderer = useRenderer()
@@ -24,6 +26,76 @@ function useDialogKeyboard(callback: (event: any) => void) {
   onMount(() => renderer.keyInput.prependListener("keypress", handle))
   onCleanup(detach)
   return detach
+}
+// AI classify: maps a free-text note onto the quiz options via the server's
+// classify watcher (same classify-<id>.json protocol the v1 dialogs use).
+// Pure mapping of a classify-response payload onto dialog state, so the
+// branching is unit-testable without a live server.
+export type ClassifyOutcome = { selectedIndices: number[]; dontKnow: boolean; correct: boolean; reason?: string }
+export function applyClassifyResult(
+  opts: { multi: boolean; correctIndices: number[]; options: Array<{ label: string; value: string }> },
+  data: any | null,
+): ClassifyOutcome {
+  const correctSet = new Set(opts.correctIndices)
+  const exactCorrect = (idxs: number[]) =>
+    idxs.length === opts.correctIndices.length &&
+    idxs.every((n) => correctSet.has(n)) &&
+    opts.correctIndices.every((n) => idxs.includes(n))
+  if (!data) return { selectedIndices: [], dontKnow: false, correct: false }
+  if (data.isIDK) return { selectedIndices: [], dontKnow: true, correct: false, reason: data.reason }
+  const fromIdx = (idxs: number[]) => {
+    const eff = !opts.multi && idxs.length > 1 ? [idxs[0]!] : idxs
+    const valid = eff.filter((n) => Number.isInteger(n) && n >= 1 && n <= opts.options.length)
+    const correct = typeof data.semanticCorrect === "boolean" ? data.semanticCorrect : exactCorrect(valid)
+    return { selectedIndices: valid, dontKnow: false, correct, reason: data.reason }
+  }
+  if (Array.isArray(data.inferredIndices) && data.inferredIndices.length) return fromIdx(data.inferredIndices)
+  if (Array.isArray(data.inferredValues) && data.inferredValues.length) {
+    const byVal = new Map(opts.options.map((o, i) => [o.value ?? o.label, i + 1]))
+    return fromIdx(data.inferredValues.map((v: any) => byVal.get(v)).filter((n: any) => typeof n === "number"))
+  }
+  return { selectedIndices: [], dontKnow: false, correct: data.semanticCorrect ?? false, reason: data.reason }
+}
+
+// Writes a classify request and polls for the server's classify-response.
+// Returns a cancel function (clears the poll). The server needs a moment
+// (LLM classify, min ~1.2s), so the dialog shows a classifying state meanwhile.
+export function startClassifyRequest(
+  pickDir: string,
+  payload: { id: string; note: string; question: string; options: Array<{ label: string; value?: string; index: number }>; multiSelect: boolean; sessionID?: string },
+  tag: string,
+  onResult: (data: any | null) => void,
+): () => void {
+  const reqPath = path.join(pickDir, `classify-${payload.id}.json`)
+  const respPath = path.join(pickDir, `classify-response-${payload.id}.json`)
+  try {
+    writeJsonAtomic(reqPath, { ...payload, type: "classify", timestamp: Date.now() })
+    tlog(tag, "classify request", payload.id, payload.note.slice(0, 50))
+  } catch (e) { tlog(tag, "classify request failed", String(e)); onResult(null); return () => {} }
+  let attempts = 0
+  let done = false
+  const timer = setInterval(() => {
+    if (done) return
+    attempts++
+    if (attempts > 60) {
+      done = true
+      clearInterval(timer)
+      tlog(tag, "classify timeout", payload.id)
+      onResult(null)
+      return
+    }
+    try {
+      if (fs.existsSync(respPath)) {
+        done = true
+        clearInterval(timer)
+        const data: any = JSON.parse(fs.readFileSync(respPath, "utf8"))
+        try { fs.unlinkSync(respPath); fs.unlinkSync(reqPath) } catch {}
+        tlog(tag, "classify response", payload.id, JSON.stringify(data).slice(0, 120))
+        onResult(data)
+      }
+    } catch {}
+  }, 500)
+  return () => { done = true; try { clearInterval(timer) } catch {} }
 }
 // Verdict fills mirror the v1 dialogs: a saturated full-row background with
 // the base background color as text. Glyph-only coloring is what made v2
@@ -62,6 +134,7 @@ function wrapQuizLines(s: string, width = 76): string[] {
 export function V2QuizDialog(props: {
   request: QuizPending
   theme: Record<string, any>
+  pendingDir: string
   onSubmit: (result: QuizResult) => void
   onCancel: () => void
 }) {
@@ -74,10 +147,17 @@ export function V2QuizDialog(props: {
 
   let cursorIdx = 0
   const selectedSet = new Set<number>()
-  let phaseStr: "select" | "feedback" = "select"
+  let phaseStr: "select" | "classifying" | "feedback" = "select"
   let fb: { correct: boolean; selectedIndices: number[]; dontKnow: boolean } | null = null
   let pendingRes: QuizResult | null = null
   let scrollOff = 0
+  // Free-text note, classified by AI into options (v1 parity). Hand-rolled
+  // single-line editor: no <input> — that component class is what failed to
+  // paint in v2 before.
+  let noteStr = ""
+  let noteReason = ""
+  let focusTarget: "options" | "note" = "options"
+  let pollCancel: (() => void) | null = null
 
   let rootBox: any = null
   let headerBox: any = null
@@ -91,6 +171,11 @@ export function V2QuizDialog(props: {
   let correctText: any = null
   let explanationText: any = null
   let scrollCueText: any = null
+  let noteBox: any = null
+  let noteTextEl: any = null
+  let footerText: any = null
+  let classifyBox: any = null
+  let noteTextFb: any = null
 
   const rowLabel = (index: number) => {
     const option = allRows[index]!
@@ -149,6 +234,10 @@ export function V2QuizDialog(props: {
       }
     })
     if (correctText) correctText.content = `Correct: ${props.request.correctIndices.map((n) => `${n}. ${props.request.options[n - 1]?.label || "—"}`).join(", ") || "—"}`
+    if (noteTextFb) {
+      const shown = noteStr.trim() + (noteReason ? ` — ${noteReason}` : "")
+      noteTextFb.content = shown ? `Your note: ${shown}` : " "
+    }
     paintScroll()
   }
   const paintHeader = () => {
@@ -167,11 +256,16 @@ export function V2QuizDialog(props: {
   const submitSelect = () => {
     if (phaseStr !== "select") return
     if (cursorIdx === props.request.options.length) {
-      pendingRes = { answers: [], dontKnow: true }
+      pendingRes = { answers: [], dontKnow: true, note: noteStr.trim() || undefined } as QuizResult
       fb = { correct: false, selectedIndices: [], dontKnow: true }
     } else {
       const indices = multi ? [...selectedSet] : [cursorIdx]
-      if (multi && indices.length === 0) return
+      // Multi with nothing toggled but a note written: let AI map the note
+      // onto options (v1 parity). Single-select always has a cursor option.
+      if (multi && indices.length === 0) {
+        if (noteStr.trim()) { startClassify(); return }
+        return
+      }
       const answers = indices.map((i) => {
         const option = props.request.options[i]!
         return { label: option.label, value: option.value ?? option.label, index: i + 1 }
@@ -180,7 +274,7 @@ export function V2QuizDialog(props: {
       const correct = selectedIndices.length === props.request.correctIndices.length &&
         selectedIndices.every((n) => correctSet.has(n)) &&
         props.request.correctIndices.every((n) => selectedIndices.includes(n))
-      pendingRes = { answers, dontKnow: false }
+      pendingRes = { answers, dontKnow: false, note: noteStr.trim() || undefined } as QuizResult
       fb = { correct, selectedIndices, dontKnow: false }
     }
     scrollOff = 0
@@ -196,6 +290,56 @@ export function V2QuizDialog(props: {
     paintScroll()
   }
 
+  const paintNote = () => {
+    const focusedNote = focusTarget === "note" && phaseStr === "select"
+    if (noteBox) noteBox.borderColor = focusedNote ? props.theme.accent : props.theme.textMuted
+    if (noteTextEl) {
+      noteTextEl.content = noteStr ? noteStr + (focusedNote ? "▌" : "") : (focusedNote ? "▌Tab to type · share what you were thinking" : "Tab to type · share what you were thinking")
+      noteTextEl.fg = noteStr ? props.theme.text : props.theme.textMuted
+    }
+    if (footerText) footerText.content = focusedNote
+      ? "Type · Enter classify with AI · Tab/Esc back to options"
+      : (multi ? "UP/DOWN move  SPACE toggle  ENTER review  TAB note  ESC cancel" : "UP/DOWN move  ENTER review  TAB note  ESC cancel")
+  }
+  const showFeedback = () => {
+    scrollOff = 0
+    phaseStr = "feedback"
+    paintHeader()
+    paintReview()
+    if (selectBox) selectBox.visible = false
+    if (feedbackBox) feedbackBox.visible = true
+  }
+  const startClassify = () => {
+    const note = noteStr.trim()
+    if (!note || phaseStr !== "select") return
+    if (pollCancel) { try { pollCancel() } catch {} pollCancel = null }
+    phaseStr = "classifying"
+    if (classifyBox) classifyBox.visible = true
+    paintNote()
+    const opts = props.request.options.map((o, i) => ({ label: o.label, value: o.value ?? o.label, index: i + 1 }))
+    pollCancel = startClassifyRequest(props.pendingDir, {
+      id: props.request.id, note,
+      question: decodeQuizText(props.request.question),
+      options: opts, multiSelect: multi, sessionID: props.request.sessionID,
+    }, "V2QuizDialog", (data) => {
+      pollCancel = null
+      if (closed) return
+      if (!data) tlog("V2QuizDialog classify timeout", props.request.id)
+      const r = applyClassifyResult({ multi, correctIndices: props.request.correctIndices, options: opts }, data)
+      noteReason = r.reason || ""
+      pendingRes = {
+        answers: r.selectedIndices.map((n) => {
+          const o = props.request.options[n - 1]!
+          return { label: o.label, value: o.value ?? o.label, index: n }
+        }),
+        dontKnow: r.dontKnow, note: note || undefined,
+      } as QuizResult
+      fb = { correct: r.correct, selectedIndices: r.selectedIndices, dontKnow: r.dontKnow }
+      if (classifyBox) classifyBox.visible = false
+      showFeedback()
+    })
+  }
+  onCleanup(() => { try { pollCancel?.() } catch {} })
   // Self-detach: the v2 host does not guarantee unmount on dialog.clear(),
   // and onCleanup alone would leave this prepended listener swallowing
   // enter/space/j/k/arrows after the quiz is answered — the user then can't
@@ -203,8 +347,9 @@ export function V2QuizDialog(props: {
   // host unmount behavior.
   let closed = false
   let detachKeys: () => void = () => {}
-  const finishSubmit = (fn: () => void) => { if (closed) return; closed = true; try { detachKeys() } catch {} fn() }
-  const finishCancel = () => { if (closed) return; closed = true; try { detachKeys() } catch {}; props.onCancel() }
+  const stopPoll = () => { if (pollCancel) { try { pollCancel() } catch {} pollCancel = null } }
+  const finishSubmit = (fn: () => void) => { if (closed) return; closed = true; try { detachKeys() } catch {}; stopPoll(); fn() }
+  const finishCancel = () => { if (closed) return; closed = true; try { detachKeys() } catch {}; stopPoll(); props.onCancel() }
   detachKeys = useDialogKeyboard((event: any) => {
     if (closed) return
     const key = String(event.name || event.sequence || "").toLowerCase()
@@ -218,6 +363,28 @@ export function V2QuizDialog(props: {
       if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
       return
     }
+    if (phaseStr === "classifying") { prevent(event); return }
+    if (focusTarget === "note") {
+      if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "options"; paintNote(); return }
+      if (key === "escape" || key === "esc") { prevent(event); focusTarget = "options"; paintNote(); return }
+      if ((key === "enter" || key === "return" || seq === "\r") && (event.ctrl || event.meta)) { prevent(event); focusTarget = "options"; paintNote(); return }
+      if (key === "enter" || key === "return" || seq === "\r") {
+        prevent(event)
+        if (noteStr.trim()) startClassify()
+        else { focusTarget = "options"; paintNote() }
+        return
+      }
+      if (key === "backspace" || seq === "\x7f" || seq === "\b") { prevent(event); noteStr = noteStr.slice(0, -1); paintNote(); return }
+      // Plain printable char (incl. space) appends to the note. Arrows and
+      // other control keys are swallowed: this editor has end-cursor only.
+      if (!event.ctrl && !event.meta && seq.length === 1 && seq >= " ") {
+        prevent(event)
+        if (noteStr.length < 240) { noteStr += seq; paintNote() }
+        return
+      }
+      return
+    }
+    if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "note"; paintNote(); return }
     if (key === "up" || key === "k" || seq === "\x1b[A") {
       prevent(event)
       cursorIdx = Math.max(0, cursorIdx - 1)
@@ -260,7 +427,14 @@ export function V2QuizDialog(props: {
             <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${multi && index < props.request.options.length ? "[ ]" : index < props.request.options.length ? `○ ${index + 1}.` : "□"} ${option.label}`}</text>
           </box>
         ))}
-        <text fg={props.theme.textMuted}>{multi ? "UP/DOWN move  SPACE toggle  ENTER review  ESC cancel" : "UP/DOWN move  ENTER review  ESC cancel"}</text>
+        <box ref={(element: any) => noteBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} paddingLeft={1} paddingRight={1}>
+          <text fg={props.theme.textMuted} bold>✎ Note (optional)</text>
+          <text ref={(element: any) => noteTextEl = element} fg={props.theme.textMuted} wrapMode="wrap">Tab to type · share what you were thinking</text>
+        </box>
+        <box ref={(element: any) => { classifyBox = element; if (element) element.visible = false }} flexDirection="column" backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}>
+          <text fg={props.theme.background} bold>Classifying your note with AI…</text>
+        </box>
+        <text ref={(element: any) => footerText = element} fg={props.theme.textMuted}>{multi ? "UP/DOWN move  SPACE toggle  ENTER review  TAB note  ESC cancel" : "UP/DOWN move  ENTER review  TAB note  ESC cancel"}</text>
       </box>
       <box ref={(element: any) => { feedbackBox = element; if (element) element.visible = false }} flexDirection="column" gap={1}>
         <box ref={(element: any) => reviewBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.accent} backgroundColor={props.theme.background} padding={1}>
@@ -274,6 +448,7 @@ export function V2QuizDialog(props: {
           <text ref={(element: any) => explanationText = element} fg={props.theme.text} wrapMode="wrap">{explLines.slice(0, visibleCount).join("\n") || " "}</text>
           <box backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}><text ref={(element: any) => scrollCueText = element} fg={props.theme.background} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text></box>
         </box>
+        <text ref={(element: any) => noteTextFb = element} fg={props.theme.textMuted} wrapMode="wrap"> </text>
         <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
       </box>
     </box>
@@ -283,6 +458,7 @@ export function V2QuizDialog(props: {
 function V2QuizBatchDialog(props: {
   request: QuizBatchPending
   theme: Record<string, any>
+  pendingDir: string
   onSubmit: (result: { results: Array<QuizResult & { correct: boolean }> }) => void
   onCancel: () => void
 }) {
@@ -294,7 +470,11 @@ function V2QuizBatchDialog(props: {
   let qIdx = 0
   let cursorIdx = 0
   let selectedSet = new Set<number>()
-  let phaseStr: "select" | "feedback" = "select"
+  let phaseStr: "select" | "classifying" | "feedback" = "select"
+  let noteStr = ""
+  let noteReason = ""
+  let focusTarget: "options" | "note" = "options"
+  let pollCancel: (() => void) | null = null
   let fb: { correct: boolean; selectedIndices: number[]; dontKnow: boolean } | null = null
   let pendingRes: QuizResult | null = null
   let scrollOff = 0
@@ -316,6 +496,11 @@ function V2QuizBatchDialog(props: {
   let correctText: any = null
   let explanationText: any = null
   let scrollCueText: any = null
+  let noteBox: any = null
+  let noteTextEl: any = null
+  let footerText: any = null
+  let classifyBox: any = null
+  let noteTextFb: any = null
 
   const cur = () => quizzes[qIdx]!
   const curMulti = () => !!cur().multiSelect
@@ -378,6 +563,10 @@ function V2QuizBatchDialog(props: {
       reviewTexts[i].bg = style.bg
     }
     if (correctText) correctText.content = `Correct: ${q.correctIndices.map((n) => `${n}. ${q.options[n - 1]?.label || "—"}`).join(", ") || "—"}`
+    if (noteTextFb) {
+      const shown = noteStr.trim() + (noteReason ? ` — ${noteReason}` : "")
+      noteTextFb.content = shown ? `Your note: ${shown}` : " "
+    }
     paintScroll()
   }
   const paintHeader = () => {
@@ -393,6 +582,59 @@ function V2QuizBatchDialog(props: {
     if (headerTitle) headerTitle.content = title
     if (quizPos) quizPos.content = `Q ${qIdx + 1}/${quizzes.length}`
   }
+  const paintNoteBatch = () => {
+    const focusedNote = focusTarget === "note" && phaseStr === "select"
+    if (noteBox) noteBox.borderColor = focusedNote ? props.theme.accent : props.theme.textMuted
+    if (noteTextEl) {
+      noteTextEl.content = noteStr ? noteStr + (focusedNote ? "▌" : "") : (focusedNote ? "▌Tab to type · share what you were thinking" : "Tab to type · share what you were thinking")
+      noteTextEl.fg = noteStr ? props.theme.text : props.theme.textMuted
+    }
+    if (footerText) footerText.content = focusedNote
+      ? "Type · Enter classify with AI · Tab/Esc back to options"
+      : "UP/DOWN move  ENTER review  TAB note  ESC cancel"
+  }
+  const showFeedbackBatch = () => {
+    scrollOff = 0
+    phaseStr = "feedback"
+    paintHeader()
+    paintReview()
+    if (selectBox) selectBox.visible = false
+    if (feedbackBox) feedbackBox.visible = true
+  }
+  const startClassifyBatch = () => {
+    const note = noteStr.trim()
+    const q = cur()
+    if (!note || phaseStr !== "select") return
+    if (pollCancel) { try { pollCancel() } catch {} pollCancel = null }
+    phaseStr = "classifying"
+    if (classifyBox) classifyBox.visible = true
+    paintNoteBatch()
+    const opts = q.options.map((o, i) => ({ label: o.label, value: o.value ?? o.label, index: i + 1 }))
+    const cid = `${props.request.id}-${qIdx}`
+    pollCancel = startClassifyRequest(props.pendingDir, {
+      id: cid, note,
+      question: decodeQuizText(q.question),
+      options: opts, multiSelect: curMulti(), sessionID: props.request.sessionID,
+    }, "V2QuizBatchDialog", (data) => {
+      pollCancel = null
+      if (closed) return
+      if (!data) tlog("V2QuizBatchDialog classify timeout", cid)
+      const r = applyClassifyResult({ multi: curMulti(), correctIndices: q.correctIndices, options: opts }, data)
+      noteReason = r.reason || ""
+      pendingRes = {
+        answers: r.selectedIndices.map((n) => {
+          const o = q.options[n - 1]!
+          return { label: o.label, value: o.value ?? o.label, index: n }
+        }),
+        dontKnow: r.dontKnow, note: note || undefined,
+      } as QuizResult
+      fb = { correct: r.correct, selectedIndices: r.selectedIndices, dontKnow: r.dontKnow }
+      if (classifyBox) classifyBox.visible = false
+      showFeedbackBatch()
+    })
+  }
+  const stopBatchPoll = () => { if (pollCancel) { try { pollCancel() } catch {} pollCancel = null } }
+  onCleanup(() => { try { pollCancel?.() } catch {} })
   const loadQuiz = (i: number) => {
     qIdx = i
     cursorIdx = 0
@@ -401,6 +643,10 @@ function V2QuizBatchDialog(props: {
     fb = null
     pendingRes = null
     scrollOff = 0
+    noteStr = ""
+    noteReason = ""
+    focusTarget = "options"
+    stopBatchPoll()
     const q = cur()
     explLines = wrapQuizLines(decodeQuizText(q.explanation).trim() || "No explanation provided.")
     maxScroll = Math.max(0, explLines.length - visibleCount)
@@ -408,6 +654,8 @@ function V2QuizBatchDialog(props: {
     if (detailsText) detailsText.content = q.details ? decodeQuizText(q.details).trim() || "Choose the best answer." : "Choose the best answer."
     paintHeader()
     paintRows()
+    paintNoteBatch()
+    if (classifyBox) classifyBox.visible = false
     if (selectBox) selectBox.visible = true
     if (feedbackBox) feedbackBox.visible = false
   }
@@ -415,11 +663,14 @@ function V2QuizBatchDialog(props: {
     if (phaseStr !== "select") return
     const q = cur()
     if (cursorIdx === q.options.length) {
-      pendingRes = { answers: [], dontKnow: true }
+      pendingRes = { answers: [], dontKnow: true, note: noteStr.trim() || undefined } as QuizResult
       fb = { correct: false, selectedIndices: [], dontKnow: true }
     } else {
       const indices = curMulti() ? [...selectedSet] : [cursorIdx]
-      if (curMulti() && indices.length === 0) return
+      if (curMulti() && indices.length === 0) {
+        if (noteStr.trim()) { startClassifyBatch(); return }
+        return
+      }
       const answers = indices.map((n) => {
         const option = q.options[n]!
         return { label: option.label, value: option.value ?? option.label, index: n + 1 }
@@ -428,7 +679,7 @@ function V2QuizBatchDialog(props: {
       const correct = selectedIndices.length === q.correctIndices.length &&
         selectedIndices.every((n) => curCorrect().has(n)) &&
         q.correctIndices.every((n) => selectedIndices.includes(n))
-      pendingRes = { answers, dontKnow: false }
+      pendingRes = { answers, dontKnow: false, note: noteStr.trim() || undefined } as QuizResult
       fb = { correct, selectedIndices, dontKnow: false }
     }
     scrollOff = 0
@@ -447,7 +698,7 @@ function V2QuizBatchDialog(props: {
     // Terminal submit only: non-terminal confirms loadQuiz() into the next
     // question and must keep the keys. Detach here so chat works even if the
     // host never unmounts the dialog after clear().
-    if (qIdx + 1 >= quizzes.length) { closed = true; try { detachKeys() } catch {}; props.onSubmit({ results }) }
+    if (qIdx + 1 >= quizzes.length) { closed = true; try { detachKeys() } catch {}; stopBatchPoll(); props.onSubmit({ results }) }
     else loadQuiz(qIdx + 1)
   }
   const scrollBy = (delta: number) => {
@@ -459,7 +710,7 @@ function V2QuizBatchDialog(props: {
   // released at dialog end, not at host unmount.
   let closed = false
   let detachKeys: () => void = () => {}
-  const finishCancel = () => { if (closed) return; closed = true; try { detachKeys() } catch {}; props.onCancel() }
+  const finishCancel = () => { if (closed) return; closed = true; try { detachKeys() } catch {}; stopBatchPoll(); props.onCancel() }
   detachKeys = useDialogKeyboard((event: any) => {
     if (closed) return
     const key = String(event.name || event.sequence || "").toLowerCase()
@@ -473,6 +724,26 @@ function V2QuizBatchDialog(props: {
       if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
       return
     }
+    if (phaseStr === "classifying") { prevent(event); return }
+    if (focusTarget === "note") {
+      if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "options"; paintNoteBatch(); return }
+      if (key === "escape" || key === "esc") { prevent(event); focusTarget = "options"; paintNoteBatch(); return }
+      if ((key === "enter" || key === "return" || seq === "\r") && (event.ctrl || event.meta)) { prevent(event); focusTarget = "options"; paintNoteBatch(); return }
+      if (key === "enter" || key === "return" || seq === "\r") {
+        prevent(event)
+        if (noteStr.trim()) startClassifyBatch()
+        else { focusTarget = "options"; paintNoteBatch() }
+        return
+      }
+      if (key === "backspace" || seq === "\x7f" || seq === "\b") { prevent(event); noteStr = noteStr.slice(0, -1); paintNoteBatch(); return }
+      if (!event.ctrl && !event.meta && seq.length === 1 && seq >= " ") {
+        prevent(event)
+        if (noteStr.length < 240) { noteStr += seq; paintNoteBatch() }
+        return
+      }
+      return
+    }
+    if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "note"; paintNoteBatch(); return }
     if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); cursorIdx = Math.max(0, cursorIdx - 1); paintRows(); return }
     if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); cursorIdx = Math.min(rowCount() - 1, cursorIdx + 1); paintRows(); return }
     if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
@@ -511,7 +782,14 @@ function V2QuizBatchDialog(props: {
             </box>
           )
         })}
-        <text fg={props.theme.textMuted}>UP/DOWN move  SPACE toggle  ENTER review  ESC cancel</text>
+        <box ref={(element: any) => noteBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} paddingLeft={1} paddingRight={1}>
+          <text fg={props.theme.textMuted} bold>✎ Note (optional)</text>
+          <text ref={(element: any) => noteTextEl = element} fg={props.theme.textMuted} wrapMode="wrap">Tab to type · share what you were thinking</text>
+        </box>
+        <box ref={(element: any) => { classifyBox = element; if (element) element.visible = false }} flexDirection="column" backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}>
+          <text fg={props.theme.background} bold>Classifying your note with AI…</text>
+        </box>
+        <text ref={(element: any) => footerText = element} fg={props.theme.textMuted}>UP/DOWN move  ENTER review  TAB note  ESC cancel</text>
       </box>
       <box ref={(element: any) => { feedbackBox = element; if (element) element.visible = false }} flexDirection="column" gap={1}>
         <box ref={(element: any) => reviewBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.accent} backgroundColor={props.theme.background} padding={1}>
@@ -525,6 +803,7 @@ function V2QuizBatchDialog(props: {
           <text ref={(element: any) => explanationText = element} fg={props.theme.text} wrapMode="wrap">{explLines.slice(0, visibleCount).join("\n") || " "}</text>
           <box backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}><text ref={(element: any) => scrollCueText = element} fg={props.theme.background} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text></box>
         </box>
+        <text ref={(element: any) => noteTextFb = element} fg={props.theme.textMuted} wrapMode="wrap"> </text>
         <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
       </box>
     </box>
@@ -736,8 +1015,8 @@ export const setup: TuiV2.Definition["setup"] = async (ctx) => {
     tlog("v2 palette", ["accent", "text", "textMuted", "background", "backgroundPanel", "backgroundElement", "success", "warning", "error"].map((k) => `${k}=${String((v2Theme as any)[k])}`).join(" "))
   } catch {}
   await runPendingLoop(facade as never, {
-    quiz: (request, onSubmit, onCancel) => <V2QuizDialog request={request} theme={v2Theme} onSubmit={onSubmit} onCancel={onCancel} />,
-    batch: (request, onSubmit, onCancel) => <V2QuizBatchDialog request={request} theme={v2Theme} onSubmit={onSubmit} onCancel={onCancel} />,
+    quiz: (request, dir, onSubmit, onCancel) => <V2QuizDialog request={request} theme={v2Theme} pendingDir={dir} onSubmit={onSubmit} onCancel={onCancel} />,
+    batch: (request, dir, onSubmit, onCancel) => <V2QuizBatchDialog request={request} theme={v2Theme} pendingDir={dir} onSubmit={onSubmit} onCancel={onCancel} />,
   })
   return () => {
     closeDialog()
