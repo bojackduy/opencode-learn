@@ -76,6 +76,27 @@ describe("adaptThemeV2", () => {
     const t = adaptThemeV2(nestedTheme as any, "dark")
     expect(t.backgroundElement).not.toBe(t.backgroundPanel)
   })
+
+  test("equal string panel/element get nudged apart (hover guarantee)", () => {
+    const flat = { background: { base: "#1e1e2e", raised: { base: "#313244", high: "#313244" } } }
+    const t = adaptThemeV2(flat as any, "dark")
+    expect(t.backgroundPanel).toBe("#313244")
+    expect(t.backgroundElement).not.toBe("#313244")
+    expect(t.backgroundElement).toMatch(/^#[0-9a-f]{6}$/)
+  })
+
+  test("equal RGBA panel/element use the theme increase ramp", () => {
+    const panel = { r: 0.1, g: 0.1, b: 0.2 }
+    const bumped = { r: 0.3, g: 0.3, b: 0.4 }
+    let got: any = null
+    const theme = {
+      background: { base: "#000000", raised: { base: panel, high: panel } },
+      increase: (c: any, n: number) => { got = [c, n]; return bumped },
+    }
+    const t = adaptThemeV2(theme as any, "dark")
+    expect(got[0]).toBe(panel)
+    expect(t.backgroundElement).toBe(bumped)
+  })
 })
 
 describe("v2VerdictStyle", () => {

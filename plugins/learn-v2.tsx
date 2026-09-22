@@ -824,7 +824,7 @@ function V2QuizBatchDialog(props: {
 // background:{base|raised|...}, border:{base}, diff/syntax/markdown subtrees.
 // Leaves are hex strings or RGBA instances (live) / {buffer:{0,1,2}} (JSON),
 // sometimes wrapped in {light,dark} pairs or {100..900} ramps.
-export function adaptThemeV2(theme: TuiV2.Context["theme"], _mode?: string): Record<string, any> {
+export function adaptThemeV2(theme: TuiV2.Context["theme"], mode?: string): Record<string, any> {
   const source = (theme ?? {}) as any
   const t = typeof source.surface === "function" ? source.surface("dialog") : source
   const textObj: any = t.text ?? {}
@@ -843,12 +843,41 @@ export function adaptThemeV2(theme: TuiV2.Context["theme"], _mode?: string): Rec
   const panelBg = value(bgDefault, t.backgroundPanel, bgObj.raised?.base)
   let elementBg = value(bgDefault, t.backgroundElement, primaryBg, bgObj.raised?.high)
   // A focused row whose background equals the panel is invisible (only the
-  // ">" marker moves). Nudge via the theme's own ramp when possible.
+  // ">" marker moves) — the missing "hover" effect. Guarantee contrast:
+  // theme ramp first, manual hex shift as fallback for plain-string themes.
+  const sameColor = (a: any, b: any) => {
+    if (a === b) return true
+    try {
+      if (typeof a === "string" && typeof b === "string") return a.toLowerCase() === b.toLowerCase()
+      const sa = String(a), sb = String(b)
+      if (sa && sb && sa === sb && sa !== "[object Object]") return true
+    } catch {}
+    return false
+  }
+  const shiftHex = (hex: string, amt: number): string | undefined => {
+    try {
+      let h = String(hex).replace("#", "")
+      if (h.length === 3) h = h.split("").map((c) => c + c).join("")
+      if (!/^[0-9a-fA-F]{6}$/.test(h)) return undefined
+      const n = parseInt(h, 16)
+      const t = amt > 0 ? 255 : 0
+      const f = Math.min(0.5, Math.abs(amt) * 0.12)
+      const ch = (v: number) => Math.round(v + (t - v) * f)
+      const hh = (x: number) => Math.max(0, Math.min(255, x)).toString(16).padStart(2, "0")
+      return `#${hh(ch((n >> 16) & 255))}${hh(ch((n >> 8) & 255))}${hh(ch(n & 255))}`
+    } catch { return undefined }
+  }
   try {
-    const inc = (source as any).increase
-    const rgbaLike = (v: any) => v && typeof v === "object" && (typeof (v as any).r === "number" || (v as any).buffer)
-    if (elementBg === panelBg && typeof inc === "function" && rgbaLike(panelBg)) {
-      elementBg = inc(panelBg, 2) ?? elementBg
+    if (sameColor(elementBg, panelBg)) {
+      const dir = mode === "light" ? -2 : 2
+      const inc = (source as any).increase
+      const rgbaLike = (v: any) => v && typeof v === "object" && (typeof (v as any).r === "number" || (v as any).buffer)
+      let nudged: any
+      try { if (typeof inc === "function" && rgbaLike(panelBg)) nudged = inc(panelBg, dir) } catch {}
+      if ((!nudged || sameColor(nudged, panelBg)) && typeof panelBg === "string") {
+        nudged = shiftHex(panelBg, dir)
+      }
+      if (nudged && !sameColor(nudged, panelBg)) elementBg = nudged
     }
   } catch {}
   return {
