@@ -25,6 +25,18 @@ function useDialogKeyboard(callback: (event: any) => void) {
   onCleanup(detach)
   return detach
 }
+// Verdict fills mirror the v1 dialogs: a saturated full-row background with
+// the base background color as text. Glyph-only coloring is what made v2
+// look washed out next to v1.
+export type V2VerdictKind = "hit" | "miss" | "unseen" | "plain"
+export function v2VerdictStyle(theme: Record<string, any>, kind: V2VerdictKind): { fg: any; bg: any } {
+  switch (kind) {
+    case "hit": return { fg: theme.background, bg: theme.success }
+    case "miss": return { fg: theme.background, bg: theme.error }
+    case "unseen": return { fg: theme.background, bg: theme.warning }
+    default: return { fg: theme.textMuted, bg: undefined }
+  }
+}
 function wrapQuizLines(s: string, width = 76): string[] {
   const out: string[] = []
   for (const para of String(s ?? "").split("\n")) {
@@ -84,7 +96,11 @@ export function V2QuizDialog(props: {
     const option = allRows[index]!
     const focused = cursorIdx === index
     const checked = index < props.request.options.length && selectedSet.has(index)
-    return `${focused ? ">" : " "} ${multi && index < props.request.options.length ? (checked ? "[x]" : "[ ]") : `${index + 1}.`} ${option.label}`
+    const glyph = multi && index < props.request.options.length
+      ? (checked ? "[x]" : "[ ]")
+      : index < props.request.options.length ? "○" : "□"
+    const num = index < props.request.options.length ? `${index + 1}. ` : ""
+    return `${focused ? ">" : " "} ${glyph} ${num}${option.label}`
   }
   const paintRows = () => {
     allRows.forEach((_option, index) => {
@@ -113,14 +129,15 @@ export function V2QuizDialog(props: {
     const isSelected = fb?.selectedIndices.includes(idx) ?? false
     const isCorrect = correctSet.has(idx)
     let marker = " "
-    let color = props.theme.textMuted
+    let kind: V2VerdictKind = "plain"
     if (fb?.dontKnow) {
       marker = isCorrect ? "✓" : " "
-      color = isCorrect ? props.theme.success : props.theme.textMuted
-    } else if (isSelected && isCorrect) { marker = "✓"; color = props.theme.success }
-    else if (isSelected && !isCorrect) { marker = "✗"; color = props.theme.error }
-    else if (!isSelected && isCorrect) { marker = "○"; color = props.theme.warning }
-    return { text: `${marker} ${idx}. ${opt.label || "—"}`, color }
+      kind = isCorrect ? "hit" : "plain"
+    } else if (isSelected && isCorrect) { marker = "✓"; kind = "hit" }
+    else if (isSelected && !isCorrect) { marker = "✗"; kind = "miss" }
+    else if (!isSelected && isCorrect) { marker = "○"; kind = "unseen" }
+    const style = v2VerdictStyle(props.theme, kind)
+    return { text: `${marker} ${idx}. ${opt.label || "—"}`, color: style.fg, bg: style.bg }
   }
   const paintReview = () => {
     props.request.options.forEach((_opt, i) => {
@@ -128,6 +145,7 @@ export function V2QuizDialog(props: {
       if (reviewTexts[i]) {
         reviewTexts[i].content = line.text
         reviewTexts[i].fg = line.color
+        reviewTexts[i].bg = line.bg
       }
     })
     if (correctText) correctText.content = `Correct: ${props.request.correctIndices.map((n) => `${n}. ${props.request.options[n - 1]?.label || "—"}`).join(", ") || "—"}`
@@ -239,7 +257,7 @@ export function V2QuizDialog(props: {
       <box ref={(element: any) => selectBox = element} flexDirection="column" gap={0}>
         {allRows.map((option, index) => (
           <box ref={(element: any) => rowBoxes[index] = element} backgroundColor={index === 0 ? props.theme.backgroundElement : props.theme.backgroundPanel} paddingLeft={1} paddingRight={1}>
-            <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${multi && index < props.request.options.length ? "[ ]" : `${index + 1}.`} ${option.label}`}</text>
+            <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${multi && index < props.request.options.length ? "[ ]" : index < props.request.options.length ? `○ ${index + 1}.` : "□"} ${option.label}`}</text>
           </box>
         ))}
         <text fg={props.theme.textMuted}>{multi ? "UP/DOWN move  SPACE toggle  ENTER review  ESC cancel" : "UP/DOWN move  ENTER review  ESC cancel"}</text>
@@ -254,7 +272,7 @@ export function V2QuizDialog(props: {
         <box flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} backgroundColor={props.theme.backgroundPanel} padding={1}>
           <text fg={props.theme.textMuted} bold>EXPLANATION</text>
           <text ref={(element: any) => explanationText = element} fg={props.theme.text} wrapMode="wrap">{explLines.slice(0, visibleCount).join("\n") || " "}</text>
-          <text ref={(element: any) => scrollCueText = element} fg={props.theme.warning} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text>
+          <box backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}><text ref={(element: any) => scrollCueText = element} fg={props.theme.background} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text></box>
         </box>
         <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
       </box>
@@ -309,7 +327,11 @@ function V2QuizBatchDialog(props: {
     const label = index < q.options.length ? q.options[index]!.label : "I don't know"
     const focused = cursorIdx === index
     const checked = index < q.options.length && selectedSet.has(index)
-    return `${focused ? ">" : " "} ${curMulti() && index < q.options.length ? (checked ? "[x]" : "[ ]") : `${index + 1}.`} ${label}`
+    const glyph = curMulti() && index < q.options.length
+      ? (checked ? "[x]" : "[ ]")
+      : index < q.options.length ? "○" : "□"
+    const num = index < q.options.length ? `${index + 1}. ` : ""
+    return `${focused ? ">" : " "} ${glyph} ${num}${label}`
   }
   const paintRows = () => {
     for (let index = 0; index <= maxOpts; index++) {
@@ -345,13 +367,15 @@ function V2QuizBatchDialog(props: {
       const isSelected = fb?.selectedIndices.includes(idx) ?? false
       const isCorrect = curCorrect().has(idx)
       let marker = " "
-      let color = props.theme.textMuted
-      if (fb?.dontKnow) { marker = isCorrect ? "✓" : " "; color = isCorrect ? props.theme.success : props.theme.textMuted }
-      else if (isSelected && isCorrect) { marker = "✓"; color = props.theme.success }
-      else if (isSelected && !isCorrect) { marker = "✗"; color = props.theme.error }
-      else if (!isSelected && isCorrect) { marker = "○"; color = props.theme.warning }
+      let kind: V2VerdictKind = "plain"
+      if (fb?.dontKnow) { marker = isCorrect ? "✓" : " "; kind = isCorrect ? "hit" : "plain" }
+      else if (isSelected && isCorrect) { marker = "✓"; kind = "hit" }
+      else if (isSelected && !isCorrect) { marker = "✗"; kind = "miss" }
+      else if (!isSelected && isCorrect) { marker = "○"; kind = "unseen" }
+      const style = v2VerdictStyle(props.theme, kind)
       reviewTexts[i].content = `${marker} ${idx}. ${q.options[i]!.label || "—"}`
-      reviewTexts[i].fg = color
+      reviewTexts[i].fg = style.fg
+      reviewTexts[i].bg = style.bg
     }
     if (correctText) correctText.content = `Correct: ${q.correctIndices.map((n) => `${n}. ${q.options[n - 1]?.label || "—"}`).join(", ") || "—"}`
     paintScroll()
@@ -483,7 +507,7 @@ function V2QuizBatchDialog(props: {
           const label = index < first.options.length ? first.options[index]!.label : "I don't know"
           return (
             <box ref={(element: any) => { rowBoxes[index] = element; if (element && !live) element.visible = false }} backgroundColor={index === 0 ? props.theme.backgroundElement : props.theme.backgroundPanel} paddingLeft={1} paddingRight={1}>
-              <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${first.multiSelect && index < first.options.length ? "[ ]" : `${index + 1}.`} ${label}`}</text>
+              <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${first.multiSelect && index < first.options.length ? "[ ]" : index < first.options.length ? `○ ${index + 1}.` : "□"} ${label}`}</text>
             </box>
           )
         })}
@@ -499,7 +523,7 @@ function V2QuizBatchDialog(props: {
         <box flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} backgroundColor={props.theme.backgroundPanel} padding={1}>
           <text fg={props.theme.textMuted} bold>EXPLANATION</text>
           <text ref={(element: any) => explanationText = element} fg={props.theme.text} wrapMode="wrap">{explLines.slice(0, visibleCount).join("\n") || " "}</text>
-          <text ref={(element: any) => scrollCueText = element} fg={props.theme.warning} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text>
+          <box backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}><text ref={(element: any) => scrollCueText = element} fg={props.theme.background} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text></box>
         </box>
         <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
       </box>
@@ -537,6 +561,17 @@ export function adaptThemeV2(theme: TuiV2.Context["theme"], _mode?: string): Rec
   const bgDefault = value("#000000", typeof t.background === "string" ? t.background : undefined, bgObj.base)
   const primaryText = textObj.action?.primary?.base
   const primaryBg = bgObj.action?.primary?.base
+  const panelBg = value(bgDefault, t.backgroundPanel, bgObj.raised?.base)
+  let elementBg = value(bgDefault, t.backgroundElement, primaryBg, bgObj.raised?.high)
+  // A focused row whose background equals the panel is invisible (only the
+  // ">" marker moves). Nudge via the theme's own ramp when possible.
+  try {
+    const inc = (source as any).increase
+    const rgbaLike = (v: any) => v && typeof v === "object" && (typeof (v as any).r === "number" || (v as any).buffer)
+    if (elementBg === panelBg && typeof inc === "function" && rgbaLike(panelBg)) {
+      elementBg = inc(panelBg, 2) ?? elementBg
+    }
+  } catch {}
   return {
     text: base,
     textMuted: muted,
@@ -547,8 +582,8 @@ export function adaptThemeV2(theme: TuiV2.Context["theme"], _mode?: string): Rec
     error: value("#ef4444", t.error, fb.error?.base, bgFb.error?.base),
     info: value(base, t.info, fb.info?.base, bgFb.info?.base),
     background: bgDefault,
-    backgroundPanel: value(bgDefault, t.backgroundPanel, bgObj.raised?.base),
-    backgroundElement: value(bgDefault, t.backgroundElement, primaryBg, bgObj.raised?.high),
+    backgroundPanel: panelBg,
+    backgroundElement: elementBg,
     backgroundMenu: value(bgDefault, t.backgroundMenu, bgObj.raised?.high),
     border: value(muted, typeof t.border === "string" ? t.border : undefined, t.border?.base),
     borderActive: value(base, t.borderActive, primaryText, t.accent),
@@ -695,6 +730,11 @@ export const setup: TuiV2.Definition["setup"] = async (ctx) => {
     },
   }
   const v2Theme = adaptThemeV2(ctx.theme, ctx.themeMode)
+  // One-line palette diagnostic: settles "which token is washed out" with
+  // data instead of guesses. Logged once per setup.
+  try {
+    tlog("v2 palette", ["accent", "text", "textMuted", "background", "backgroundPanel", "backgroundElement", "success", "warning", "error"].map((k) => `${k}=${String((v2Theme as any)[k])}`).join(" "))
+  } catch {}
   await runPendingLoop(facade as never, {
     quiz: (request, onSubmit, onCancel) => <V2QuizDialog request={request} theme={v2Theme} onSubmit={onSubmit} onCancel={onCancel} />,
     batch: (request, onSubmit, onCancel) => <V2QuizBatchDialog request={request} theme={v2Theme} onSubmit={onSubmit} onCancel={onCancel} />,

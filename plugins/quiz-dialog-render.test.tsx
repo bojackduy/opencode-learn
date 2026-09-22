@@ -86,7 +86,7 @@ describe("V2QuizDialog visual", () => {
         expect(frame).toContain("scarecrow")
         expect(frame).toContain("straw-tegy")
         expect(frame).toContain("outstanding in his field")
-        expect(frame).toContain("> 1. He bribed a crow")
+        expect(frame).toContain("> ○ 1. He bribed a crow")
         expect((setup.renderer as any).keyInput.listenerCount("keypress")).toBeGreaterThan(1)
 
         // Drive the same keypress emitter useKeyboard subscribes to. This is
@@ -109,8 +109,8 @@ describe("V2QuizDialog visual", () => {
         keyInput.emit("keypress", key("down"))
         await setup.renderOnce()
         const movedFrame = setup.captureCharFrame()
-        expect(movedFrame).toContain("> 2. He had excellent straw-tegy")
-        expect(movedFrame).not.toContain("> 1. He bribed a crow")
+        expect(movedFrame).toContain("> ○ 2. He had excellent straw-tegy")
+        expect(movedFrame).not.toContain("> ○ 1. He bribed a crow")
         expect(hostScrolls).toBe(0)
         const hostScrollsAfterSelect = hostScrolls
         expect(requestedFrames).toBeGreaterThan(0)

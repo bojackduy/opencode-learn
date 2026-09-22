@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { adaptThemeV2 } from "./learn-v2"
+import { adaptThemeV2, v2VerdictStyle } from "./learn-v2"
 
 // Mirrors the production v2 ResolvedTheme shape observed in learn-tui.log:
 // nested bags with the exact resolved action/raised/feedback token shape.
@@ -70,5 +70,22 @@ describe("adaptThemeV2", () => {
     expect(t.text).toBe("#ffffff")
     expect(t.background).toBe("#000000")
     expect(t.accent).toBe("#ffffff")
+  })
+
+  test("focus background stays distinct from panel", () => {
+    const t = adaptThemeV2(nestedTheme as any, "dark")
+    expect(t.backgroundElement).not.toBe(t.backgroundPanel)
+  })
+})
+
+describe("v2VerdictStyle", () => {
+  const theme = { background: "#1e1e2e", textMuted: "#6c7086", success: "#a6e3a1", error: "#f38ba8", warning: "#f9e2af" }
+  test("verdict rows get full fills with base text, like v1", () => {
+    expect(v2VerdictStyle(theme, "hit")).toEqual({ fg: "#1e1e2e", bg: "#a6e3a1" })
+    expect(v2VerdictStyle(theme, "miss")).toEqual({ fg: "#1e1e2e", bg: "#f38ba8" })
+    expect(v2VerdictStyle(theme, "unseen")).toEqual({ fg: "#1e1e2e", bg: "#f9e2af" })
+  })
+  test("plain rows stay unfilled", () => {
+    expect(v2VerdictStyle(theme, "plain")).toEqual({ fg: "#6c7086", bg: undefined })
   })
 })
