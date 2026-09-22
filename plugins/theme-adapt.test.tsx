@@ -41,14 +41,16 @@ describe("adaptThemeV2", () => {
     expect(t.textMuted).toBe("#6c7086")
     expect(t.background).toBe("#1e1e2e")
     expect(t.backgroundPanel).toBe("#313244")
-    expect(t.accent).toBe("#89b4fa")
+    expect(t.accent).toBe(nestedTheme.hue.accent)
     expect(t.success).toBe("#a6e3a1")
     expect(t.error).toBe("#f38ba8")
     expect(t.warning).toBe("#f9e2af")
     expect(t.border).toBe("#45475a")
     // Focused-row background must differ from the panel, or the cursor is invisible.
     expect(t.backgroundElement).not.toBe(t.backgroundPanel)
-    for (const v of Object.values(t)) expect(typeof v).toBe("string")
+    for (const [key, v] of Object.entries(t)) {
+      if (key !== "accent") expect(typeof v).toBe("string")
+    }
   })
 
   test("uses dialog surface and preserves RGBA objects", () => {
@@ -62,14 +64,16 @@ describe("adaptThemeV2", () => {
     const t = adaptThemeV2({ surface: (name: string) => { requested = name; return dialog } } as any, "dark")
     expect(requested).toBe("dialog")
     expect(t.background).toBe(defaultBackground)
-    expect(t.accent).toBe("#7aa2f7")
+    expect(t.accent).toBe("#8b5cf6")
+    expect(t.backgroundElement).toBe("#333")
   })
 
   test("empty theme falls back without crashing", () => {
     const t = adaptThemeV2({} as any, "dark")
     expect(t.text).toBe("#ffffff")
     expect(t.background).toBe("#000000")
-    expect(t.accent).toBe("#ffffff")
+    expect(t.accent).toBe("#8b5cf6")
+    expect(t.backgroundElement).toBe("#3f3f46")
   })
 
   test("focus background stays distinct from panel", () => {
@@ -83,6 +87,22 @@ describe("adaptThemeV2", () => {
     expect(t.backgroundPanel).toBe("#313244")
     expect(t.backgroundElement).not.toBe("#313244")
     expect(t.backgroundElement).toMatch(/^#[0-9a-f]{6}$/)
+  })
+
+  test("hue.accent as a shade ramp (not a leaf) resolves to a real color, not [object Object]", () => {
+    // Regression: real production theme.hue.accent is a ramp bag like
+    // {100..900}, each a leaf. Passing the bag itself as fg/backgroundColor
+    // crashed OpenTUI's color parser inside dialog.show()'s render callback,
+    // so the quiz popup never appeared at all.
+    const ramp = {
+      hue: {
+        accent: { "100": "#ede9fe", "500": "#8b5cf6", "900": "#4c1d95" },
+      },
+    }
+    const t = adaptThemeV2(ramp as any, "dark")
+    expect(t.accent).not.toBe(ramp.hue.accent)
+    expect(typeof t.accent).toBe("string")
+    expect(t.accent).toBe("#8b5cf6")
   })
 
   test("equal RGBA panel/element use the theme increase ramp", () => {

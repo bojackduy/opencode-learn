@@ -89,6 +89,23 @@ describe("V2QuizDialog visual", () => {
         expect(frame).toContain("> ○ 1. He bribed a crow")
         expect((setup.renderer as any).keyInput.listenerCount("keypress")).toBeGreaterThan(1)
 
+        // Pointer movement must move the same highlighted row as v1. v2 used
+        // to have no mouse handlers, so moving over an option did nothing.
+        const lines = frame.split("\n")
+        const row1Y = lines.findIndex((line) => line.includes("He bribed a crow"))
+        const row2Y = lines.findIndex((line) => line.includes("He had excellent straw-tegy"))
+        expect(row1Y).toBeGreaterThanOrEqual(0)
+        expect(row2Y).toBeGreaterThanOrEqual(0)
+        const row2BgBefore = setup.captureSpans().lines[row2Y]!.spans.find((span) => span.text.includes("straw-tegy"))!.bg
+        await setup.mockMouse.moveTo(lines[row2Y]!.indexOf("He had excellent straw-tegy"), row2Y)
+        await setup.renderOnce()
+        expect(setup.captureCharFrame()).toContain("> ○ 2. He had excellent straw-tegy")
+        const row2BgAfter = setup.captureSpans().lines[row2Y]!.spans.find((span) => span.text.includes("straw-tegy"))!.bg
+        expect(row2BgAfter).not.toEqual(row2BgBefore)
+        await setup.mockMouse.moveTo(lines[row1Y]!.indexOf("He bribed a crow"), row1Y)
+        await setup.renderOnce()
+        expect(setup.captureCharFrame()).toContain("> ○ 1. He bribed a crow")
+
         // Drive the same keypress emitter useKeyboard subscribes to. This is
         // deterministic across OpenTUI test-runtime versions.
         const keyInput = (setup.renderer as any).keyInput
@@ -111,6 +128,8 @@ describe("V2QuizDialog visual", () => {
         const movedFrame = setup.captureCharFrame()
         expect(movedFrame).toContain("> ○ 2. He had excellent straw-tegy")
         expect(movedFrame).not.toContain("> ○ 1. He bribed a crow")
+        const keyboardFocusBg = setup.captureSpans().lines[row2Y]!.spans.find((span) => span.text.includes("straw-tegy"))!.bg
+        expect(keyboardFocusBg).not.toEqual(row2BgBefore)
         expect(hostScrolls).toBe(0)
         const hostScrollsAfterSelect = hostScrolls
         expect(requestedFrames).toBeGreaterThan(0)

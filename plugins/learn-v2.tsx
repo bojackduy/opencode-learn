@@ -138,6 +138,7 @@ export function V2QuizDialog(props: {
   onSubmit: (result: QuizResult) => void
   onCancel: () => void
 }) {
+  const renderer = useRenderer()
   const multi = !!props.request.multiSelect
   const correctSet = new Set(props.request.correctIndices)
   const allRows = [...props.request.options, { label: "I don't know", value: "__dont_know__", index: props.request.options.length + 1 }]
@@ -190,9 +191,9 @@ export function V2QuizDialog(props: {
   const paintRows = () => {
     allRows.forEach((_option, index) => {
       const focused = cursorIdx === index
-      if (rowBoxes[index]) rowBoxes[index].backgroundColor = focused ? props.theme.backgroundElement : props.theme.backgroundPanel
+      if (rowBoxes[index]) rowBoxes[index].backgroundColor = focused ? props.theme.backgroundElement : undefined
       if (rowTexts[index]) {
-        rowTexts[index].fg = focused ? props.theme.accent : props.theme.text
+        rowTexts[index].fg = focused ? props.theme.accent : selectedSet.has(index) ? props.theme.text : props.theme.textMuted
         rowTexts[index].content = rowLabel(index)
       }
     })
@@ -410,6 +411,32 @@ export function V2QuizDialog(props: {
     if (key === "enter" || key === "return" || seq === "\r") { prevent(event); submitSelect() }
   })
 
+  const focusRow = (index: number) => {
+    if (phaseStr !== "select") return
+    focusTarget = "options"
+    cursorIdx = index
+    paintRows()
+    paintNote()
+    renderer.requestRender()
+  }
+  const activateRow = (index: number) => {
+    if (phaseStr !== "select") return
+    focusRow(index)
+    if (!multi || index === props.request.options.length) submitSelect()
+    else {
+      if (selectedSet.has(index)) selectedSet.delete(index)
+      else selectedSet.add(index)
+      paintRows()
+      renderer.requestRender()
+    }
+  }
+  const focusNote = () => {
+    if (phaseStr !== "select") return
+    focusTarget = "note"
+    paintNote()
+    renderer.requestRender()
+  }
+
   const questionText = decodeQuizText(props.request.question).trim() || "Quiz question"
   const detailsText = props.request.details ? decodeQuizText(props.request.details).trim() || "Choose the best answer." : "Choose the best answer."
 
@@ -423,11 +450,11 @@ export function V2QuizDialog(props: {
       <text fg={props.theme.textMuted} wrapMode="wrap">{detailsText}</text>
       <box ref={(element: any) => selectBox = element} flexDirection="column" gap={0}>
         {allRows.map((option, index) => (
-          <box ref={(element: any) => rowBoxes[index] = element} backgroundColor={index === 0 ? props.theme.backgroundElement : props.theme.backgroundPanel} paddingLeft={1} paddingRight={1}>
-            <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${multi && index < props.request.options.length ? "[ ]" : index < props.request.options.length ? `○ ${index + 1}.` : "□"} ${option.label}`}</text>
+          <box ref={(element: any) => rowBoxes[index] = element} backgroundColor={index === 0 ? props.theme.backgroundElement : undefined} paddingLeft={1} paddingRight={1} onMouseOver={() => focusRow(index)} onMouseMove={() => focusRow(index)} onMouseUp={() => activateRow(index)}>
+            <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.textMuted} bold={index === 0}>{`${index === 0 ? ">" : " "} ${multi && index < props.request.options.length ? "[ ]" : index < props.request.options.length ? `○ ${index + 1}.` : "□"} ${option.label}`}</text>
           </box>
         ))}
-        <box ref={(element: any) => noteBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} paddingLeft={1} paddingRight={1}>
+        <box ref={(element: any) => noteBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} paddingLeft={1} paddingRight={1} onMouseOver={focusNote} onMouseMove={focusNote} onMouseUp={focusNote}>
           <text fg={props.theme.textMuted} bold>✎ Note (optional)</text>
           <text ref={(element: any) => noteTextEl = element} fg={props.theme.textMuted} wrapMode="wrap">Tab to type · share what you were thinking</text>
         </box>
@@ -462,6 +489,7 @@ function V2QuizBatchDialog(props: {
   onSubmit: (result: { results: Array<QuizResult & { correct: boolean }> }) => void
   onCancel: () => void
 }) {
+  const renderer = useRenderer()
   const quizzes = props.request.quizzes
   const maxOpts = Math.max(...quizzes.map((q) => q.options.length))
   const visibleCount = 8
@@ -524,9 +552,9 @@ function V2QuizBatchDialog(props: {
       if (rowBoxes[index]) rowBoxes[index].visible = live
       if (!live) continue
       const focused = cursorIdx === index
-      if (rowBoxes[index]) rowBoxes[index].backgroundColor = focused ? props.theme.backgroundElement : props.theme.backgroundPanel
+      if (rowBoxes[index]) rowBoxes[index].backgroundColor = focused ? props.theme.backgroundElement : undefined
       if (rowTexts[index]) {
-        rowTexts[index].fg = focused ? props.theme.accent : props.theme.text
+        rowTexts[index].fg = focused ? props.theme.accent : selectedSet.has(index) ? props.theme.text : props.theme.textMuted
         rowTexts[index].content = rowLabel(index)
       }
     }
@@ -759,6 +787,32 @@ function V2QuizBatchDialog(props: {
     if (key === "enter" || key === "return" || seq === "\r") { prevent(event); submitSelect() }
   })
 
+  const focusRow = (index: number) => {
+    if (phaseStr !== "select" || index >= rowCount()) return
+    focusTarget = "options"
+    cursorIdx = index
+    paintRows()
+    paintNoteBatch()
+    renderer.requestRender()
+  }
+  const activateRow = (index: number) => {
+    if (phaseStr !== "select" || index >= rowCount()) return
+    focusRow(index)
+    if (!curMulti() || index === cur().options.length) submitSelect()
+    else {
+      if (selectedSet.has(index)) selectedSet.delete(index)
+      else selectedSet.add(index)
+      paintRows()
+      renderer.requestRender()
+    }
+  }
+  const focusNote = () => {
+    if (phaseStr !== "select") return
+    focusTarget = "note"
+    paintNoteBatch()
+    renderer.requestRender()
+  }
+
   const first = quizzes[0]!
   const firstRows: string[] = [...first.options.map((o) => o.label), "I don't know"]
   explLines = wrapQuizLines(decodeQuizText(first.explanation).trim() || "No explanation provided.")
@@ -777,12 +831,12 @@ function V2QuizBatchDialog(props: {
           const live = index < first.options.length + 1
           const label = index < first.options.length ? first.options[index]!.label : "I don't know"
           return (
-            <box ref={(element: any) => { rowBoxes[index] = element; if (element && !live) element.visible = false }} backgroundColor={index === 0 ? props.theme.backgroundElement : props.theme.backgroundPanel} paddingLeft={1} paddingRight={1}>
-              <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.text} bold={index === 0}>{`${index === 0 ? ">" : " "} ${first.multiSelect && index < first.options.length ? "[ ]" : index < first.options.length ? `○ ${index + 1}.` : "□"} ${label}`}</text>
+            <box ref={(element: any) => { rowBoxes[index] = element; if (element && !live) element.visible = false }} backgroundColor={index === 0 ? props.theme.backgroundElement : undefined} paddingLeft={1} paddingRight={1} onMouseOver={() => focusRow(index)} onMouseMove={() => focusRow(index)} onMouseUp={() => activateRow(index)}>
+              <text ref={(element: any) => rowTexts[index] = element} fg={index === 0 ? props.theme.accent : props.theme.textMuted} bold={index === 0}>{`${index === 0 ? ">" : " "} ${first.multiSelect && index < first.options.length ? "[ ]" : index < first.options.length ? `○ ${index + 1}.` : "□"} ${label}`}</text>
             </box>
           )
         })}
-        <box ref={(element: any) => noteBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} paddingLeft={1} paddingRight={1}>
+        <box ref={(element: any) => noteBox = element} flexDirection="column" gap={0} border={true} borderColor={props.theme.textMuted} paddingLeft={1} paddingRight={1} onMouseOver={focusNote} onMouseMove={focusNote} onMouseUp={focusNote}>
           <text fg={props.theme.textMuted} bold>✎ Note (optional)</text>
           <text ref={(element: any) => noteTextEl = element} fg={props.theme.textMuted} wrapMode="wrap">Tab to type · share what you were thinking</text>
         </box>
@@ -840,8 +894,33 @@ export function adaptThemeV2(theme: TuiV2.Context["theme"], mode?: string): Reco
   const bgDefault = value("#000000", typeof t.background === "string" ? t.background : undefined, bgObj.base)
   const primaryText = textObj.action?.primary?.base
   const primaryBg = bgObj.action?.primary?.base
+  // hue.<name> in the real v2 theme is a shade RAMP (e.g. {100..900}), not a
+  // single leaf like text.base. Passing that whole bag straight through as a
+  // ColorInput crashes OpenTUI's color parser inside dialog.show()'s render
+  // callback, so the popup never paints at all — not a color glitch, a hard
+  // "no popup" failure. Recurse to pull one real leaf out of the ramp.
+  const isColorLeaf = (v: any) => typeof v === "string" || (v && typeof v === "object" && (typeof (v as any).r === "number" || (v as any).buffer))
+  const colorLeaf = (v: any, depth = 0): any => {
+    if (isColorLeaf(v)) return v
+    if (!v || typeof v !== "object" || depth > 4) return undefined
+    for (const key of ["base", "DEFAULT", "default", "500", "600", "400", "300", "700", "200", "800", "900", "100"]) {
+      if (key in v) {
+        const leaf = colorLeaf((v as any)[key], depth + 1)
+        if (leaf !== undefined) return leaf
+      }
+    }
+    for (const key of Object.keys(v)) {
+      const leaf = colorLeaf((v as any)[key], depth + 1)
+      if (leaf !== undefined) return leaf
+    }
+    return undefined
+  }
+  const hueAccent = colorLeaf(t.hue?.accent ?? source.hue?.accent)
   const panelBg = value(bgDefault, t.backgroundPanel, bgObj.raised?.base)
-  let elementBg = value(bgDefault, t.backgroundElement, primaryBg, bgObj.raised?.high)
+  // Keyboard focus and mouse hover use this fill. Prefer the raised surface:
+  // background.action.primary can resolve to the terminal's transparent
+  // default, which moves the cursor marker without painting a visible row.
+  let elementBg = value(mode === "light" ? "#d4d4d8" : "#3f3f46", bgObj.raised?.high, t.backgroundElement, primaryBg)
   // A focused row whose background equals the panel is invisible (only the
   // ">" marker moves) — the missing "hover" effect. Guarantee contrast:
   // theme ramp first, manual hex shift as fallback for plain-string themes.
@@ -884,7 +963,9 @@ export function adaptThemeV2(theme: TuiV2.Context["theme"], mode?: string): Reco
     text: base,
     textMuted: muted,
     primary: value(base, t.primary, primaryText),
-    accent: value(base, t.accent, primaryText),
+    // `text.action.primary.base` is often the normal foreground (white), not
+    // the theme accent. v2 exposes the real accent under hue.accent.
+    accent: value("#8b5cf6", colorLeaf(t.accent), hueAccent),
     success: value("#22c55e", t.success, fb.success?.base, bgFb.success?.base),
     warning: value("#eab308", t.warning, fb.warning?.base, bgFb.warning?.base),
     error: value("#ef4444", t.error, fb.error?.base, bgFb.error?.base),

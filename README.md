@@ -36,7 +36,7 @@ Keywords: `opencode` `opencode-plugin` `learn` `teach` `quiz` `md-log` `obsidian
 | `extensions/visual-tools` `mermaid/svg` | `plugins/learn.ts:write_mermaid/edit/render` + `write_svg/edit/render` | `STAGING_ROOT=tmp/opencode-visual-tools`, `Chrome`+`mmdc` / `rsvg-convert`→`magick`, `viz/` publish |
 | `agents/researcher` `mermaid-maker` `svg-maker` | `agents/{researcher,mermaid-maker,svg-maker}.md` | `researcher` `safe_bash` → `bash:ask` in opencode; makers get `write_*`/`render_*` at **primary** (`* :allow`) per user choice |
 
-Plus `plugins/learn-tui.tsx` — modal TUI `QuizDialog`/`QuizBatchDialog` (4-state `hit/miss/false-alarm/correct-rejection` `success/error/warning` solid `bg` inverted, `0a/15` lighter, `○/✓/✗`), durable `pendingDir` `.opencode/learn-pending` `watch+poll 700ms` + `hb 2s` `.tui-alive`.
+Plus `plugins/learn-tui.tsx` — modal TUI `QuizDialog`/`QuizBatchDialog` (4-state `hit/miss/false-alarm/correct-rejection` `success/error/warning` solid `bg` inverted, `0a/15` lighter, `○/✓/✗`), durable `pendingDir` `.opencode/learn-pending` `watch+poll 700ms` + `hb 2s` `.tui-alive`. v1 + v2 hosts supported via per-host modules (`learn-v1`/`learn-v2`, lazy entry) with mouse/keyboard hover parity, theme-accent ramp handling, and free-text note → AI classify on both.
 
 ## Honour & reference
 
@@ -150,7 +150,7 @@ See `~/Code/opencode-loopd/{package.json,scripts/install-node.mjs,.github/workfl
 
 ## Requirements
 
-* [OpenCode](https://opencode.ai) `>=1.18` + `bun >=1.1`
+* [OpenCode](https://opencode.ai) v1 (`>=1.18`) **and** v2 — dual compatible (server + TUI: `learn-v1` for `.tui`, `learn-v2` for `.setup`) + `bun >=1.1`
 * `ask-user-question` not needed — native `question` used
 * Visual: `Chrome` (`/Applications/Google Chrome.app/...`) + `@mermaid-js/mermaid-cli` (bundled) or `rsvg-convert`/`magick` for SVG. `viz/` inside vault.
 
