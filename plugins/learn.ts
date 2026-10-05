@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin"
 import type { Plugin as V2Plugin } from "@opencode/plugin"
 import * as fs from "node:fs"
 import * as path from "node:path"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { spawn } from "node:child_process"
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -158,48 +158,267 @@ function getMdFile(sessionID: string | undefined): string | undefined {
   if (!sessionID) return undefined
   return mdLinks.get(sessionID)?.file
 }
-function appendToMdLogForSession(sessionID: string | undefined, text: string) {
+
+// ── Entry identity (content-aware idempotency) ───────────────────────────────
+// Every appended entry carries a machine-readable identity derived from the SOURCE
+// message/part id, so the guard is derivable from the file's own bytes and survives
+// a restart, a different worktree, or a lost in-memory watermark. The identity is
+// written as an HTML comment directly above the entry — invisible in Obsidian's
+// rendered view, machine-parseable on disk.
+const MD_MARKER_RE = /<!--\s*learn-md:([^\s]+)\s*-->/g
+function mdSanitizeId(id: string) { return id.replace(/[^A-Za-z0-9_.:#@/-]/g, "_") }
+function mdMarker(id: string) { return `<!-- learn-md:${mdSanitizeId(id)} -->` }
+function mdHash(s: string): string {
+  let h1 = 0x811c9dc5, h2 = 0x01000193
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0
+    h2 = Math.imul(h2 + c + i, 0x85ebca6b) >>> 0
+  }
+  return h1.toString(36) + h2.toString(36)
+}
+export function readMdEntryIds(text: string): Set<string> {
+  const out = new Set<string>()
+  MD_MARKER_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = MD_MARKER_RE.exec(text))) out.add(m[1]!)
+  return out
+}
+/**
+ * Map each identity marker to the body written under it (everything up to the next
+ * marker or EOF). A marker alone does NOT prove the entry survived: if the file was
+ * truncated mid-entry, the marker can outlive the text it introduced. Callers must
+ * verify the body too, or a gutted file looks complete.
+ */
+export function readMdEntryBodies(text: string): Map<string, string> {
+  const out = new Map<string, string>()
+  MD_MARKER_RE.lastIndex = 0
+  const marks: Array<{ id: string; start: number; end: number }> = []
+  let m: RegExpExecArray | null
+  while ((m = MD_MARKER_RE.exec(text))) marks.push({ id: m[1]!, start: m.index, end: m.index + m[0].length })
+  for (let i = 0; i < marks.length; i++) {
+    const bodyStart = marks[i]!.end
+    const bodyEnd = i + 1 < marks.length ? marks[i + 1]!.start : text.length
+    const body = text.slice(bodyStart, bodyEnd).trim()
+    const prev = out.get(marks[i]!.id)
+    // A duplicated marker (from an earlier repair) must not hide a surviving body.
+    if (prev === undefined || prev.length < body.length) out.set(marks[i]!.id, body)
+  }
+  return out
+}
+// Source-derived identity. `kind` separates the mirrored shapes; `source` is the
+// upstream message/part/tool-call id; `seq` disambiguates multiple callouts emitted
+// from one message (e.g. quiz_batch Q/A pairs). Deliberately NOT keyed on sessionID:
+// a file is 1-1-1 with one session, so source ids are already unique per file, and
+// keeping the id session-free means a re-link from another worktree (or a restart)
+// derives the exact same identity from the file's own bytes.
+export function mdEntryId(kind: string, source: string, seq = 0) {
+  return `${kind}:${source}#${seq}`
+}
+function countOccurrences(haystack: string, needle: string) {
+  if (needle.length === 0) return 0
+  let n = 0, i = haystack.indexOf(needle)
+  while (i !== -1) { n++; i = haystack.indexOf(needle, i + needle.length) }
+  return n
+}
+/**
+ * Append-only, idempotent write. An entry is skipped only when it is PROVABLY already
+ * in the file — either its identity marker is present with a matching body, or the same
+ * rendered text already occurs with multiplicity left over (legacy pre-marker files, and
+ * any identity mismatch between the live hook and backfill). A marker whose body was cut
+ * away does NOT count as present, so a truncated file is repaired rather than trusted.
+ * Never truncates or rewrites existing bytes — the user's notes are preserved verbatim.
+ * Returns how many entries were actually appended.
+ */
+function appendMdEntriesToFile(file: string, entries: Array<{ id?: string; text: string }>): number {
+  if (entries.length === 0) return 0
+  let current = ""
+  try { if (fs.existsSync(file)) current = fs.readFileSync(file, "utf-8") } catch {}
+  const bodies = readMdEntryBodies(current)
+  const emitted = new Set<string>()
+  const textBudget = new Map<string, number>()
+  const anonCount = new Map<string, number>()
+  const added: string[] = []
+  for (const entry of entries) {
+    const text = entry.text
+    const want = text.trim()
+    let id: string
+    if (entry.id) {
+      id = mdSanitizeId(entry.id)
+      // Present means marker AND body. A bare marker whose text was truncated away
+      // must be repaired, not treated as done.
+      const body = bodies.get(id)
+      if (body !== undefined && (body === want || body.includes(want))) continue
+      if (emitted.has(id)) continue
+    } else {
+      // No upstream id available (e.g. a tool-answer path without callID): fall back to an
+      // ordinal derived from the entry's own content. Ordinals restart at 0 on every run, so
+      // re-running produces the same ids and stays idempotent.
+      const h = mdHash(text)
+      const n = anonCount.get(h) ?? 0
+      anonCount.set(h, n + 1)
+      id = mdSanitizeId(`anon:${h}#${n}`)
+      const body = bodies.get(id)
+      if (body !== undefined && (body === want || body.includes(want))) continue
+      if (emitted.has(id)) continue
+    }
+    // Secondary content guard: identical rendered text already in the file means this entry
+    // is already mirrored. Counted with multiplicity so repeated content that genuinely
+    // occurs N times in history still gets N entries.
+    const left = textBudget.get(text) ?? countOccurrences(current, text)
+    if (left > 0) { textBudget.set(text, left - 1); continue }
+    emitted.add(id)
+    added.push(`${mdMarker(id)}\n${text}`)
+  }
+  if (added.length === 0) return 0
+  const prefix = current.trim().length > 0 ? "\n\n" : ""
+  fs.writeFileSync(file, current + prefix + added.join("\n\n") + "\n", "utf-8")
+  return added.length
+}
+function appendToMdLogForSession(sessionID: string | undefined, text: string, entryId?: string) {
   const file = getMdFile(sessionID)
   if (!file || !sessionID) return
-  try {
-    let current = ""
-    if (fs.existsSync(file)) current = fs.readFileSync(file, "utf-8")
-    const prefix = current.trim().length > 0 ? "\n\n" : ""
-    fs.writeFileSync(file, current + prefix + text + "\n", "utf-8")
-  } catch {}
+  try { appendMdEntriesToFile(file, [{ id: entryId, text }]) } catch {}
 }
-function loadMdLinks(markerPath: string, directory: string) {
+
+// ── Link store ───────────────────────────────────────────────────────────────
+// The 1-1-1 binding must be authoritative regardless of the directory opencode was
+// launched from, so links live in ONE canonical user-level store:
+//   ~/.opencode/learn-md-log.json   (override with LEARN_MD_LOG_STORE)
+// Legacy per-worktree stores (<directory>/.opencode/learn-md-log.json) are still
+// READ on load and merged into the canonical one; they are never deleted or moved.
+export const MD_LINK_STORE_ENV = "LEARN_MD_LOG_STORE"
+/** Optional extra legacy store paths to merge (path.delimiter separated). */
+export const MD_LINK_EXTRA_STORES_ENV = "LEARN_MD_LOG_EXTRA_STORES"
+export function canonicalMdLinkStorePath(): string {
+  const override = process.env[MD_LINK_STORE_ENV]
+  if (override && override.trim().length > 0) return path.resolve(override.trim())
+  return path.join(homedir(), ".opencode", "learn-md-log.json")
+}
+function legacyMdLinkStorePath(directory: string) { return path.join(directory, ".opencode", "learn-md-log.json") }
+function readMdStoreFile(storePath: string): Record<string, MdLinkMeta> | null {
   try {
-    if (!fs.existsSync(markerPath)) return 0
-    const data = JSON.parse(fs.readFileSync(markerPath, "utf-8"))
+    if (!fs.existsSync(storePath)) return null
+    const data = JSON.parse(fs.readFileSync(storePath, "utf-8"))
     // Legacy shape {file} — do NOT auto-migrate (would bleed). Back up and start empty.
     if (data && typeof data.file === "string" && !data.links) {
-      try { fs.writeFileSync(markerPath + ".bak", JSON.stringify(data), "utf-8") } catch {}
-      try { fs.writeFileSync(markerPath, JSON.stringify({ version: 1, links: {} }), "utf-8") } catch {}
-      try { slog("md-log legacy marker backed up, starting empty 1-1-1", markerPath) } catch {}
-      return 0
+      try { fs.writeFileSync(storePath + ".bak", JSON.stringify(data), "utf-8") } catch {}
+      try { fs.writeFileSync(storePath, JSON.stringify({ version: 1, links: {} }), "utf-8") } catch {}
+      try { slog("md-log legacy marker backed up, starting empty 1-1-1", storePath) } catch {}
+      return {}
     }
     const links = (data as any)?.links ?? {}
-    let n = 0
+    const out: Record<string, MdLinkMeta> = {}
     for (const [ses, v] of Object.entries<any>(links)) {
       const f = (v as any)?.file ?? (typeof v === "string" ? v : undefined)
-      if (typeof ses === "string" && typeof f === "string" && fs.existsSync(f)) {
-        mdLinks.set(ses, { file: f, directory: (v as any)?.directory || directory, linkedAt: (v as any)?.linkedAt || Date.now(), backfilledUntil: (v as any)?.backfilledUntil })
-        n++
+      if (typeof ses !== "string" || typeof f !== "string" || !fs.existsSync(f)) continue
+      out[ses] = {
+        file: f,
+        directory: (v as any)?.directory || "",
+        linkedAt: (v as any)?.linkedAt || Date.now(),
+        backfilledUntil: (v as any)?.backfilledUntil,
       }
     }
-    return n
-  } catch { return 0 }
+    return out
+  } catch { return null }
 }
-function saveMdLinksForDirectory(markerPath: string, directory: string) {
-  try {
-    const out: Record<string, { file: string; directory: string; linkedAt: number }> = {}
-    for (const [ses, meta] of mdLinks) {
-      if (meta.directory === directory) out[ses] = meta
+function mergeLinkMeta(a: MdLinkMeta, b: MdLinkMeta): MdLinkMeta {
+  // Prefer whichever record still points at a file that exists; on a tie keep the
+  // newer link and never discard a watermark the other record had.
+  const aOk = fs.existsSync(a.file)
+  const bOk = fs.existsSync(b.file)
+  const base = !aOk && bOk ? b : !bOk && aOk ? a : (b.linkedAt >= a.linkedAt ? b : a)
+  const wm = base.backfilledUntil ?? a.backfilledUntil ?? b.backfilledUntil
+  return { ...base, backfilledUntil: wm }
+}
+/**
+ * Load every discoverable store and merge them into mdLinks. The canonical store
+ * wins conflicts; legacy per-worktree stores fill in what it is missing. Returns
+ * the merged link count and whether any legacy link had to be migrated.
+ *
+ * Discoverable = the canonical store, this directory's legacy store, every directory
+ * recorded in the canonical store's `legacyStoreDirs` (so a worktree's old links stay
+ * reachable after it has been merged once), and any LEARN_MD_LOG_EXTRA_STORES entries.
+ */
+export function loadMdLinks(directory: string): { count: number; migrated: number } {
+  const canonical = canonicalMdLinkStorePath()
+  const stores = new Set<string>()
+  if (canonical) stores.add(canonical)
+  stores.add(legacyMdLinkStorePath(directory))
+  for (const dir of knownLegacyStoreDirs(canonical)) stores.add(legacyMdLinkStorePath(dir))
+  for (const p of (process.env[MD_LINK_EXTRA_STORES_ENV] ?? "").split(path.delimiter)) {
+    if (p.trim().length > 0) stores.add(path.resolve(p.trim()))
+  }
+  const merged: Record<string, MdLinkMeta> = {}
+  let count = 0
+  let migrated = 0
+  // Canonical first so its records take precedence, then any other discovered store.
+  const ordered = [...stores].sort((a, b) => (a === canonical ? -1 : b === canonical ? 1 : 0))
+  for (const storePath of ordered) {
+    const links = readMdStoreFile(storePath)
+    if (!links) continue
+    for (const [ses, meta] of Object.entries(links)) {
+      const withDir = { ...meta, directory: meta.directory || directory }
+      if (merged[ses]) {
+        merged[ses] = mergeLinkMeta(merged[ses]!, withDir)
+        if (storePath !== canonical) migrated++
+      } else {
+        merged[ses] = withDir
+        count++
+        if (storePath !== canonical) migrated++
+      }
     }
-    fs.mkdirSync(path.dirname(markerPath), { recursive: true })
-    fs.writeFileSync(markerPath, JSON.stringify({ version: 1, links: out }), "utf-8")
+  }
+  for (const [ses, meta] of Object.entries(merged)) mdLinks.set(ses, meta)
+  return { count, migrated }
+}
+/** Directories whose legacy stores have been merged into the canonical store. */
+function knownLegacyStoreDirs(canonical: string): string[] {
+  try {
+    if (!canonical || !fs.existsSync(canonical)) return []
+    const data = JSON.parse(fs.readFileSync(canonical, "utf-8"))
+    const dirs = (data as any)?.legacyStoreDirs
+    return Array.isArray(dirs) ? dirs.filter((d: unknown): d is string => typeof d === "string" && d.length > 0) : []
+  } catch { return [] }
+}
+/**
+ * Persist the FULL link set to the canonical store, so the 1-1-1 binding is shared by
+ * every worktree. This directory's legacy file is also refreshed with its own links so
+ * older versions of the plugin keep working, and the directory is recorded in
+ * `legacyStoreDirs` so its old store is re-merged on later launches. Legacy stores for
+ * OTHER directories are never deleted or moved.
+ */
+export function saveMdLinks(directory?: string) {
+  const all: Record<string, MdLinkMeta> = {}
+  for (const [ses, meta] of mdLinks) all[ses] = meta
+  const canonical = canonicalMdLinkStorePath()
+  try {
+    if (canonical) {
+      const dirs = new Set(knownLegacyStoreDirs(canonical))
+      for (const meta of Object.values(all)) if (meta.directory) dirs.add(meta.directory)
+      if (directory) dirs.add(directory)
+      fs.mkdirSync(path.dirname(canonical), { recursive: true })
+      fs.writeFileSync(canonical, JSON.stringify({ version: 2, links: all, legacyStoreDirs: [...dirs] }, null, 2), "utf-8")
+    }
   } catch {}
+  if (!directory) return
+  try {
+    const out: Record<string, MdLinkMeta> = {}
+    for (const [ses, meta] of mdLinks) if (meta.directory === directory) out[ses] = meta
+    const legacy = legacyMdLinkStorePath(directory)
+    if (path.resolve(legacy) === path.resolve(canonical)) return
+    fs.mkdirSync(path.dirname(legacy), { recursive: true })
+    fs.writeFileSync(legacy, JSON.stringify({ version: 1, links: out }, null, 2), "utf-8")
+  } catch {}
+}
+/** Test seam: drop in-memory link state so each case starts from a clean store. */
+export function __resetMdLogState() {
+  mdLinks.clear()
+  mdFileLocks.clear()
+}
+/** The set of store paths loadMdLinks() consults for `directory` (canonical + legacy). */
+export function mdLinkStorePaths(directory: string) {
+  return [canonicalMdLinkStorePath(), legacyMdLinkStorePath(directory)].filter(Boolean)
 }
 function extractHookSessionID(...candidates: any[]): string | undefined {
   for (const c of candidates) {
@@ -275,7 +494,7 @@ function answerCalloutAsk(details: any): string {
   if (body.length === 0) body.push("(no answer)")
   return callout("example", "Answer", body)
 }
-async function backfillMdLog(client: any, sessionID: string, directory: string, markerPath: string): Promise<number> {
+async function backfillMdLog(client: any, sessionID: string, directory: string): Promise<number> {
   const mdFile = getMdFile(sessionID)
   if (!mdFile || !sessionID) return 0
   const linkMeta = mdLinks.get(sessionID)
@@ -285,24 +504,28 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
     const data: any = res?.data ?? res
     const allEntries: any[] = Array.isArray(data) ? data : []
     if (!allEntries.length) return 0
-    // Idempotency: skip everything up to (and including) the last message already backfilled,
-    // so re-linking the same file (md_log called again) never re-dumps history already written.
-    let entries = allEntries
-    if (already) {
-      const idx = allEntries.findIndex((e) => e?.info?.id === already)
-      // If the watermark message can't be found (pruned/compacted history), bail out rather
-      // than risk re-appending everything — live hooks still capture new messages going forward.
-      if (idx < 0) return 0
-      entries = allEntries.slice(idx + 1)
-      if (!entries.length) return 0
-    }
-    const blocks: string[] = []
+    // Content-aware repair: walk the WHOLE history, tag every rendered block with its
+    // source-derived identity, and append only what the target file is missing.
+    //
+    // `backfilledUntil` is deliberately NOT used to slice history. A watermark records
+    // what was once written, not what is still in the file — if the file is truncated,
+    // gutted or hand-edited, slicing on it would permanently suppress the lost content.
+    // Skipping is instead decided per entry by the file's own bytes (see
+    // appendMdEntriesToFile), so a full walk costs one render pass and is always correct.
+    const entries = allEntries
+    const blocks: Array<{ id?: string; text: string }> = []
     let lastID: string | undefined = already
+    // Per-message sequence counter so multiple callouts from one message stay distinct
+    // and reproducible across runs.
+    let seq = 0
+    const push = (kind: string, source: string, text: string) => { blocks.push({ id: mdEntryId(kind, source, seq), text }); seq++ }
     for (const entry of entries) {
       const info: any = entry.info
       if (info?.id) lastID = info.id
       const parts: any[] = entry.parts ?? []
       if (!info || !info.role) continue
+      const msgID = String(info.id ?? "")
+      seq = 0
       if (info.role === "user") {
         const text = parts.filter((p: any) => p.type === "text").map((p: any) => p.text).join("\n").trim()
         const fallback = typeof info.content === "string" ? info.content : ""
@@ -311,10 +534,10 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
         if (!trimmed) continue
         // Skip system-injected quiz/batch answer prompts — they are mirrored as beautiful callouts via watchAndInject, not as plain user quotes
         if (/^\[(quiz|quiz_batch|question) (answered|cancelled)\]/i.test(trimmed) || trimmed.startsWith("[quiz answered]") || trimmed.startsWith("[quiz_batch answered]") || trimmed.startsWith("[question answered]")) continue
-        blocks.push(userBlock(trimmed))
+        push("u", msgID, userBlock(trimmed))
       } else if (info.role === "assistant") {
         const textParts = parts.filter((p: any) => p.type === "text" && !p.synthetic && !p.ignored).map((p: any) => (p.text || "").trim()).filter(Boolean)
-        if (textParts.length) blocks.push(assistantBlock(textParts.join("\n\n")))
+        if (textParts.length) push("a", msgID, assistantBlock(textParts.join("\n\n")))
         for (const p of parts) {
           if (p.type !== "tool") continue
           const toolName = p.tool
@@ -329,19 +552,19 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
               for (let i = 0; i < quizzes.length; i++) {
                 const qq = quizzes[i]
                 const label = `Quiz ${i + 1}/${quizzes.length}`
-                blocks.push(questionCallout(label, qq.question, qq.details?.trim() || undefined, qq.options ?? []))
+                push("q", msgID, questionCallout(label, qq.question, qq.details?.trim() || undefined, qq.options ?? []))
               }
             } else if (st.status === "completed") {
               for (let i = 0; i < quizzes.length; i++) {
                 const qq = quizzes[i]
                 const label = `Quiz ${i + 1}/${quizzes.length}`
-                blocks.push(questionCallout(label, qq.question, qq.details?.trim() || undefined, qq.options ?? []))
+                push("q", msgID, questionCallout(label, qq.question, qq.details?.trim() || undefined, qq.options ?? []))
                 // Try to get per-quiz answer from meta.results if available (live path via watchAndInject will have beautiful logs anyway)
                 const results: any[] = meta.results ?? []
                 const x = results[i] || {}
                 if (x && (x.answers || x.correct !== undefined)) {
                   const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note, why: x.why }
-                  blocks.push(answerCalloutQuiz(details))
+                  push("qa", msgID, answerCalloutQuiz(details))
                 }
               }
             }
@@ -352,15 +575,15 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
             if (st.status === "pending" || st.status === "running") {
               qs.forEach((q: any, i: number) => {
                 if (!q?.question) return
-                blocks.push(questionCallout(q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question"), q.question, undefined, q.options ?? []))
+                push("q", msgID, questionCallout(q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question"), q.question, undefined, q.options ?? []))
               })
             } else if (st.status === "completed") {
               qs.forEach((q: any, i: number) => {
                 if (!q?.question) return
-                blocks.push(questionCallout(q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question"), q.question, undefined, q.options ?? []))
+                push("q", msgID, questionCallout(q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question"), q.question, undefined, q.options ?? []))
               })
               const ans = Array.isArray(meta.answers) ? meta.answers : []
-              blocks.push(answerCalloutAsk({ answers: ans, questions: qs, status: "completed" }))
+              push("qa", msgID, answerCalloutAsk({ answers: ans, questions: qs, status: "completed" }))
             }
             continue
           }
@@ -368,7 +591,7 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
             if (input.question) {
               const opts = Array.isArray(input.options) ? input.options : []
               const label = toolName === "quiz" ? "Quiz" : "Question"
-              blocks.push(questionCallout(label, input.question, input.details?.trim() || undefined, opts))
+              push("q", msgID, questionCallout(label, input.question, input.details?.trim() || undefined, opts))
             }
           } else if (st.status === "completed") {
             // Question (with true order if shuffled, fallback to input)
@@ -377,41 +600,33 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
               const label = toolName === "quiz" ? "Quiz" : "Question"
               // Only push question if not already pushed as pending (avoid duplicate)
               // For backfill we push both Q and A together
-              if (!blocks.length || !blocks[blocks.length - 1].includes(input.question.slice(0, 20))) {
-                blocks.push(questionCallout(label, input.question, input.details?.trim() || undefined, opts))
+              const prevText = blocks[blocks.length - 1]?.text ?? ""
+              if (!prevText.includes(input.question.slice(0, 20))) {
+                push("q", msgID, questionCallout(label, input.question, input.details?.trim() || undefined, opts))
               }
             }
             if (toolName === "quiz") {
               const details = { status: "completed", answers: meta.answers ?? [], correct: meta.correct, correctIndices: meta.correctIndices ?? [], explanation: meta.explanation ?? "", dontKnow: meta.dontKnow ?? false, note: meta.note, why: meta.why }
-              blocks.push(answerCalloutQuiz(details))
+              push("qa", msgID, answerCalloutQuiz(details))
             } else {
               const details = { answers: meta.answers ?? [], status: "completed" }
-              blocks.push(answerCalloutAsk(details))
+              push("qa", msgID, answerCalloutAsk(details))
             }
           }
         }
       }
     }
-    if (blocks.length) {
-      const mdFile2 = getMdFile(sessionID) || mdFile
-      let current = ""
-      try { if (fs.existsSync(mdFile2)) current = fs.readFileSync(mdFile2, "utf-8") } catch {}
-      // If file empty, overwrite; else append with separator (preserve user notes)
-      if (current.trim().length === 0) {
-        fs.writeFileSync(mdFile2, blocks.join("\n\n") + "\n", "utf-8")
-      } else {
-        // Avoid duplicating if already contains same session text
-        const prefix = current.trim().length > 0 ? "\n\n" : ""
-        fs.writeFileSync(mdFile2, current + prefix + blocks.join("\n\n") + "\n", "utf-8")
-      }
-    }
+    // Append-only + content-aware: entries already present in the file (by identity
+    // marker, or by identical rendered text for pre-marker files) are skipped, so a
+    // second backfill is a no-op and a truncated file gets exactly its missing entries.
+    const appended = blocks.length ? appendMdEntriesToFile(getMdFile(sessionID) || mdFile, blocks) : 0
     // Persist the watermark whenever we've examined new entries, even if none produced a block,
     // so a repeated md_log call never re-scans (and never re-appends) the same history again.
     if (lastID && lastID !== already) {
       mdLinks.set(sessionID, { ...(linkMeta as MdLinkMeta), file: mdFile, directory, backfilledUntil: lastID })
-      saveMdLinksForDirectory(markerPath, directory)
+      saveMdLinks(directory)
     }
-    return blocks.length
+    return appended
   } catch (e) {
     slog("backfill failed", String(e))
     return 0
@@ -722,11 +937,15 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
 // Plugin definition
 // ────────────────────────────────────────────────────────────────────────────
 const server: Plugin = async ({ client, directory }) => {
-  // 1-1-1: restore session->file links for this directory (same session resumes, different session stays silent)
-  const markerPath = path.join(directory, ".opencode", "learn-md-log.json")
+  // 1-1-1: restore session->file links. The canonical store is user-level so the binding
+  // survives launching from a different worktree; this directory's legacy store is merged in.
   try {
-    const n = loadMdLinks(markerPath, directory)
-    if (n) slog("md-log links restored", n, markerPath)
+    const { count, migrated } = loadMdLinks(directory)
+    if (count) slog("md-log links restored", count, "canonical:", canonicalMdLinkStorePath())
+    if (migrated) {
+      slog("md-log legacy links merged into canonical store", migrated, canonicalMdLinkStorePath())
+      saveMdLinks(directory)
+    }
   } catch {}
 
   // Session-scoped visual state (one per plugin instance; subagents get separate plugin instances per session, so isolation is natural)
@@ -1067,7 +1286,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                   const details = { status: "completed" as const, answers: r?.answers || [], correct: ok, correctIndices: j.correctIndices || [], explanation: j.explanation, dontKnow: dk, note: r?.note, why: r?.why }
                   const sesJ = j.sessionID as string
                   const fJ = getMdFile(sesJ)!
-                  void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details)))
+                  void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details), mdEntryId("qa", `resume:${j.id}`, 0)))
                 }
                 return dk ? `[quiz answered] "${j.question}" -> I don't know.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}${why}` : `[quiz answered] "${j.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}${why}`
               } else if (j.type === "quiz_batch") {
@@ -1079,7 +1298,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                     const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note, why: x.why }
                     const sesJ = j.sessionID as string
                     const fJ = getMdFile(sesJ)!
-                    void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details)))
+                    void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details), mdEntryId("qa", `resume:${j.id}`, i)))
                   }
                 }
                 const lines = (j.quizzes || []).map((qq:any, i:number) => {
@@ -1171,7 +1390,10 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         const mkey = mdKey(ses, mid)
         if (loggedTextPartIds.has(mkey)) return
         loggedTextPartIds.add(mkey)
-        await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, userBlock(text)))
+        // Identity mirrors backfill's `u:<messageID>#0`, so a later backfill recognises
+        // this entry as already present. With no message id, fall back to content identity.
+        const entryId = msg?.id ? mdEntryId("u", String(msg.id), 0) : undefined
+        await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, userBlock(text), entryId))
       } catch {}
     },
     "experimental.text.complete": async (input, output) => {
@@ -1182,10 +1404,14 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         const text = (output as any).text?.trim()
         if (!text) return
         const partID = (input as any).partID
+        const messageID = (input as any).messageID
         const pkey = partID ? mdKey(ses, partID) : undefined
         if (pkey && loggedTextPartIds.has(pkey)) return
         if (pkey) loggedTextPartIds.add(pkey)
-        await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, assistantBlock(stripSkillBlocks(text))))
+        // Backfill keys assistant entries on the message id, so use messageID here for
+        // cross-path identity agreement; fall back to content identity without one.
+        const entryId = messageID ? mdEntryId("a", String(messageID), 0) : undefined
+        await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, assistantBlock(stripSkillBlocks(text)), entryId))
       } catch {}
     },
     "tool.execute.before": async (input, output) => {
@@ -1208,7 +1434,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
             const q = qs[i]
             if (!q?.question) continue
             const label = q.header || (qs.length > 1 ? `Question ${i + 1}/${qs.length}` : "Question")
-            await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, questionCallout(label, q.question, undefined, q.options ?? [])))
+            const entryId = callID ? mdEntryId("q", String(callID), i) : undefined
+            await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, questionCallout(label, q.question, undefined, q.options ?? []), entryId))
           }
         }
       } catch {}
@@ -1230,14 +1457,14 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           if (!Array.isArray(answers) || !answers.length) {
             const outText = typeof (output as any)?.output === "string" ? ((output as any).output as string).trim() : ""
             if (outText) {
-              await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, callout("example", "Answer", [outText.slice(0, 500)])))
+              await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, callout("example", "Answer", [outText.slice(0, 500)]), akey ? mdEntryId("qa", String(callID), 0) : undefined))
               if (akey) loggedToolCallIds.add(akey)
               return
             }
             answers = []
           }
           const details: any = { answers, questions: qs, status: "completed" }
-          await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, answerCalloutAsk(details)))
+          await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, answerCalloutAsk(details), akey ? mdEntryId("qa", String(callID), 0) : undefined))
           if (akey) loggedToolCallIds.add(akey)
         }
       } catch {}
@@ -1270,7 +1497,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
             if (role === "user") return
             // Fallback for assistant when experimental.text.complete not fired
             loggedTextPartIds.add(pkey)
-            await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, assistantBlock(stripSkillBlocks(text))))
+            const entryId = part.messageID ? mdEntryId("a", String(part.messageID), 0) : undefined
+            await withMdFileLock(mdFile, () => appendToMdLogForSession(ses, assistantBlock(stripSkillBlocks(text)), entryId))
           }
         }
       } catch {}
@@ -1352,7 +1580,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                   note: r?.note,
                   why: r?.why,
                 }
-                void withMdFileLock(qf, () => appendToMdLogForSession(quizSes, answerCalloutQuiz(details)))
+                void withMdFileLock(qf, () => appendToMdLogForSession(quizSes, answerCalloutQuiz(details), mdEntryId("qa", `quiz:${id}`, 0)))
               }
               return dk
                 ? `[quiz answered] "${qFixed}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}${why}`
@@ -1362,7 +1590,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           {
             const qf = quizSes ? getMdFile(quizSes) : undefined
             if (qf && quizSes) {
-              try { await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, questionCallout("Quiz", qFixed, dFixed?.trim() || undefined, options.map((o) => ({ label: o.label }))))) } catch {}
+              try { await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, questionCallout("Quiz", qFixed, dFixed?.trim() || undefined, options.map((o) => ({ label: o.label }))), mdEntryId("q", `quiz:${id}`, 0))) } catch {}
             }
           }
           if (tuiAlive) {
@@ -1385,7 +1613,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               const msg = `User selected "I don't know" — genuine gap, not a guess.\nCorrect: ${correctStr}\nExplanation: ${eFixed}`
               {
                 const qf = quizSes ? getMdFile(quizSes) : undefined
-                if (qf && quizSes) await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, callout("question", "Quiz — I don't know", [qFixed, trimmed, `Correct: ${correctStr}`, eFixed])))
+                if (qf && quizSes) await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, callout("question", "Quiz — I don\'t know", [qFixed, trimmed, `Correct: ${correctStr}`, eFixed]), mdEntryId("qa", `quiz:${id}`, 0)))
               }
               return msg
             }
@@ -1399,7 +1627,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               ;(ctx as any).metadata?.({ title: correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", metadata: { correct, correctIndices, explanation: eFixed } })
             {
               const qf = quizSes ? getMdFile(quizSes) : undefined
-              if (qf && quizSes) await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, callout(correct ? "success" : "failure", correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", [`Q: ${qFixed}`, `Selected: ${selectedStr}`, `Correct: ${correctStr}`, eFixed])))
+              if (qf && quizSes) await withMdFileLock(qf, () => appendToMdLogForSession(quizSes, callout(correct ? "success" : "failure", correct ? "Quiz — correct ✓" : "Quiz — incorrect ✗", [`Q: ${qFixed}`, `Selected: ${selectedStr}`, `Correct: ${correctStr}`, eFixed]), mdEntryId("qa", `quiz:${id}`, 0)))
             }
             return result
           }
@@ -1474,7 +1702,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               for (let i = 0; i < normalized.length; i++) {
                 const q = normalized[i]
                 const label = `Quiz ${i + 1}/${normalized.length}`
-                try { await withMdFileLock(bf, () => appendToMdLogForSession(batchSes, questionCallout(label, q.question, q.details?.trim() || undefined, q.options.map((o: any) => ({ label: o.label }))))) } catch {}
+                try { await withMdFileLock(bf, () => appendToMdLogForSession(batchSes, questionCallout(label, q.question, q.details?.trim() || undefined, q.options.map((o: any) => ({ label: o.label }))), mdEntryId("q", `quiz_batch:${id}`, i))) } catch {}
               }
             }
           }
@@ -1500,7 +1728,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                     // Use same callout helper as single quiz but with batch label context
                     try {
                       // withMdFileLock is async, but watchAndInject buildText is sync — queue without await and let it flush
-                      void withMdFileLock(bf, () => appendToMdLogForSession(batchSes, answerCalloutQuiz(details)))
+                      void withMdFileLock(bf, () => appendToMdLogForSession(batchSes, answerCalloutQuiz(details), mdEntryId("qa", `quiz_batch:${id}`, i)))
                     } catch {}
                   }
                 }
@@ -1551,22 +1779,24 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           const resolved = path.isAbsolute(args.filepath) ? args.filepath : path.resolve(ctx.directory, args.filepath)
           if (!fs.existsSync(resolved)) return `File does not exist: ${resolved}`
           if (!fs.statSync(resolved).isFile()) return `Not a file: ${resolved}`
-          // Enforce 1-1-1: one file linked to at most one session
+          // Enforce 1-1-1: one file linked to at most one session. The check runs over the
+          // canonical (user-level) store, so it holds across worktrees/launch directories.
           for (const [ses, meta] of mdLinks) {
             if (meta.file === resolved && ses !== sessionID) {
               return `File already linked to session ${ses.slice(0,8)} — 1-1-1 violation. Copy to a new file or md_unlog that session first.`
             }
           }
           // Re-linking the SAME file for this session (e.g. md_log called again after a
-          // restart/reconnect) must preserve the backfill watermark — otherwise every re-link
-          // would re-dump the entire session history into the file a second time.
+          // restart/reconnect) must preserve the backfill watermark. It is only a fast
+          // path now — backfillMdLog still diffs identities against the file itself, so a
+          // re-link can restore anything missing without ever duplicating what is present.
           const existingMeta = mdLinks.get(sessionID)
           const preservedWatermark = existingMeta?.file === resolved ? existingMeta.backfilledUntil : undefined
           mdLinks.set(sessionID, { file: resolved, directory, linkedAt: Date.now(), backfilledUntil: preservedWatermark })
-          saveMdLinksForDirectory(markerPath, directory)
+          saveMdLinks(directory)
           // Backfill history for this session only
           let backfilled = 0
-          try { backfilled = await backfillMdLog(client, sessionID, directory, markerPath) } catch (e) { slog("backfill error", String(e)) }
+          try { backfilled = await backfillMdLog(client, sessionID, directory) } catch (e) { slog("backfill error", String(e)) }
           await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved, backfilled, sessionID } } })
           return `Linked: ${resolved} to session ${sessionID.slice(0,8)} — ${backfilled ? `${backfilled} entries backfilled — ` : ""}future messages for THIS session will be mirrored. Other sessions stay silent.`
         },
@@ -1580,7 +1810,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           const own = sessionID ? mdLinks.get(sessionID) : undefined
           let countDir = 0
           for (const [, meta] of mdLinks) if (meta.directory === directory) countDir++
-          return `session ${sessionID?.slice(0,8) ?? "(none)"} -> ${own?.file ?? "(no link)"} | links in this directory: ${countDir}`
+          return `session ${sessionID?.slice(0,8) ?? "(none)"} -> ${own?.file ?? "(no link)"} | links in this directory: ${countDir} | links across all worktrees: ${mdLinks.size} | store: ${canonicalMdLinkStorePath()}`
         },
       }),
 
@@ -1594,7 +1824,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           if (!meta) return "No file linked for this session"
           const name = path.basename(meta.file)
           mdLinks.delete(sessionID)
-          saveMdLinksForDirectory(markerPath, directory)
+          saveMdLinks(directory)
           await client.app.log({ body: { service: "learn", level: "info", message: `md-log unlinked: ${name}`, extra: { sessionID } } })
           return `Unlinked: ${name} from session ${sessionID.slice(0,8)} (other sessions unaffected)`
         },

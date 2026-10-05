@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { describe, expect, test } from "bun:test"
+import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -283,9 +283,20 @@ describe("the callout the agent sees", () => {
 // ── pending file -> response file -> injected prompt / md-log callout ────────
 const PENDING = path.join(".opencode", "learn-pending")
 
+// The md-log link store is user-level (shared across worktrees so the 1-1-1 binding
+// holds regardless of launch directory). Tests must never write the developer's real
+// store, so every temp project gets its own canonical store path.
+let prevStoreEnv: string | undefined
+beforeAll(() => { prevStoreEnv = process.env.LEARN_MD_LOG_STORE })
+afterAll(() => {
+  if (prevStoreEnv === undefined) delete process.env.LEARN_MD_LOG_STORE
+  else process.env.LEARN_MD_LOG_STORE = prevStoreEnv
+})
+
 function tmpProject(prefix: string) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix))
   fs.mkdirSync(path.join(dir, PENDING), { recursive: true })
+  process.env.LEARN_MD_LOG_STORE = path.join(dir, ".opencode", "learn-md-log.json")
   return dir
 }
 

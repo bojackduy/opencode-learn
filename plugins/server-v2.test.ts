@@ -1,6 +1,26 @@
-import { describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import fs from "node:fs"
 import os from "node:os"
-import plugin from "./learn"
+import path from "node:path"
+import plugin, { MD_LINK_STORE_ENV, __resetMdLogState } from "./learn"
+
+// Booting the plugin loads the md-log link store, which is user-level by design so the
+// 1-1-1 binding survives a change of launch directory. Point it at a temp store so this
+// test neither reads nor writes the developer's real one.
+let realStoreDir = ""
+let prevStore: string | undefined
+beforeEach(() => {
+  realStoreDir = fs.mkdtempSync(path.join(os.tmpdir(), "learn-server-v2-"))
+  prevStore = process.env[MD_LINK_STORE_ENV]
+  process.env[MD_LINK_STORE_ENV] = path.join(realStoreDir, "learn-md-log.json")
+  __resetMdLogState()
+})
+afterEach(() => {
+  if (prevStore === undefined) delete process.env[MD_LINK_STORE_ENV]
+  else process.env[MD_LINK_STORE_ENV] = prevStore
+  __resetMdLogState()
+  try { fs.rmSync(realStoreDir, { recursive: true, force: true }) } catch {}
+})
 
 describe("Server dual export", () => {
   test("exposes id, server, and setup from a single default export", () => {
