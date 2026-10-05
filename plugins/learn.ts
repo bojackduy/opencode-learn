@@ -530,6 +530,59 @@ function archiveExpiredPending(dir: string, f: string) {
   } catch {}
 }
 
+// Which model maps a free-text note onto quiz options. The `classify` agent
+// declares no model, so this used to be whatever the session inherited — the
+// first rate-limit then silently degraded the answer. /learn-model persists the
+// choice here; llmClassify walks the chain and reports every model that failed.
+export type ModelRef = { providerID: string; modelID: string }
+export const CLASSIFY_CONFIG_REL = path.join(".opencode", "learn-classify.json")
+export function parseModelRef(s: unknown): ModelRef | null {
+  const raw = String(s ?? "").trim()
+  const at = raw.indexOf("/")
+  if (at <= 0 || at === raw.length - 1) return null
+  const providerID = raw.slice(0, at).trim()
+  const modelID = raw.slice(at + 1).trim()
+  if (!providerID || !modelID) return null
+  return { providerID, modelID }
+}
+export function modelRefLabel(m: ModelRef | null | undefined) { return m ? `${m.providerID}/${m.modelID}` : "" }
+export function classifyConfigPath(directory: string) { return path.join(directory, CLASSIFY_CONFIG_REL) }
+export function readClassifyConfig(directory: string): { model: ModelRef | null; fallbacks: ModelRef[] } {
+  try {
+    const raw = JSON.parse(fs.readFileSync(classifyConfigPath(directory), "utf8"))
+    const model = raw?.model ? parseModelRef(`${raw.model?.providerID}/${raw.model?.modelID}`) : null
+    const fallbacks = Array.isArray(raw?.fallbacks)
+      ? raw.fallbacks.map((m: any) => parseModelRef(typeof m === "string" ? m : `${m?.providerID}/${m?.modelID}`)).filter((m: ModelRef | null): m is ModelRef => !!m)
+      : []
+    return { model, fallbacks }
+  } catch { return { model: null, fallbacks: [] } }
+}
+export function writeClassifyConfig(directory: string, model: ModelRef, fallbacks: ModelRef[]) {
+  const file = classifyConfigPath(directory)
+  try { fs.mkdirSync(path.dirname(file), { recursive: true }) } catch {}
+  const payload = { model, fallbacks, updatedAt: Date.now() }
+  fs.writeFileSync(file, JSON.stringify(payload, null, 2), "utf8")
+  return payload
+}
+export function clearClassifyConfig(directory: string): boolean {
+  try { fs.unlinkSync(classifyConfigPath(directory)); return true } catch { return false }
+}
+// The chain always has one entry: an empty ref means "inherit the classify agent's model".
+export function classifyModelChain(directory: string): Array<{ label: string; ref: ModelRef | null }> {
+  const cfg = readClassifyConfig(directory)
+  const chain: Array<{ label: string; ref: ModelRef | null }> = []
+  if (cfg.model) chain.push({ label: modelRefLabel(cfg.model), ref: cfg.model })
+  for (const f of cfg.fallbacks) {
+    const label = modelRefLabel(f)
+    if (!chain.some((c) => c.label === label)) chain.push({ label, ref: f })
+  }
+  if (!chain.length) chain.push({ label: "default (classify agent's model)", ref: null })
+  return chain
+}
+export function parseModelList(s: unknown): ModelRef[] {
+  return String(s ?? "").split(",").map((x) => x.trim()).filter(Boolean).map(parseModelRef).filter((m: ModelRef | null): m is ModelRef => !!m)
+}
+
 // Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
 const activeWatchers = new Map<string, () => void>()
 function watchAndInject(client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
@@ -710,7 +763,7 @@ const server: Plugin = async ({ client, directory }) => {
     }
     return uniq
   }
-  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string, parentSessionID?: string, multiSelect?: boolean): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string; isIDK?: boolean }> {
+  async function llmClassify(client: any, directory: string, note: string, options: Array<{ label: string; value?: string }>, question?: string, parentSessionID?: string, multiSelect?: boolean): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string; isIDK?: boolean; failed?: boolean; errors?: string[] }> {
     const modeHint = multiSelect ? "This is a MULTI-SELECT question (0..N options may be correct). You may return 0..N inferred indices." : "This is a SINGLE-SELECT question (exactly 0 or 1 inferred). You MUST return at most ONE inferred index. Never return multiple. If note is ambiguous or mentions several options, pick the SINGLE best match. Return [] if vague."
     const idkHint = `Also detect IDK intent: if note says "I don't know / idk / too hard / too difficult / need easier / want easier / skip / give me easier/harder" or expresses wanting difficulty adjustment, set "isIDK": true (and keep inferred as [] or best guess). Otherwise isIDK false. The main teacher will use this to adapt difficulty.`
     const prompt = `Map learner's free-text note (may be Vietnamese or English) to closest option(s) and judge semantic correctness. Only pick from given Options, no new options. ${modeHint} ${idkHint}
@@ -723,7 +776,10 @@ Learner note: "${note}"
 Task: 1) inferred: which option(s) note best matches (Vietnamese translations/synonyms allowed) — respect single/multi mode above. 2) semanticCorrect: true if note shows valid understanding or deeper nuance even when inferred != correct key (e.g., note about rotate array variant vs standard sorted is valid nuance). 3) reason: short English reason. 4) isIDK: true if note expresses IDK / wants easier/harder/skip.
 
 Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK":false}  If vague/"I don't know", inferred:[], semanticCorrect:false, isIDK:true if IDK intent. No markdown, just JSON.`
-    try {
+    // One attempt on one model. Returns null when the model could not answer
+    // (quota/auth error or no parseable JSON in 12s) so the caller can move on
+    // to the next entry of the chain instead of degrading silently.
+    const classifyWithModel = async (ref: ModelRef | null, label: string): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string; isIDK?: boolean } | null> => {
       const title = `classify: ${question ? question.slice(0, 30) : note.slice(0, 20)}`
       const body: any = { title }
       if (parentSessionID) body.parentID = parentSessionID
@@ -731,11 +787,13 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       const sid = created?.data?.id || created?.id || created?.data?.sessionID
       if (!sid) throw new Error("no sid")
       const createdSession = created?.data || created
-      slog("classify subagent created", sid, `requestedParent:${parentSessionID || "none"}`, `actualParent:${createdSession?.parentID || "none"}`, note.slice(0, 40))
+      slog("classify subagent created", sid, `model:${label}`, `requestedParent:${parentSessionID || "none"}`, `actualParent:${createdSession?.parentID || "none"}`, note.slice(0, 40))
       if (parentSessionID && createdSession?.parentID !== parentSessionID) {
         throw new Error(`classifier parent mismatch: expected ${parentSessionID}, got ${createdSession?.parentID || "none"}`)
       }
-      await client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text: prompt }], agent: "classify" } })
+      const promptBody: any = { parts: [{ type: "text", text: prompt }], agent: "classify" }
+      if (ref) promptBody.model = { providerID: ref.providerID, modelID: ref.modelID }
+      await client.session.prompt({ path: { id: sid }, body: promptBody })
       // Poll for assistant response up to 12s
       for (let i = 0; i < 24; i++) {
         await new Promise(r => setTimeout(r, 500))
@@ -768,7 +826,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                     const nums = parsed.inferred.filter((n: any) => typeof n === "number" && n >= 1 && n <= options.length)
                     const fnums = enforceSingle(nums)
                     const isIDK = !!(parsed.isIDK ?? parsed.isIdk ?? parsed.dontKnow ?? parsed.isDontKnow ?? parsed.dont_know) || (noteIsIDK && fnums.length===0)
-                    slog("llmClassify success object", note.slice(0, 40), nums.join(","), `->${fnums.join(",")}`, `semantic:${parsed.semanticCorrect} isIDK:${isIDK} reason:${parsed.reason || ""} sid:${sid}`)
+                    slog("llmClassify success object", label, note.slice(0, 40), nums.join(","), `->${fnums.join(",")}`, `semantic:${parsed.semanticCorrect} isIDK:${isIDK} reason:${parsed.reason || ""} sid:${sid}`)
                     return { inferred: fnums, semanticCorrect: !!parsed.semanticCorrect, reason: parsed.reason, sessionID: sid, isIDK }
                   }
                 } catch {}
@@ -782,7 +840,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                     if (nums.length) {
                       const fnums = enforceSingle(nums)
                       const isIDK = noteIsIDK && fnums.length===0
-                      slog("llmClassify success array", note.slice(0, 40), nums.join(","), `->${fnums.join(",")} isIDK:${isIDK}`)
+                      slog("llmClassify success array", label, note.slice(0, 40), nums.join(","), `->${fnums.join(",")} isIDK:${isIDK}`)
                       return { inferred: fnums, sessionID: sid, isIDK }
                     }
                   }
@@ -806,24 +864,52 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           }
         } catch {}
       }
-      slog("llmClassify timeout", note.slice(0, 40))
-    } catch (e) {
-      slog("llmClassify failed", String(e).slice(0, 200))
+      slog("llmClassify timeout", label, note.slice(0, 40))
+      return null
     }
-    return { inferred: [] }
+    // Walk the configured chain in order. Only a chain that produced no answer at
+    // ALL reports failure — the caller must then show the reason instead of
+    // submitting a heuristic guess as if the model had answered.
+    const chain = classifyModelChain(directory)
+    const errors: string[] = []
+    for (const entry of chain) {
+      try {
+        const res = await classifyWithModel(entry.ref, entry.label)
+        if (res) {
+          if (errors.length) slog("llmClassify recovered on fallback", entry.label, `after: ${errors.join(" | ")}`)
+          return res
+        }
+        errors.push(`${entry.label}: no answer within 12s`)
+      } catch (e) {
+        const why = String(e).slice(0, 200)
+        errors.push(`${entry.label}: ${why}`)
+        slog("llmClassify model failed", entry.label, why)
+      }
+    }
+    slog("llmClassify all models failed", note.slice(0, 40), errors.join(" | "))
+    return { inferred: [], failed: true, errors }
   }
   function startClassifyWatcher(client: any, directory: string) {
     const dir = pendingDir(directory)
     try { fs.mkdirSync(dir, { recursive: true }) } catch {}
+    // A request is claimed by atomic rename before any work, so a request file
+    // that outlives its response (the TUI polls for the response and only then
+    // unlinks the request) cannot be picked up again by a later sweep. Without
+    // this the same id was re-classified on every directory event, burning one
+    // model call each time.
+    const isClaim = (f: string) => f.startsWith("classify-") && !f.startsWith("classify-response-") && f.includes(".claim-")
+    const isRequest = (f: string) => f.startsWith("classify-") && !f.startsWith("classify-response-") && !f.includes(".claim-")
     const processClassify = async (filename: string) => {
-      if (!filename.startsWith("classify-") || filename.startsWith("classify-response-")) return
+      if (!isRequest(filename)) return
       const fp = path.join(dir, filename)
       if (!fs.existsSync(fp)) return
       const respPath = path.join(dir, filename.replace("classify-", "classify-response-"))
-      if (fs.existsSync(respPath)) return
+      if (fs.existsSync(respPath)) { try { fs.unlinkSync(fp) } catch {}; return }
+      const claimPath = path.join(dir, filename.replace(/\.json$/, `.claim-${process.pid}.json`))
+      try { fs.renameSync(fp, claimPath) } catch { return } // another sweep won it
       let data: any
-      try { data = JSON.parse(fs.readFileSync(fp, "utf8")) } catch { return }
-      if (data?.type !== "classify" || !data?.note || !Array.isArray(data?.options)) return
+      try { data = JSON.parse(fs.readFileSync(claimPath, "utf8")) } catch { try { fs.unlinkSync(claimPath) } catch {}; return }
+      if (data?.type !== "classify" || !data?.note || !Array.isArray(data?.options)) { try { fs.unlinkSync(claimPath) } catch {}; return }
       slog("classify watcher processing", data.id, data.note.slice(0, 80))
       const byVal = new Map<string, number>(data.options.map((o: any, i: number) => [o.value, i + 1] as [string, number]))
       const start = Date.now()
@@ -848,6 +934,16 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         reason = llmRes.reason
         isIDK = (llmRes as any).isIDK ?? isIDK
         slog("classify llm hit", data.id, llmRes.inferred.join(","), `semantic:${semanticCorrect} isIDK:${isIDK} multi:${multi} sid:${llmRes.sessionID || ""}`)
+      } else if ((llmRes as any).failed) {
+        // Every model in the chain errored. Heuristics would answer here, and
+        // the popup would grade a guess as if the model had reasoned about the
+        // note — so report the failure and let the learner retry or pick.
+        const errors = ((llmRes as any).errors as string[]) ?? []
+        const out = { id: data.id, inferredIndices: [], inferredValues: [] as string[], semanticCorrect: false, isIDK: false, failed: true, via: "failed" as const, errors, note: data.note, at: Date.now() }
+        slog("classify all models failed", data.id, errors.join(" | "))
+        try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8") } catch {}
+        try { fs.unlinkSync(claimPath) } catch {}
+        return
       } else {
         inferred = heuristicClassify(data.note, data.options, multi)
         if (inferred.length) slog("classify heuristic hit", data.id, inferred.join(","), `multi:${multi} isIDK:${isIDK}`)
@@ -891,12 +987,23 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       }
       const inferredValues = inferred.map((i: number) => data.options[i - 1]?.value).filter(Boolean) as string[]
       slog("classify inferred", data.id, inferred.join(",") || "(none)", `semantic:${semanticCorrect} reason:${reason || ""} isIDK:${isIDK} multi:${multi} sid:${(llmRes as any)?.sessionID || ""} note:"${data.note.slice(0, 60)}"`)
-      const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, isIDK, classifySessionID: (llmRes as any)?.sessionID, note: data.note, at: Date.now() }
+      const out = { id: data.id, inferredIndices: inferred, inferredValues, semanticCorrect, reason, isIDK, via: llmRes.inferred.length ? "model" as const : "heuristic" as const, classifySessionID: (llmRes as any)?.sessionID, note: data.note, at: Date.now() }
       try { fs.writeFileSync(respPath, JSON.stringify(out), "utf8"); slog("classify response written", data.id, inferred.join(",")) } catch {}
+      try { fs.unlinkSync(claimPath) } catch {}
     }
     const sweep = () => {
       try {
-        for (const f of fs.readdirSync(dir).filter(f => f.startsWith("classify-") && !f.startsWith("classify-response-"))) {
+        // A process that died mid-classify leaves its claim behind; requeue it
+        // once it is clearly stale so the TUI's pending note is not lost.
+        for (const f of fs.readdirSync(dir).filter(isClaim)) {
+          try {
+            const age = Date.now() - fs.statSync(path.join(dir, f)).mtimeMs
+            if (age < 30000) continue
+            fs.renameSync(path.join(dir, f), path.join(dir, f.replace(/\.claim-.*\.json$/, ".json")))
+            slog("classify claim requeued", f)
+          } catch {}
+        }
+        for (const f of fs.readdirSync(dir).filter(isRequest)) {
           void processClassify(f)
         }
       } catch {}
@@ -1019,6 +1126,25 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         }
       }
       if (mutated) (output as any).agent = agents
+      // /learn-model <provider/model[,fallback]> — the shortcut for the
+      // learn_classify_model tool. With arguments it sets the model; with none it
+      // lists and asks which one to use.
+      const commands = (output as any).command ?? {}
+      if (!commands["learn-model"]) {
+        commands["learn-model"] = {
+          template: [
+            "Apply the user's classify-model choice with the `learn_classify_model` tool. User input: $ARGUMENTS",
+            "",
+            "- If the input names one or more models, call `learn_classify_model` with action=\"set\", model=<the first model>, and fallbacks=<the rest, comma-separated> when more were given.",
+            "- If the input says clear/reset/default/none, call `learn_classify_model` with action=\"clear\".",
+            "- If the input is empty, call `learn_classify_model` with action=\"list\", then ask the user which model to use with the `question` tool — options are the available models from the tool output, plus a \"clear / use default\" choice — and apply the answer with action=\"set\" or action=\"clear\".",
+            "",
+            "Report the tool's output to the user. Do not call any other tool.",
+          ].join("\n"),
+          description: "Choose the model that maps your free-text quiz notes onto options — /learn-model anthropic/claude-sonnet-4-5, or /learn-model clear",
+        }
+        ;(output as any).command = commands
+      }
       await client.app.log({ body: { service: "learn", level: "info", message: "learn plugin initialized", extra: { directory } } })
     },
 
@@ -1466,6 +1592,48 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         },
       }),
 
+      // ── classify model selection (/learn-model) ─────────────────────────
+      learn_classify_model: tool({
+        description: "Choose which model maps a free-text note onto quiz options. The `classify` agent declares no model, so this inherits the session model and silently degrades on a rate-limit. `set` persists to <project>/.opencode/learn-classify.json and takes effect on the next note; `fallbacks` are tried in order when a model errors. Exposed as /learn-model.",
+        args: {
+          action: tool.schema.enum(["list", "set", "clear"]).describe("list = current model + fallback chain; set = persist model; clear = drop the override"),
+          model: tool.schema.string().optional().describe("provider/model, e.g. anthropic/claude-sonnet-4-5 or opencode/big"),
+          fallbacks: tool.schema.string().optional().describe("Optional comma-separated provider/model list, tried in order when a model fails"),
+        },
+        async execute(args) {
+          if (args.action === "set") {
+            const ref = parseModelRef(args.model)
+            if (!ref) return `learn_classify_model set: cannot parse model "${args.model ?? ""}" — expected provider/model`
+            const fallbacks = parseModelList(args.fallbacks)
+            writeClassifyConfig(directory, ref, fallbacks)
+            await client.app.log({ body: { service: "learn", level: "info", message: `classify model set: ${modelRefLabel(ref)}`, extra: { directory, fallbacks: fallbacks.length } } })
+            return `Classify model: ${modelRefLabel(ref)}${fallbacks.length ? ` (fallbacks: ${fallbacks.map(modelRefLabel).join(" → ")})` : " (no fallbacks)"}\nSaved ${classifyConfigPath(directory)} — applies to the next note you submit in a quiz.`
+          }
+          if (args.action === "clear") {
+            const had = !!readClassifyConfig(directory).model
+            const removed = clearClassifyConfig(directory)
+            return removed
+              ? `Cleared the classify model override${had ? "" : " (none was set)"} — classification uses the classify agent's model again.`
+              : `No override to clear at ${classifyConfigPath(directory)} — classification already uses the classify agent's model.`
+          }
+          const chain = classifyModelChain(directory)
+          const file = classifyConfigPath(directory)
+          let available: string
+          try {
+            const cfg: any = await client.config.get()
+            const providers = cfg?.data?.provider ?? cfg?.provider ?? {}
+            const models: string[] = []
+            for (const [pid, p] of Object.entries<any>(providers)) for (const mid of Object.keys(p?.models ?? {})) models.push(`${pid}/${mid}`)
+            available = models.length
+              ? `${models.length} configured: ${models.slice(0, 40).join(", ")}${models.length > 40 ? ", …" : ""}`
+              : "none — this host's plugin API exposes no model list (run `opencode models`)"
+          } catch (e) {
+            available = `unavailable — ${String(e).slice(0, 120)}`
+          }
+          return `classify model: ${chain[0]?.label ?? "(unset)"}\nfallback chain: ${chain.map((c) => c.label).join(" → ")}\noverride file: ${file}${readClassifyConfig(directory).model ? "" : " (absent — default in use)"}\navailable models: ${available}`
+        },
+      }),
+
       // ── Visual tools (mermaid) ─────────────────────────────────────────
       write_mermaid: tool({
         description: "Write the FULL Mermaid source to this session's managed file (first draft or rewrite). You do NOT name the file — edit_mermaid and render_mermaid act on same one. `source` is complete Mermaid diagram. Writing does NOT render — call render_mermaid when ready. For small fix prefer edit_mermaid.",
@@ -1593,8 +1761,9 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
 // - `experimental.text.complete` is skipped: the engine's own
 //   message.part.updated fallback covers assistant text (see flushText below).
 // - create() drops parentID (v2 has none) and prompt() drops the `classify`
-//   agent override (v2 prompt takes no agent): llmClassify fails soft to the
-//   heuristic classifier in both cases.
+//   agent override and the classify model (v2 prompt takes neither): llmClassify
+//   runs on the session's model and falls back to the heuristic classifier. A
+//   classify failure on v2 is reported through classify-response, not guessed.
 // - backfill maps only user/assistant text through the shim; quiz tool-state
 //   replay may be lossy in v2. Live hooks capture going forward regardless.
 

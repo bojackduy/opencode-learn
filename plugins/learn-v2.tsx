@@ -5,7 +5,7 @@
 // so this specifier can no longer break v1 reactivity.
 import type { Plugin as TuiV2 } from "@opencode/plugin/tui"
 import { onCleanup, onMount } from "solid-js/dist/solid.js"
-import { useRenderer } from "@opentui/solid"
+import { useRenderer, useTerminalDimensions } from "@opentui/solid"
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { decodeQuizText, prevent, runPendingLoop, tlog, writeJsonAtomic } from "./learn-shared"
@@ -31,7 +31,7 @@ function useDialogKeyboard(callback: (event: any) => void) {
 // classify watcher (same classify-<id>.json protocol the v1 dialogs use).
 // Pure mapping of a classify-response payload onto dialog state, so the
 // branching is unit-testable without a live server.
-export type ClassifyOutcome = { selectedIndices: number[]; dontKnow: boolean; correct: boolean; reason?: string }
+export type ClassifyOutcome = { selectedIndices: number[]; dontKnow: boolean; correct: boolean; reason?: string; failed?: boolean; errors?: string[] }
 export function applyClassifyResult(
   opts: { multi: boolean; correctIndices: number[]; options: Array<{ label: string; value: string }> },
   data: any | null,
@@ -42,6 +42,12 @@ export function applyClassifyResult(
     idxs.every((n) => correctSet.has(n)) &&
     opts.correctIndices.every((n) => idxs.includes(n))
   if (!data) return { selectedIndices: [], dontKnow: false, correct: false }
+  // Every model in the chain errored. Report it instead of degrading to an
+  // empty (wrong) answer — the dialog keeps the popup open on this.
+  if (data.failed === true) {
+    const errors = Array.isArray(data.errors) && data.errors.length ? data.errors.map((e: any) => String(e)) : [String(data.reason || "all models failed")]
+    return { selectedIndices: [], dontKnow: false, correct: false, failed: true, errors }
+  }
   if (data.isIDK) return { selectedIndices: [], dontKnow: true, correct: false, reason: data.reason }
   const fromIdx = (idxs: number[]) => {
     const eff = !opts.multi && idxs.length > 1 ? [idxs[0]!] : idxs
@@ -109,6 +115,15 @@ export function v2VerdictStyle(theme: Record<string, any>, kind: V2VerdictKind):
     default: return { fg: theme.textMuted, bg: undefined }
   }
 }
+// Per-model failure lines shown in the classify_failed banner (model + fallbacks).
+const MAX_MODEL_REASONS = 4
+// Quiz text wraps to the real terminal, never a fixed 76 columns: on a 44-col
+// phone terminal a 76-col line overflows the dialog and drops its right border.
+// 76 is kept as the cap so wide desktops wrap exactly as before.
+export function quizWrapWidth(terminalWidth: number | undefined): number {
+  const w = Number.isFinite(terminalWidth) ? (terminalWidth as number) : 80
+  return Math.max(12, Math.min(76, w - 6))
+}
 function wrapQuizLines(s: string, width = 76): string[] {
   const out: string[] = []
   for (const para of String(s ?? "").split("\n")) {
@@ -139,19 +154,27 @@ export function V2QuizDialog(props: {
   onCancel: () => void
 }) {
   const renderer = useRenderer()
+  const dims = useTerminalDimensions()
+  const wrapWidth = () => quizWrapWidth(dims().width)
   const multi = !!props.request.multiSelect
   const correctSet = new Set(props.request.correctIndices)
   const allRows = [...props.request.options, { label: "I don't know", value: "__dont_know__", index: props.request.options.length + 1 }]
-  const explLines = wrapQuizLines(decodeQuizText(props.request.explanation).trim() || "No explanation provided.")
+  const explLines = wrapQuizLines(decodeQuizText(props.request.explanation).trim() || "No explanation provided.", wrapWidth())
   const visibleCount = 8
   const maxScroll = Math.max(0, explLines.length - visibleCount)
 
   let cursorIdx = 0
   const selectedSet = new Set<number>()
-  let phaseStr: "select" | "classifying" | "feedback" = "select"
+  let phaseStr: "select" | "classifying" | "classify_failed" | "feedback" = "select"
   let fb: { correct: boolean; selectedIndices: number[]; dontKnow: boolean } | null = null
   let pendingRes: QuizResult | null = null
   let scrollOff = 0
+  // Every model errored: keep the popup open, show why, offer retry / switch
+  // model / pick an option by hand. Never grade a guess as answered.
+  let classifyErrors: string[] = []
+  let modelHint = false
+  // In classify_failed the option list stays live so the learner can answer manually.
+  const canPick = () => phaseStr === "select" || phaseStr === "classify_failed"
   // Free-text note, classified by AI into options (v1 parity). Hand-rolled
   // single-line editor: no <input> — that component class is what failed to
   // paint in v2 before.
@@ -176,6 +199,10 @@ export function V2QuizDialog(props: {
   let noteTextEl: any = null
   let footerText: any = null
   let classifyBox: any = null
+  let failedBox: any = null
+  let failedTitle: any = null
+  const failedReasons: any[] = []
+  let failedHint: any = null
   let noteTextFb: any = null
 
   const rowLabel = (index: number) => {
@@ -255,7 +282,7 @@ export function V2QuizDialog(props: {
   }
 
   const submitSelect = () => {
-    if (phaseStr !== "select") return
+    if (!canPick()) return
     if (cursorIdx === props.request.options.length) {
       pendingRes = { answers: [], dontKnow: true, note: noteStr.trim() || undefined } as QuizResult
       fb = { correct: false, selectedIndices: [], dontKnow: true }
@@ -292,7 +319,7 @@ export function V2QuizDialog(props: {
   }
 
   const paintNote = () => {
-    const focusedNote = focusTarget === "note" && phaseStr === "select"
+    const focusedNote = focusTarget === "note" && canPick()
     if (noteBox) noteBox.borderColor = focusedNote ? props.theme.accent : props.theme.textMuted
     if (noteTextEl) {
       noteTextEl.content = noteStr ? noteStr + (focusedNote ? "▌" : "") : (focusedNote ? "▌Tab to type · share what you were thinking" : "Tab to type · share what you were thinking")
@@ -308,13 +335,32 @@ export function V2QuizDialog(props: {
     paintHeader()
     paintReview()
     if (selectBox) selectBox.visible = false
+    if (failedBox) failedBox.visible = false
     if (feedbackBox) feedbackBox.visible = true
+  }
+  const showClassifyFailed = (errors: string[]) => {
+    phaseStr = "classify_failed"
+    classifyErrors = errors.length ? errors : ["all models failed"]
+    // Focus returns to the options so UP/DOWN + ENTER answer by hand without a
+    // detour through the note editor that started the classify.
+    focusTarget = "options"
+    paintHeader()
+    if (classifyBox) classifyBox.visible = false
+    if (feedbackBox) feedbackBox.visible = false
+    if (failedBox) failedBox.visible = true
+    if (failedTitle) failedTitle.content = "✗ Classification failed — no model answered"
+    failedReasons.forEach((el, i) => { el.content = classifyErrors[i] ?? ""; el.visible = i < classifyErrors.length })
+    if (failedHint) failedHint.content = modelHint
+      ? "Switch model: run /learn-model <provider/model> in chat, then press R"
+      : "R retry classify  ·  M how to switch model  ·  UP/DOWN + ENTER pick an option"
+    paintNote()
   }
   const startClassify = () => {
     const note = noteStr.trim()
-    if (!note || phaseStr !== "select") return
+    if (!note || !canPick()) return
     if (pollCancel) { try { pollCancel() } catch {} pollCancel = null }
     phaseStr = "classifying"
+    if (failedBox) failedBox.visible = false
     if (classifyBox) classifyBox.visible = true
     paintNote()
     const opts = props.request.options.map((o, i) => ({ label: o.label, value: o.value ?? o.label, index: i + 1 }))
@@ -325,8 +371,17 @@ export function V2QuizDialog(props: {
     }, "V2QuizDialog", (data) => {
       pollCancel = null
       if (closed) return
-      if (!data) tlog("V2QuizDialog classify timeout", props.request.id)
+      if (!data) {
+        tlog("V2QuizDialog classify timeout", props.request.id)
+        showClassifyFailed(["no answer within 30s"])
+        return
+      }
       const r = applyClassifyResult({ multi, correctIndices: props.request.correctIndices, options: opts }, data)
+      if (r.failed) {
+        tlog("V2QuizDialog classify failed", props.request.id, JSON.stringify(r.errors))
+        showClassifyFailed(r.errors ?? [])
+        return
+      }
       noteReason = r.reason || ""
       pendingRes = {
         answers: r.selectedIndices.map((n) => {
@@ -365,6 +420,12 @@ export function V2QuizDialog(props: {
       return
     }
     if (phaseStr === "classifying") { prevent(event); return }
+    if (phaseStr === "classify_failed" && focusTarget !== "note") {
+      // R retries the same note, M explains how to switch model. Every other key
+      // falls through: the option list is live so the learner can answer.
+      if (key === "r") { prevent(event); startClassify(); return }
+      if (key === "m") { prevent(event); modelHint = !modelHint; showClassifyFailed(classifyErrors); return }
+    }
     if (focusTarget === "note") {
       if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "options"; paintNote(); return }
       if (key === "escape" || key === "esc") { prevent(event); focusTarget = "options"; paintNote(); return }
@@ -412,7 +473,7 @@ export function V2QuizDialog(props: {
   })
 
   const focusRow = (index: number) => {
-    if (phaseStr !== "select") return
+    if (!canPick()) return
     focusTarget = "options"
     cursorIdx = index
     paintRows()
@@ -420,7 +481,7 @@ export function V2QuizDialog(props: {
     renderer.requestRender()
   }
   const activateRow = (index: number) => {
-    if (phaseStr !== "select") return
+    if (!canPick()) return
     focusRow(index)
     if (!multi || index === props.request.options.length) submitSelect()
     else {
@@ -431,7 +492,7 @@ export function V2QuizDialog(props: {
     }
   }
   const focusNote = () => {
-    if (phaseStr !== "select") return
+    if (!canPick()) return
     focusTarget = "note"
     paintNote()
     renderer.requestRender()
@@ -461,6 +522,13 @@ export function V2QuizDialog(props: {
         <box ref={(element: any) => { classifyBox = element; if (element) element.visible = false }} flexDirection="column" backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}>
           <text fg={props.theme.background} bold>Classifying your note with AI…</text>
         </box>
+        <box ref={(element: any) => { failedBox = element; if (element) element.visible = false }} flexDirection="column" gap={0} border={true} borderColor={props.theme.error} backgroundColor={props.theme.background} paddingLeft={1} paddingRight={1}>
+          <text ref={(element: any) => failedTitle = element} fg={props.theme.error} bold>✗ Classification failed — no model answered</text>
+          {Array.from({ length: MAX_MODEL_REASONS }, (_v, i) => (
+            <text ref={(element: any) => { failedReasons[i] = element; if (element) element.visible = false }} fg={props.theme.textMuted} wrapMode="wrap"> </text>
+          ))}
+          <text ref={(element: any) => failedHint = element} fg={props.theme.warning} wrapMode="wrap">R retry classify  ·  M how to switch model  ·  UP/DOWN + ENTER pick an option</text>
+        </box>
         <text ref={(element: any) => footerText = element} fg={props.theme.textMuted}>{multi ? "UP/DOWN move  SPACE toggle  ENTER review  TAB note  ESC cancel" : "UP/DOWN move  ENTER review  TAB note  ESC cancel"}</text>
       </box>
       <box ref={(element: any) => { feedbackBox = element; if (element) element.visible = false }} flexDirection="column" gap={1}>
@@ -482,7 +550,7 @@ export function V2QuizDialog(props: {
   )
 }
 
-function V2QuizBatchDialog(props: {
+export function V2QuizBatchDialog(props: {
   request: QuizBatchPending
   theme: Record<string, any>
   pendingDir: string
@@ -490,6 +558,8 @@ function V2QuizBatchDialog(props: {
   onCancel: () => void
 }) {
   const renderer = useRenderer()
+  const dims = useTerminalDimensions()
+  const wrapWidth = () => quizWrapWidth(dims().width)
   const quizzes = props.request.quizzes
   const maxOpts = Math.max(...quizzes.map((q) => q.options.length))
   const visibleCount = 8
@@ -498,7 +568,11 @@ function V2QuizBatchDialog(props: {
   let qIdx = 0
   let cursorIdx = 0
   let selectedSet = new Set<number>()
-  let phaseStr: "select" | "classifying" | "feedback" = "select"
+  let phaseStr: "select" | "classifying" | "classify_failed" | "feedback" = "select"
+  let classifyErrors: string[] = []
+  let modelHint = false
+  // In classify_failed the option list stays live so the learner can answer manually.
+  const canPick = () => phaseStr === "select" || phaseStr === "classify_failed"
   let noteStr = ""
   let noteReason = ""
   let focusTarget: "options" | "note" = "options"
@@ -528,6 +602,10 @@ function V2QuizBatchDialog(props: {
   let noteTextEl: any = null
   let footerText: any = null
   let classifyBox: any = null
+  let failedBox: any = null
+  let failedTitle: any = null
+  const failedReasons: any[] = []
+  let failedHint: any = null
   let noteTextFb: any = null
 
   const cur = () => quizzes[qIdx]!
@@ -611,7 +689,7 @@ function V2QuizBatchDialog(props: {
     if (quizPos) quizPos.content = `Q ${qIdx + 1}/${quizzes.length}`
   }
   const paintNoteBatch = () => {
-    const focusedNote = focusTarget === "note" && phaseStr === "select"
+    const focusedNote = focusTarget === "note" && canPick()
     if (noteBox) noteBox.borderColor = focusedNote ? props.theme.accent : props.theme.textMuted
     if (noteTextEl) {
       noteTextEl.content = noteStr ? noteStr + (focusedNote ? "▌" : "") : (focusedNote ? "▌Tab to type · share what you were thinking" : "Tab to type · share what you were thinking")
@@ -627,14 +705,31 @@ function V2QuizBatchDialog(props: {
     paintHeader()
     paintReview()
     if (selectBox) selectBox.visible = false
+    if (failedBox) failedBox.visible = false
     if (feedbackBox) feedbackBox.visible = true
+  }
+  const showClassifyFailedBatch = (errors: string[]) => {
+    phaseStr = "classify_failed"
+    classifyErrors = errors.length ? errors : ["all models failed"]
+    focusTarget = "options"
+    paintHeader()
+    if (classifyBox) classifyBox.visible = false
+    if (feedbackBox) feedbackBox.visible = false
+    if (failedBox) failedBox.visible = true
+    if (failedTitle) failedTitle.content = "✗ Classification failed — no model answered"
+    failedReasons.forEach((el, i) => { el.content = classifyErrors[i] ?? ""; el.visible = i < classifyErrors.length })
+    if (failedHint) failedHint.content = modelHint
+      ? "Switch model: run /learn-model <provider/model> in chat, then press R"
+      : "R retry classify  ·  M how to switch model  ·  UP/DOWN + ENTER pick an option"
+    paintNoteBatch()
   }
   const startClassifyBatch = () => {
     const note = noteStr.trim()
     const q = cur()
-    if (!note || phaseStr !== "select") return
+    if (!note || !canPick()) return
     if (pollCancel) { try { pollCancel() } catch {} pollCancel = null }
     phaseStr = "classifying"
+    if (failedBox) failedBox.visible = false
     if (classifyBox) classifyBox.visible = true
     paintNoteBatch()
     const opts = q.options.map((o, i) => ({ label: o.label, value: o.value ?? o.label, index: i + 1 }))
@@ -646,8 +741,17 @@ function V2QuizBatchDialog(props: {
     }, "V2QuizBatchDialog", (data) => {
       pollCancel = null
       if (closed) return
-      if (!data) tlog("V2QuizBatchDialog classify timeout", cid)
+      if (!data) {
+        tlog("V2QuizBatchDialog classify timeout", cid)
+        showClassifyFailedBatch(["no answer within 30s"])
+        return
+      }
       const r = applyClassifyResult({ multi: curMulti(), correctIndices: q.correctIndices, options: opts }, data)
+      if (r.failed) {
+        tlog("V2QuizBatchDialog classify failed", cid, JSON.stringify(r.errors))
+        showClassifyFailedBatch(r.errors ?? [])
+        return
+      }
       noteReason = r.reason || ""
       pendingRes = {
         answers: r.selectedIndices.map((n) => {
@@ -676,7 +780,7 @@ function V2QuizBatchDialog(props: {
     focusTarget = "options"
     stopBatchPoll()
     const q = cur()
-    explLines = wrapQuizLines(decodeQuizText(q.explanation).trim() || "No explanation provided.")
+    explLines = wrapQuizLines(decodeQuizText(q.explanation).trim() || "No explanation provided.", wrapWidth())
     maxScroll = Math.max(0, explLines.length - visibleCount)
     if (questionText) questionText.content = decodeQuizText(q.question).trim() || "Quiz question"
     if (detailsText) detailsText.content = q.details ? decodeQuizText(q.details).trim() || "Choose the best answer." : "Choose the best answer."
@@ -684,11 +788,12 @@ function V2QuizBatchDialog(props: {
     paintRows()
     paintNoteBatch()
     if (classifyBox) classifyBox.visible = false
+    if (failedBox) failedBox.visible = false
     if (selectBox) selectBox.visible = true
     if (feedbackBox) feedbackBox.visible = false
   }
   const submitSelect = () => {
-    if (phaseStr !== "select") return
+    if (!canPick()) return
     const q = cur()
     if (cursorIdx === q.options.length) {
       pendingRes = { answers: [], dontKnow: true, note: noteStr.trim() || undefined } as QuizResult
@@ -753,6 +858,10 @@ function V2QuizBatchDialog(props: {
       return
     }
     if (phaseStr === "classifying") { prevent(event); return }
+    if (phaseStr === "classify_failed" && focusTarget !== "note") {
+      if (key === "r") { prevent(event); startClassifyBatch(); return }
+      if (key === "m") { prevent(event); modelHint = !modelHint; showClassifyFailedBatch(classifyErrors); return }
+    }
     if (focusTarget === "note") {
       if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "options"; paintNoteBatch(); return }
       if (key === "escape" || key === "esc") { prevent(event); focusTarget = "options"; paintNoteBatch(); return }
@@ -788,7 +897,7 @@ function V2QuizBatchDialog(props: {
   })
 
   const focusRow = (index: number) => {
-    if (phaseStr !== "select" || index >= rowCount()) return
+    if (!canPick() || index >= rowCount()) return
     focusTarget = "options"
     cursorIdx = index
     paintRows()
@@ -796,7 +905,7 @@ function V2QuizBatchDialog(props: {
     renderer.requestRender()
   }
   const activateRow = (index: number) => {
-    if (phaseStr !== "select" || index >= rowCount()) return
+    if (!canPick() || index >= rowCount()) return
     focusRow(index)
     if (!curMulti() || index === cur().options.length) submitSelect()
     else {
@@ -807,7 +916,7 @@ function V2QuizBatchDialog(props: {
     }
   }
   const focusNote = () => {
-    if (phaseStr !== "select") return
+    if (!canPick()) return
     focusTarget = "note"
     paintNoteBatch()
     renderer.requestRender()
@@ -815,7 +924,7 @@ function V2QuizBatchDialog(props: {
 
   const first = quizzes[0]!
   const firstRows: string[] = [...first.options.map((o) => o.label), "I don't know"]
-  explLines = wrapQuizLines(decodeQuizText(first.explanation).trim() || "No explanation provided.")
+  explLines = wrapQuizLines(decodeQuizText(first.explanation).trim() || "No explanation provided.", wrapWidth())
   maxScroll = Math.max(0, explLines.length - visibleCount)
 
   return (
@@ -842,6 +951,13 @@ function V2QuizBatchDialog(props: {
         </box>
         <box ref={(element: any) => { classifyBox = element; if (element) element.visible = false }} flexDirection="column" backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}>
           <text fg={props.theme.background} bold>Classifying your note with AI…</text>
+        </box>
+        <box ref={(element: any) => { failedBox = element; if (element) element.visible = false }} flexDirection="column" gap={0} border={true} borderColor={props.theme.error} backgroundColor={props.theme.background} paddingLeft={1} paddingRight={1}>
+          <text ref={(element: any) => failedTitle = element} fg={props.theme.error} bold>✗ Classification failed — no model answered</text>
+          {Array.from({ length: MAX_MODEL_REASONS }, (_v, i) => (
+            <text ref={(element: any) => { failedReasons[i] = element; if (element) element.visible = false }} fg={props.theme.textMuted} wrapMode="wrap"> </text>
+          ))}
+          <text ref={(element: any) => failedHint = element} fg={props.theme.warning} wrapMode="wrap">R retry classify  ·  M how to switch model  ·  UP/DOWN + ENTER pick an option</text>
         </box>
         <text ref={(element: any) => footerText = element} fg={props.theme.textMuted}>UP/DOWN move  ENTER review  TAB note  ESC cancel</text>
       </box>

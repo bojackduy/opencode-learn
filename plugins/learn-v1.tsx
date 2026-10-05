@@ -51,7 +51,20 @@ function syntaxStyle(theme:any){
   ])
 }
 
-function QuizDialog(props: {
+// Popup geometry derives from the real terminal. A floor wider/taller than the
+// screen (phone over SSH at 44 cols) overflowed the popup and collapsed its
+// border, so the floors are only safe minimums and the terminal always wins.
+// `ratio`/`cap` keep the existing desktop look for the two dialogs.
+export function popupSize(terminal: { width?: number; height?: number }, ratio: number, cap: number) {
+  const w = Number.isFinite(terminal?.width) ? (terminal!.width as number) : 80
+  const h = Number.isFinite(terminal?.height) ? (terminal!.height as number) : 24
+  return {
+    width: Math.min(Math.max(20, Math.min(w - 8, Math.floor(w * ratio), cap)), w),
+    height: Math.min(Math.max(6, Math.min(h - 6, Math.floor(h * ratio), cap)), h),
+  }
+}
+
+export function QuizDialog(props: {
   api: Parameters<TuiPlugin>[0]
   request: QuizPending
   onSubmit: (result: { answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string }) => void
@@ -60,14 +73,8 @@ function QuizDialog(props: {
   const theme = () => props.api.theme.current
   const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
-  const popupWidth = () => {
-    const w = dims().width
-    return Math.max(62, Math.min(w - 8, Math.floor(w * 0.80), 92))
-  }
-  const popupHeight = () => {
-    const h = dims().height
-    return Math.max(14, Math.min(h - 6, Math.floor(h * 0.62), 26))
-  }
+  const popupWidth = () => popupSize(dims(), 0.80, 92).width
+  const popupHeight = () => popupSize(dims(), 0.62, 26).height
   const options = () => props.request.options
   const correctSet = new Set(props.request.correctIndices)
   const isMulti = () => !!props.request.multiSelect
@@ -76,11 +83,17 @@ function QuizDialog(props: {
 
   const [focused, setFocused] = createSignal<"options" | "note">("options")
   const [optionIndex, setOptionIndex] = createSignal(0)
-  const [phase, setPhase] = createSignal<"select" | "feedback" | "classifying">("select")
+  const [phase, setPhase] = createSignal<"select" | "feedback" | "classifying" | "classify_failed">("select")
   const [note, setNote] = createSignal("")
   const [dontKnow, setDontKnow] = createSignal(false)
   const [selected, setSelected] = createSignal<Map<string, { label: string; value: string; index: number }>>(new Map())
   const [feedback, setFeedback] = createSignal<{ correct: boolean; selectedIndices: number[] } | null>(null)
+  // Every model errored: keep the popup open, show why, offer retry / switch
+  // model / pick an option by hand. Never grade a heuristic guess as answered.
+  const [classifyErrors, setClassifyErrors] = createSignal<string[]>([])
+  const [modelHint, setModelHint] = createSignal(false)
+  // In classify_failed the option list stays live so the learner can answer manually.
+  const canPick = () => phase() === "select" || phase() === "classify_failed"
 
   let noteInputEl: any
   let scrollRef: any
@@ -134,82 +147,100 @@ function QuizDialog(props: {
     // For single-select, dontKnow is a final answer — submit immediately (no Submit button)
     if (!isMulti() && willBe) setTimeout(() => submitSelect(), 0)
   }
+  // Focus returns to the options so ↑↓/Enter answer by hand without a detour
+  // through the note editor that started the classify.
+  const failClassify = (errors: string[]) => {
+    setClassifyErrors(errors.length ? errors : ["classify failed"])
+    setFocused("options")
+    setPhase("classify_failed")
+  }
+  const startClassify = () => {
+    if (!note().trim()) return
+    setPhase("classifying")
+    setClassifyErrors([])
+    try {
+      const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
+      const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
+      const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
+      writeJsonAtomic(path.join(pDir, `classify-${props.request.id}.json`), pendingClassify)
+      tlog("QuizDialog classify request", props.request.id, note().trim().slice(0, 50))
+      // Poll for classify-response
+      const respPath = path.join(pDir, `classify-response-${props.request.id}.json`)
+      let attempts = 0
+      const poll = setInterval(() => {
+        attempts++
+        if (attempts > 60) { clearInterval(poll); failClassify(["no answer within 30s"]); return }
+        try {
+          if (fs.existsSync(respPath)) {
+            clearInterval(poll)
+            const raw = fs.readFileSync(respPath, "utf8")
+            const data: any = JSON.parse(raw)
+            try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${props.request.id}.json`)) } catch {}
+            if (data?.failed) {
+              tlog("QuizDialog classify failed", JSON.stringify(data.errors || data.reason || ""))
+              failClassify(data.errors)
+              return
+            }
+            const inferred = data?.inferredIndices as number[] | undefined
+            const inferredValues = data?.inferredValues as string[] | undefined
+            const semanticCorrect = data?.semanticCorrect as boolean | undefined
+            const reason = data?.reason as string | undefined
+            const isIDK = !!(data as any)?.isIDK
+            const computeCorrect = (idxs: number[]) => {
+              if (typeof semanticCorrect === "boolean") return semanticCorrect
+              return idxs.length === props.request.correctIndices.length && idxs.every((v: number) => correctSet.has(v)) && props.request.correctIndices.every((v: number) => idxs.includes(v))
+            }
+            if (isIDK) {
+              setDontKnow(true)
+              setSelected(new Map())
+              setFeedback({ correct: false, selectedIndices: [] })
+              if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
+              else if (!note().toLowerCase().includes("idk") && !note().toLowerCase().includes("don't know")) setNote(prev => prev ? `${prev} — IDK: ${reason || "needs easier"}` : prev)
+              tlog("QuizDialog classify isIDK", reason || "")
+            } else if (inferred && inferred.length) {
+              const eff = !isMulti() && inferred.length > 1 ? [inferred[0]!] : inferred
+              if (eff.length !== inferred.length) tlog("QuizDialog classify enforce single", inferred.join(","), "->", eff.join(","))
+              const m = new Map<string, { label: string; value: string; index: number }>()
+              for (let i = 0; i < eff.length; i++) {
+                const idx = eff[i]
+                const opt = options()[idx - 1]
+                if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx })
+              }
+              setSelected(m)
+              const correct = computeCorrect(eff)
+              setFeedback({ correct, selectedIndices: eff })
+              if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
+              tlog("QuizDialog classify done", eff.join(","), correct, reason || "")
+            } else if (inferredValues && inferredValues.length) {
+              const byVal = new Map(options().map((o, i) => [o.value, i + 1]))
+              let idxs = inferredValues.map(v => byVal.get(v)).filter(Boolean) as number[]
+              if (!isMulti() && idxs.length > 1) { const b=idxs.join(","); idxs=[idxs[0]!]; tlog("QuizDialog classifyValues enforce single", b, "->", idxs.join(",")) }
+              const m = new Map<string, { label: string; value: string; index: number }>()
+              for (const idx of idxs) { const opt = options()[idx - 1]; if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
+              setSelected(m)
+              const correct = computeCorrect(idxs)
+              setFeedback({ correct, selectedIndices: idxs })
+            } else {
+              const correct = typeof semanticCorrect === "boolean" ? semanticCorrect : false
+              setFeedback({ correct, selectedIndices: [] })
+              if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
+            }
+            setPhase("feedback")
+          }
+        } catch {}
+      }, 500)
+      // Cleanup on dispose
+      onCleanup(() => clearInterval(poll))
+    } catch (e) { tlog("classify request failed", String(e)); failClassify([`request failed: ${String(e).slice(0, 120)}`]) }
+  }
   const submitSelect = () => {
+    if (!canPick()) return
     const selMap = selected()
     if (!isMulti() && selMap.size === 0 && !dontKnow() && !note().trim()) return
     if (isMulti() && selMap.size === 0 && !dontKnow() && !note().trim()) return
     // If 0 selected but note present, trigger AI classify (async popup) — keep popup, show classifying
     if (selMap.size === 0 && !dontKnow() && note().trim()) {
-      setPhase("classifying" as any)
-      try {
-        const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
-        const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
-        const pendingClassify = { id: props.request.id, type: "classify" as const, note: note().trim(), question: props.request.question, options: options().map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
-        writeJsonAtomic(path.join(pDir, `classify-${props.request.id}.json`), pendingClassify)
-        tlog("QuizDialog classify request", props.request.id, note().trim().slice(0, 50))
-        // Poll for classify-response
-        const respPath = path.join(pDir, `classify-response-${props.request.id}.json`)
-        let attempts = 0
-        const poll = setInterval(() => {
-          attempts++
-          if (attempts > 60) { clearInterval(poll); setPhase("feedback"); setFeedback({ correct: false, selectedIndices: [] }); return }
-          try {
-            if (fs.existsSync(respPath)) {
-              clearInterval(poll)
-              const raw = fs.readFileSync(respPath, "utf8")
-              const data: any = JSON.parse(raw)
-              try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${props.request.id}.json`)) } catch {}
-              const inferred = data?.inferredIndices as number[] | undefined
-              const inferredValues = data?.inferredValues as string[] | undefined
-              const semanticCorrect = data?.semanticCorrect as boolean | undefined
-              const reason = data?.reason as string | undefined
-              const isIDK = !!(data as any)?.isIDK
-              const computeCorrect = (idxs: number[]) => {
-                if (typeof semanticCorrect === "boolean") return semanticCorrect
-                return idxs.length === props.request.correctIndices.length && idxs.every((v: number) => correctSet.has(v)) && props.request.correctIndices.every((v: number) => idxs.includes(v))
-              }
-              if (isIDK) {
-                setDontKnow(true)
-                setSelected(new Map())
-                setFeedback({ correct: false, selectedIndices: [] })
-                if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
-                else if (!note().toLowerCase().includes("idk") && !note().toLowerCase().includes("don't know")) setNote(prev => prev ? `${prev} — IDK: ${reason || "needs easier"}` : prev)
-                tlog("QuizDialog classify isIDK", reason || "")
-              } else if (inferred && inferred.length) {
-                const eff = !isMulti() && inferred.length > 1 ? [inferred[0]!] : inferred
-                if (eff.length !== inferred.length) tlog("QuizDialog classify enforce single", inferred.join(","), "->", eff.join(","))
-                const m = new Map<string, { label: string; value: string; index: number }>()
-                for (let i = 0; i < eff.length; i++) {
-                  const idx = eff[i]
-                  const opt = options()[idx - 1]
-                  if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx })
-                }
-                setSelected(m)
-                const correct = computeCorrect(eff)
-                setFeedback({ correct, selectedIndices: eff })
-                if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
-                tlog("QuizDialog classify done", eff.join(","), correct, reason || "")
-              } else if (inferredValues && inferredValues.length) {
-                const byVal = new Map(options().map((o, i) => [o.value, i + 1]))
-                let idxs = inferredValues.map(v => byVal.get(v)).filter(Boolean) as number[]
-                if (!isMulti() && idxs.length > 1) { const b=idxs.join(","); idxs=[idxs[0]!]; tlog("QuizDialog classifyValues enforce single", b, "->", idxs.join(",")) }
-                const m = new Map<string, { label: string; value: string; index: number }>()
-                for (const idx of idxs) { const opt = options()[idx - 1]; if (opt) m.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
-                setSelected(m)
-                const correct = computeCorrect(idxs)
-                setFeedback({ correct, selectedIndices: idxs })
-              } else {
-                const correct = typeof semanticCorrect === "boolean" ? semanticCorrect : false
-                setFeedback({ correct, selectedIndices: [] })
-                if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
-              }
-              setPhase("feedback")
-            }
-          } catch {}
-        }, 500)
-        // Cleanup on dispose
-        onCleanup(() => clearInterval(poll))
-      } catch (e) { tlog("classify request failed", String(e)); setPhase("feedback"); setFeedback({ correct: false, selectedIndices: [] }) }
+      startClassify()
       return
     }
     if (dontKnow()) {
@@ -242,6 +273,12 @@ function QuizDialog(props: {
     const seq = evt.sequence || ""
     const lower = String(key||"").toLowerCase()
     if ((phase() as any) === "classifying") { prevent(evt); return }
+    if ((phase() as any) === "classify_failed" && focused() !== "note") {
+      // r retries the same note, m explains how to switch model. Every other
+      // key falls through: the option list is live so the learner can answer.
+      if (isPlainKey(evt, "r")) { prevent(evt); startClassify(); return }
+      if (isPlainKey(evt, "m")) { prevent(evt); setModelHint(v => !v); return }
+    }
     // When in feedback, handle scroll first, then confirm
     if (phase() === "feedback") {
       if (isPlainKey(evt,"d") || seq === "\x04") { prevent(evt); try { scrollRef?.scrollBy(scrollAmount()); setTimeout(updateScrollIndicators, 30); setTimeout(updateScrollIndicators, 120) } catch {} return }
@@ -326,6 +363,15 @@ function QuizDialog(props: {
           </box>
         </Show>
 
+        <Show when={(phase() as any) === "classify_failed"}>
+          <box flexDirection="column" gap={1} padding={1} border={true} borderColor={theme().error} backgroundColor={theme().background}>
+            <text fg={theme().error} bold>✗ Classification failed — no model answered</text>
+            <text fg={theme().textMuted} wrapMode="wrap">"{note()}"</text>
+            <For each={classifyErrors()}>{(err, i) => <text fg={theme().textMuted} wrapMode="wrap">{i() + 1}. {err}</text>}</For>
+            <text fg={theme().warning}>r retry · ↑↓ + Enter pick an option yourself</text>
+            <Show when={modelHint()}><text fg={theme().textMuted} wrapMode="wrap">Switch model: run /learn-model &lt;provider/model&gt; in chat, then press r</text></Show>
+          </box>
+        </Show>
         <scrollbox ref={(el:any)=> scrollRef = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
         {/* Question — use opencode markdown render so ```python blocks get syntax coloring like native messages */}
         <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} paddingTop={1}>
@@ -335,7 +381,7 @@ function QuizDialog(props: {
           </Show>
         </box>
 
-        <Show when={phase() === "select"}>
+        <Show when={canPick()}>
           <box flexDirection="column" gap={0} padding={1} border={true} borderColor={theme().borderSubtle} backgroundColor={theme().background}>
             <For each={options()}>
               {(opt, i) => {
@@ -343,8 +389,8 @@ function QuizDialog(props: {
                 const isFocused = () => focused() === "options" && optionIndex() === idx
                 const isSelected = () => selected().has(`opt:${idx}`)
                 return (
-                    <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} paddingRight={1} backgroundColor={isFocused() ? theme().backgroundElement : undefined} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==idx) setOptionIndex(idx) }} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==idx) setOptionIndex(idx) }} onMouseUp={() => {
-                      if (phase()!=="select") return
+                    <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} paddingRight={1} backgroundColor={isFocused() ? theme().backgroundElement : undefined} onMouseOver={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==idx) setOptionIndex(idx) }} onMouseMove={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==idx) setOptionIndex(idx) }} onMouseUp={() => {
+                      if (!canPick()) return
                       setOptionIndex(idx)
                       setFocused("options")
                       if (isMulti()) toggleOption(idx)
@@ -360,14 +406,14 @@ function QuizDialog(props: {
                 )
               }}
             </For>
-            <Show when={options().length > 0}><box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(20, popupWidth() - 8))}</text></box></Show>
-            <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} paddingRight={1} backgroundColor={focused() === "options" && optionIndex() === dontKnowIdx() ? theme().backgroundElement : undefined} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseUp={() => { if (phase()!=="select") return; setOptionIndex(dontKnowIdx()); setFocused("options"); handleDontKnow() }}>
+            <Show when={options().length > 0}><box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(2, popupWidth() - 8))}</text></box></Show>
+            <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} paddingRight={1} backgroundColor={focused() === "options" && optionIndex() === dontKnowIdx() ? theme().backgroundElement : undefined} onMouseOver={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseMove={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseUp={() => { if (!canPick()) return; setOptionIndex(dontKnowIdx()); setFocused("options"); handleDontKnow() }}>
               <box width={2} alignItems="center"><text fg={focused() === "options" && optionIndex() === dontKnowIdx() ? theme().accent : theme().textMuted}>{focused() === "options" && optionIndex() === dontKnowIdx() ? "▸" : " "}</text></box>
               <box width={2} alignItems="center"><text fg={dontKnow() ? theme().warning : theme().textMuted}>{dontKnow() ? "☑" : "☐"}</text></box>
               <box flexGrow={1}><text fg={dontKnow() ? theme().warning : theme().textMuted} italic wrapMode="wrap">I don't know — genuine gap, not a guess</text></box>
             </box>
 
-            <box flexDirection="column" gap={0} paddingTop={1} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="note") setFocused("note") }} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="note") setFocused("note") }} onMouseUp={() => { if (phase()!=="select") return; setFocused("note") }}>
+            <box flexDirection="column" gap={0} paddingTop={1} onMouseOver={() => { if (!canPick()) return; if (focused()!=="note") setFocused("note") }} onMouseMove={() => { if (!canPick()) return; if (focused()!=="note") setFocused("note") }} onMouseUp={() => { if (!canPick()) return; setFocused("note") }}>
               <box flexDirection="row" alignItems="center" gap={1}>
                 <text fg={focused() === "note" ? theme().accent : theme().textMuted} bold={focused() === "note"}>✎ Note (optional)</text>
                 <Show when={focused() === "note"}><text fg={theme().accent}>● editing</text></Show>
@@ -394,7 +440,7 @@ function QuizDialog(props: {
             </box>
             <Show when={isMulti()}>
               <box justifyContent="center" paddingTop={1}>
-                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() || note().trim() ? theme().success : theme().borderSubtle)} backgroundColor={focused() === "options" && optionIndex() === submitIdx() ? theme().backgroundElement : (selected().size > 0 || dontKnow() || note().trim() ? theme().success : theme().background)} paddingLeft={2} paddingRight={2} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseUp={() => { if (phase()!=="select") return; setOptionIndex(submitIdx()); setFocused("options"); submitSelect() }}>
+                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() || note().trim() ? theme().success : theme().borderSubtle)} backgroundColor={focused() === "options" && optionIndex() === submitIdx() ? theme().backgroundElement : (selected().size > 0 || dontKnow() || note().trim() ? theme().success : theme().background)} paddingLeft={2} paddingRight={2} onMouseOver={() => { if (!canPick()) return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseMove={() => { if (!canPick()) return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseUp={() => { if (!canPick()) return; setOptionIndex(submitIdx()); setFocused("options"); submitSelect() }}>
                   <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() || note().trim() ? theme().background : theme().textMuted)}>{focused() === "options" && optionIndex() === submitIdx() ? "▸" : " "}</text>
                   <text fg={focused() === "options" && optionIndex() === submitIdx() ? theme().accent : (selected().size > 0 || dontKnow() || note().trim() ? theme().background : theme().textMuted)} bold>↳  Submit{note().trim() && !selected().size && !dontKnow() ? " note" : ""}</text>
                 </box>
@@ -402,7 +448,7 @@ function QuizDialog(props: {
             </Show>
             <Show when={!isMulti() && note().trim() && !selected().size && !dontKnow()}>
               <box justifyContent="center" paddingTop={1}>
-                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().accent : theme().success} backgroundColor={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().backgroundElement : theme().success} paddingLeft={2} paddingRight={2} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="options" || optionIndex()!==dontKnowIdx()+1) { setFocused("options"); setOptionIndex(dontKnowIdx()+1) }}} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="options" || optionIndex()!==dontKnowIdx()+1) { setFocused("options"); setOptionIndex(dontKnowIdx()+1) }}} onMouseUp={() => { if (phase()!=="select") return; setOptionIndex(dontKnowIdx()+1); setFocused("options"); submitSelect() }}>
+                <box flexDirection="row" alignItems="center" gap={1} border={true} borderColor={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().accent : theme().success} backgroundColor={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().backgroundElement : theme().success} paddingLeft={2} paddingRight={2} onMouseOver={() => { if (!canPick()) return; if (focused()!=="options" || optionIndex()!==dontKnowIdx()+1) { setFocused("options"); setOptionIndex(dontKnowIdx()+1) }}} onMouseMove={() => { if (!canPick()) return; if (focused()!=="options" || optionIndex()!==dontKnowIdx()+1) { setFocused("options"); setOptionIndex(dontKnowIdx()+1) }}} onMouseUp={() => { if (!canPick()) return; setOptionIndex(dontKnowIdx()+1); setFocused("options"); submitSelect() }}>
                   <text fg={focused() === "options" && optionIndex() === dontKnowIdx() + 1 ? theme().accent : theme().background} bold>↳  Submit note → classify</text>
                 </box>
               </box>
@@ -417,6 +463,7 @@ function QuizDialog(props: {
             <text fg={theme().textMuted}>Mapping to options — please wait</text>
           </box>
         </Show>
+
 
         <Show when={phase() === "feedback"}>
           <box flexDirection="column" gap={1} padding={1} border={true} borderColor={feedback()?.correct ? theme().success : theme().error} backgroundColor={theme().background}>
@@ -440,7 +487,7 @@ function QuizDialog(props: {
                 )
               }}
             </For>
-            <box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(20, popupWidth() - 12))}</text></box>
+            <box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(2, popupWidth() - 12))}</text></box>
             <Show when={dontKnow()}><text fg={theme().warning}>● You said: I don't know — genuine gap</text></Show>
             <Show when={!dontKnow()}><text fg={feedback()?.correct ? theme().success : theme().error} bold>{feedback()?.correct ? "✓ Correct!  Well located." : "✗ Incorrect — nice try, let's fix the edge."}</text></Show>
             <text fg={theme().textMuted}>Correct: {props.request.correctIndices.map(i => `${i}. ${options()[i-1]?.label}`).join(", ")}</text>
@@ -456,6 +503,7 @@ function QuizDialog(props: {
             {phase() === "feedback"
               ? (canScrollUp() && canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter to continue</span></> : canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter to continue</span></> : canScrollUp() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter to continue</span></> : "↵ Enter / Esc to continue  →  next probe")
               : phase() === "classifying" ? "Classifying your note..."
+              : (phase() as any) === "classify_failed" ? <><span style={{fg: theme.error, bold: true}}>r retry classify · m switch model</span><span style={{fg: theme().textMuted}}> · ↑↓ + Enter pick an option · Esc cancel</span></>
               : focused() === "note" ? "Enter submit note → classify · Tab/Esc back"
               : (canScrollUp() || canScrollDown()) ? <><span style={{fg: theme().textMuted}}>j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel</span><span style={{fg: theme.warning, bold: true}}> · d/u scroll</span></> : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
           </text>
@@ -465,7 +513,7 @@ function QuizDialog(props: {
 }
 
 
-function QuizBatchDialog(props: {
+export function QuizBatchDialog(props: {
   api: Parameters<TuiPlugin>[0]
   request: QuizBatchPending
   onSubmit: (result: { results: Array<{ answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string; correct: boolean }> }) => void
@@ -474,14 +522,8 @@ function QuizBatchDialog(props: {
   const theme = () => props.api.theme.current
   const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
-  const popupWidth = () => {
-    const w = dims().width
-    return Math.max(64, Math.min(w - 8, Math.floor(w * 0.82), 96))
-  }
-  const popupHeight = () => {
-    const h = dims().height
-    return Math.max(14, Math.min(h - 6, Math.floor(h * 0.64), 28))
-  }
+  const popupWidth = () => popupSize(dims(), 0.82, 96).width
+  const popupHeight = () => popupSize(dims(), 0.64, 28).height
   const [idx, setIdx] = createSignal(0)
   // Guard: if no quizzes, cancel
   if (!props.request.quizzes || props.request.quizzes.length === 0) {
@@ -490,7 +532,7 @@ function QuizBatchDialog(props: {
     return null as any
   }
   const cur = () => props.request.quizzes[idx()] ?? props.request.quizzes[0]
-  const [phase, setPhase] = createSignal<"select" | "feedback" | "classifying">("select")
+  const [phase, setPhase] = createSignal<"select" | "feedback" | "classifying" | "classify_failed">("select")
   const [feedback, setFeedback] = createSignal<{ correct: boolean; selectedIndices: number[] } | null>(null)
   const [dontKnow, setDontKnow] = createSignal(false)
   const [selected, setSelected] = createSignal<Map<string, any>>(new Map())
@@ -498,6 +540,10 @@ function QuizBatchDialog(props: {
   const [focused, setFocused] = createSignal<"options" | "note">("options")
   const [optionIndex, setOptionIndex] = createSignal(0)
   const [results, setResults] = createSignal<Array<{ answers: any[]; dontKnow: boolean; note?: string; correct: boolean }>>([])
+  const [classifyErrors, setClassifyErrors] = createSignal<string[]>([])
+  const [modelHint, setModelHint] = createSignal(false)
+  // In classify_failed the option list stays live so the learner can answer manually.
+  const canPick = () => phase() === "select" || phase() === "classify_failed"
   const isMulti = () => !!cur().multiSelect
   const dontKnowIdx = () => cur().options.length
   const submitIdx = () => isMulti() ? cur().options.length + 1 : -1
@@ -557,68 +603,84 @@ function QuizBatchDialog(props: {
       }
     } catch(e){ tlog("goNext failed", String(e)); props.onCancel() }
   }
+  const failClassifyBatch = (errors: string[]) => {
+    setClassifyErrors(errors.length ? errors : ["classify failed"])
+    setFocused("options")
+    setPhase("classify_failed")
+  }
+  const startClassifyBatch = () => {
+    if (!note().trim()) return
+    setPhase("classifying")
+    setClassifyErrors([])
+    try {
+      const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
+      const cid = `${props.request.id}-${idx()}`
+      const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
+      const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
+      writeJsonAtomic(path.join(pDir, `classify-${cid}.json`), pendingClassify)
+      tlog("QuizBatchDialog classify request", cid, note().trim().slice(0, 50))
+      const respPath = path.join(pDir, `classify-response-${cid}.json`)
+      let attempts = 0
+      const poll = setInterval(() => {
+        attempts++
+        if (attempts > 60) { clearInterval(poll); failClassifyBatch(["no answer within 30s"]); return }
+        try {
+          if (fs.existsSync(respPath)) {
+            clearInterval(poll)
+            const raw = fs.readFileSync(respPath, "utf8")
+            const data: any = JSON.parse(raw)
+            try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${cid}.json`)) } catch {}
+            if (data?.failed) {
+              tlog("QuizBatchDialog classify failed", JSON.stringify(data.errors || data.reason || ""))
+              failClassifyBatch(data.errors)
+              return
+            }
+            const inferred = data?.inferredIndices as number[] | undefined
+            const semanticCorrect = data?.semanticCorrect as boolean | undefined
+            const reason = data?.reason as string | undefined
+            const isIDK = !!(data as any)?.isIDK
+            const computeOk2 = (idxs: number[]) => {
+              if (typeof semanticCorrect === "boolean") return semanticCorrect
+              const correctSet2 = new Set(cur().correctIndices)
+              return idxs.length === cur().correctIndices.length && idxs.every(v => correctSet2.has(v)) && cur().correctIndices.every(v => idxs.includes(v))
+            }
+            if (isIDK) {
+              setDontKnow(true)
+              setSelected(new Map())
+              setFeedback({ correct: false, selectedIndices: [] })
+              if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
+              tlog("QuizBatchDialog classify isIDK", reason || "")
+            } else if (inferred && inferred.length) {
+              const eff = !isMulti() && inferred.length > 1 ? [inferred[0]!] : inferred
+              if (eff.length !== inferred.length) tlog("QuizBatchDialog classify enforce single", inferred.join(","), "->", eff.join(","))
+              const mm = new Map<string, any>()
+              for (const idx of eff) { const opt = cur().options[idx - 1]; if (opt) mm.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
+              setSelected(mm)
+              const ok2 = computeOk2(eff)
+              setFeedback({ correct: ok2, selectedIndices: eff })
+              if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
+              tlog("QuizBatchDialog classify done", eff.join(","), ok2, reason || "")
+            } else {
+              const ok2 = typeof semanticCorrect === "boolean" ? semanticCorrect : false
+              setFeedback({ correct: ok2, selectedIndices: [] })
+              if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
+            }
+            setPhase("feedback")
+          }
+        } catch {}
+      }, 500)
+      onCleanup(() => clearInterval(poll))
+    } catch (e) { tlog("classify batch failed", String(e)); failClassifyBatch([`request failed: ${String(e).slice(0, 120)}`]) }
+  }
   const submitSelect = () => {
     try {
+      if (!canPick()) return
       const m = selected()
       if (!isMulti() && m.size===0 && !dontKnow() && !note().trim()) return
       if (isMulti() && m.size===0 && !dontKnow() && !note().trim()) return
       // 0 selected + note -> AI classify, keep popup
       if (m.size===0 && !dontKnow() && note().trim()) {
-        setPhase("classifying" as any)
-        try {
-          const pDir = (globalThis as any).__learnPendingDir || ".opencode/learn-pending"
-          const cid = `${props.request.id}-${idx()}`
-          const routeSessionID = (props.api.route as any)?.current?.params?.sessionID
-          const pendingClassify = { id: cid, type: "classify" as const, note: note().trim(), question: cur().question, options: cur().options.map((o: any, i: number) => ({ label: o.label, value: o.value, index: i + 1 })), multiSelect: isMulti(), timestamp: Date.now(), sessionID: props.request.sessionID || routeSessionID }
-          writeJsonAtomic(path.join(pDir, `classify-${cid}.json`), pendingClassify)
-          tlog("QuizBatchDialog classify request", cid, note().trim().slice(0, 50))
-          const respPath = path.join(pDir, `classify-response-${cid}.json`)
-          let attempts = 0
-          const poll = setInterval(() => {
-            attempts++
-            if (attempts > 60) { clearInterval(poll); setFeedback({ correct: false, selectedIndices: [] }); setPhase("feedback"); return }
-            try {
-              if (fs.existsSync(respPath)) {
-                clearInterval(poll)
-                const raw = fs.readFileSync(respPath, "utf8")
-                const data: any = JSON.parse(raw)
-                try { fs.unlinkSync(respPath); fs.unlinkSync(path.join(pDir, `classify-${cid}.json`)) } catch {}
-                const inferred = data?.inferredIndices as number[] | undefined
-                const semanticCorrect = data?.semanticCorrect as boolean | undefined
-                const reason = data?.reason as string | undefined
-                const isIDK = !!(data as any)?.isIDK
-                const computeOk2 = (idxs: number[]) => {
-                  if (typeof semanticCorrect === "boolean") return semanticCorrect
-                  const correctSet2 = new Set(cur().correctIndices)
-                  return idxs.length === cur().correctIndices.length && idxs.every(v => correctSet2.has(v)) && cur().correctIndices.every(v => idxs.includes(v))
-                }
-                if (isIDK) {
-                  setDontKnow(true)
-                  setSelected(new Map())
-                  setFeedback({ correct: false, selectedIndices: [] })
-                  if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
-                  tlog("QuizBatchDialog classify isIDK", reason || "")
-                } else if (inferred && inferred.length) {
-                  const eff = !isMulti() && inferred.length > 1 ? [inferred[0]!] : inferred
-                  if (eff.length !== inferred.length) tlog("QuizBatchDialog classify enforce single", inferred.join(","), "->", eff.join(","))
-                  const mm = new Map<string, any>()
-                  for (const idx of eff) { const opt = cur().options[idx - 1]; if (opt) mm.set(`opt:${idx - 1}`, { label: opt.label, value: opt.value, index: idx }) }
-                  setSelected(mm)
-                  const ok2 = computeOk2(eff)
-                  setFeedback({ correct: ok2, selectedIndices: eff })
-                  if (reason) setNote(prev => prev ? `${prev} — ${reason}` : prev)
-                  tlog("QuizBatchDialog classify done", eff.join(","), ok2, reason || "")
-                } else {
-                  const ok2 = typeof semanticCorrect === "boolean" ? semanticCorrect : false
-                  setFeedback({ correct: ok2, selectedIndices: [] })
-                  if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
-                }
-                setPhase("feedback")
-              }
-            } catch {}
-          }, 500)
-          onCleanup(() => clearInterval(poll))
-        } catch (e) { tlog("classify batch failed", String(e)); setFeedback({ correct: false, selectedIndices: [] }); setPhase("feedback") }
+        startClassifyBatch()
         return
       }
       const sel = Array.from(m.values())
@@ -638,6 +700,10 @@ function QuizBatchDialog(props: {
     try {
       const k=evt.name||evt.sequence||evt.raw||""; const seq=evt.sequence||""; const lower=String(k||"").toLowerCase()
       if((phase() as any)==="classifying"){ prevent(evt); return }
+      if((phase() as any)==="classify_failed" && focused()!=="note"){
+        if (isPlainKeyBatch(evt,"r")){ prevent(evt); startClassifyBatch(); return }
+        if (isPlainKeyBatch(evt,"m")){ prevent(evt); setModelHint(v=>!v); return }
+      }
       if(phase()==="feedback"){
         if (isPlainKeyBatch(evt,"d")||seq==="\x04"){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
         if (isPlainKeyBatch(evt,"u")||seq==="\x15"){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
@@ -670,17 +736,25 @@ function QuizBatchDialog(props: {
           </text>
         </box>
       </Show>
+      <Show when={(phase() as any)==="classify_failed"}>
+        <box flexDirection="column" gap={1} padding={1} border={true} borderColor={theme().error} backgroundColor={theme().background}>
+          <text fg={theme().error} bold>✗ Classification failed — no model answered</text>
+          <For each={classifyErrors()}>{(err:any,i:any)=><text fg={theme().textMuted} wrapMode="wrap">{i()+1}. {err}</text>}</For>
+          <text fg={theme().warning}>r retry · ↑↓ + Enter pick an option yourself</text>
+          <Show when={modelHint()}><text fg={theme().textMuted} wrapMode="wrap">Switch model: run /learn-model &lt;provider/model&gt; in chat, then press r</text></Show>
+        </box>
+      </Show>
       <scrollbox ref={(el:any)=> scrollRefBatch = el} flexGrow={1} verticalScrollbarOptions={{ visible: true, trackOptions: { backgroundColor: theme().background, foregroundColor: theme().borderActive } }}>
       <markdown syntaxStyle={syntax()} content={decodeQuizText(cur().question)} fg={theme().text} bg={theme().backgroundPanel} />
       <Show when={cur().details}><markdown syntaxStyle={syntax()} content={decodeQuizText(cur().details)} fg={theme().textMuted} bg={theme().backgroundPanel} /></Show>
-      <Show when={phase()==="select"}>
+      <Show when={canPick()}>
         <box flexDirection="column" gap={0} padding={1} border={true} borderColor={theme().borderSubtle} backgroundColor={theme().background}>
-          <For each={cur().options}>{(opt:any,i:any)=>{const id=i(); const foc=()=>focused()==="options"&&optionIndex()===id; const sel=()=>selected().has(`opt:${id}`); return <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={foc()?theme().backgroundElement:undefined} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==id) setOptionIndex(id) }} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==id) setOptionIndex(id) }} onMouseUp={() => { if (phase()!=="select") return; setOptionIndex(id); setFocused("options"); if (isMulti()) toggle(id); else { const o=cur().options[id]; if(o){ setSelected(new Map([[`opt:${id}`,{label:o.label,value:o.value,index:id+1}]])); setDontKnow(false); submitSelect() } } }}><box width={2}><text fg={foc()?theme().accent:theme().textMuted}>{foc()?"▸":" "}</text></box><box width={2}><text fg={isMulti()?(sel()?theme().success:theme().textMuted):(sel()?theme().accent:theme().textMuted)}>{isMulti()?(sel()?"☑":"☐"):(sel()?"⬢":"○")}</text></box><box flexGrow={1}><text fg={sel()?theme().text:theme().textMuted} bold={foc()} wrapMode="wrap">{id+1}. {opt.label}</text></box></box>}}</For>
-          <box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(20,popupWidth()-8))}</text></box>
-          <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().backgroundElement:undefined} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseUp={() => { if (phase()!=="select") return; setOptionIndex(dontKnowIdx()); setFocused("options"); const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); }}><box width={2}><text fg={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===dontKnowIdx()?"▸":" "}</text></box><box width={2}><text fg={dontKnow()?theme().warning:theme().textMuted}>{dontKnow()?"☑":"☐"}</text></box><box flexGrow={1}><text fg={dontKnow()?theme().warning:theme().textMuted} italic>I don't know</text></box></box>
-          <box flexDirection="column" paddingTop={1} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="note") setFocused("note") }} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="note") setFocused("note") }} onMouseUp={() => { if (phase()!=="select") return; setFocused("note") }}><text fg={focused()==="note"?theme().accent:theme().textMuted}>✎ Note</text><box border={true} borderColor={focused()==="note"?theme().accent:theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}><Show when={focused()==="note"} fallback={<text fg={theme().textMuted}>{note()||"Tab to edit · share what you were thinking"}</text>}><input ref={(el:any)=>noteEl=el} value={note()} onInput={(v:any)=>setNote(typeof v==="string"?v:v?.target?.value??"")} onSubmit={()=>{ if (!selected().size && !dontKnow() && note().trim()) submitSelect(); else setFocused("options") }} placeholder="note (Enter to submit note → classify)" /></Show></box></box>
+          <For each={cur().options}>{(opt:any,i:any)=>{const id=i(); const foc=()=>focused()==="options"&&optionIndex()===id; const sel=()=>selected().has(`opt:${id}`); return <box flexDirection="row" alignItems="flexStart" gap={1} paddingLeft={1} backgroundColor={foc()?theme().backgroundElement:undefined} onMouseOver={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==id) setOptionIndex(id) }} onMouseMove={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==id) setOptionIndex(id) }} onMouseUp={() => { if (!canPick()) return; setOptionIndex(id); setFocused("options"); if (isMulti()) toggle(id); else { const o=cur().options[id]; if(o){ setSelected(new Map([[`opt:${id}`,{label:o.label,value:o.value,index:id+1}]])); setDontKnow(false); submitSelect() } } }}><box width={2}><text fg={foc()?theme().accent:theme().textMuted}>{foc()?"▸":" "}</text></box><box width={2}><text fg={isMulti()?(sel()?theme().success:theme().textMuted):(sel()?theme().accent:theme().textMuted)}>{isMulti()?(sel()?"☑":"☐"):(sel()?"⬢":"○")}</text></box><box flexGrow={1}><text fg={sel()?theme().text:theme().textMuted} bold={foc()} wrapMode="wrap">{id+1}. {opt.label}</text></box></box>}}</For>
+          <box height={1}><text fg={theme().borderSubtle}>{"─".repeat(Math.max(2,popupWidth()-8))}</text></box>
+          <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().backgroundElement:undefined} onMouseOver={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseMove={() => { if (!canPick()) return; if (focused()!=="options") setFocused("options"); if (optionIndex()!==dontKnowIdx()) setOptionIndex(dontKnowIdx()) }} onMouseUp={() => { if (!canPick()) return; setOptionIndex(dontKnowIdx()); setFocused("options"); const willBe=!dontKnow(); setDontKnow(willBe); if(willBe) setSelected(new Map()); }}><box width={2}><text fg={focused()==="options"&&optionIndex()===dontKnowIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===dontKnowIdx()?"▸":" "}</text></box><box width={2}><text fg={dontKnow()?theme().warning:theme().textMuted}>{dontKnow()?"☑":"☐"}</text></box><box flexGrow={1}><text fg={dontKnow()?theme().warning:theme().textMuted} italic>I don't know</text></box></box>
+          <box flexDirection="column" paddingTop={1} onMouseOver={() => { if (!canPick()) return; if (focused()!=="note") setFocused("note") }} onMouseMove={() => { if (!canPick()) return; if (focused()!=="note") setFocused("note") }} onMouseUp={() => { if (!canPick()) return; setFocused("note") }}><text fg={focused()==="note"?theme().accent:theme().textMuted}>✎ Note</text><box border={true} borderColor={focused()==="note"?theme().accent:theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}><Show when={focused()==="note"} fallback={<text fg={theme().textMuted}>{note()||"Tab to edit · share what you were thinking"}</text>}><input ref={(el:any)=>noteEl=el} value={note()} onInput={(v:any)=>setNote(typeof v==="string"?v:v?.target?.value??"")} onSubmit={()=>{ if (!selected().size && !dontKnow() && note().trim()) submitSelect(); else setFocused("options") }} placeholder="note (Enter to submit note → classify)" /></Show></box></box>
           <box flexDirection="row" justifyContent="space-between" paddingTop={1}><text fg={theme().textMuted}>{isMulti() ? `${selected().size} selected` : note().trim() && !selected().size ? "note → classify" : ""}</text><text fg={theme().textMuted}>{idx()+1}/{props.request.quizzes.length}</text></box>
-          <Show when={isMulti()}><box justifyContent="center" paddingTop={1}><box flexDirection="row" gap={1} border={true} borderColor={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().borderSubtle} backgroundColor={focused()==="options"&&optionIndex()===submitIdx()?theme().backgroundElement:theme().background} paddingLeft={2} paddingRight={2} onMouseOver={() => { if (phase()!=="select") return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseMove={() => { if (phase()!=="select") return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseUp={() => { if (phase()!=="select") return; setOptionIndex(submitIdx()); setFocused("options"); submitSelect() }}><text fg={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===submitIdx()?"▸":" "}</text><text bold>↳ Submit</text></box></box></Show>
+          <Show when={isMulti()}><box justifyContent="center" paddingTop={1}><box flexDirection="row" gap={1} border={true} borderColor={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().borderSubtle} backgroundColor={focused()==="options"&&optionIndex()===submitIdx()?theme().backgroundElement:theme().background} paddingLeft={2} paddingRight={2} onMouseOver={() => { if (!canPick()) return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseMove={() => { if (!canPick()) return; if (focused()!=="options" || optionIndex()!==submitIdx()) { setFocused("options"); setOptionIndex(submitIdx()) }}} onMouseUp={() => { if (!canPick()) return; setOptionIndex(submitIdx()); setFocused("options"); submitSelect() }}><text fg={focused()==="options"&&optionIndex()===submitIdx()?theme().accent:theme().textMuted}>{focused()==="options"&&optionIndex()===submitIdx()?"▸":" "}</text><text bold>↳ Submit</text></box></box></Show>
         </box>
       </Show>
       <Show when={(phase() as any)==="classifying"}>
@@ -701,7 +775,7 @@ function QuizBatchDialog(props: {
       </scrollbox>
       <box height={1} justifyContent="center">
         <text fg={theme().textMuted} wrapMode="wrap">
-          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollUpBatch() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : focused()==="note" ? "Enter submit note → classify · Tab/Esc back" : (canScrollUpBatch() || canScrollDownBatch()) ? <><span style={{fg: theme().textMuted}}>j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel</span><span style={{fg: theme.warning, bold: true}}> · d/u scroll</span></> : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
+          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollUpBatch() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : (phase() as any)==="classify_failed" ? <><span style={{fg: theme.error, bold: true}}>r retry classify · m switch model</span><span style={{fg: theme().textMuted}}> · ↑↓ + Enter pick an option · Esc cancel</span></> : focused()==="note" ? "Enter submit note → classify · Tab/Esc back" : (canScrollUpBatch() || canScrollDownBatch()) ? <><span style={{fg: theme().textMuted}}>j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel</span><span style={{fg: theme.warning, bold: true}}> · d/u scroll</span></> : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
         </text>
       </box>
     </box>

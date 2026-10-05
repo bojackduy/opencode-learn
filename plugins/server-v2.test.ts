@@ -76,6 +76,7 @@ describe("Server v2 setup", () => {
         [
           "edit_mermaid",
           "edit_svg",
+          "learn_classify_model",
           "md_log",
           "md_log_status",
           "md_unlog",

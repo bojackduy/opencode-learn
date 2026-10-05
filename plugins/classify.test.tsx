@@ -61,3 +61,21 @@ describe("applyClassifyResult", () => {
     })
   })
 })
+
+describe("applyClassifyResult total failure", () => {
+  test("failed response reports the per-model errors instead of an empty answer", () => {
+    const r = applyClassifyResult(single, { failed: true, errors: ["anthropic/claude-sonnet-4-5: 429 rate limited", "opencode/big: 401 auth"] })
+    expect(r).toEqual({
+      selectedIndices: [], dontKnow: false, correct: false, failed: true,
+      errors: ["anthropic/claude-sonnet-4-5: 429 rate limited", "opencode/big: 401 auth"],
+    })
+  })
+
+  test("failed without errors still carries a reason line", () => {
+    expect(applyClassifyResult(single, { failed: true }).errors).toEqual(["all models failed"])
+  })
+
+  test("a model that answered is not a failure", () => {
+    expect(applyClassifyResult(single, { inferredIndices: [2] }).failed).toBeUndefined()
+  })
+})
