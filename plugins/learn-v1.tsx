@@ -51,6 +51,10 @@ function syntaxStyle(theme:any){
   ])
 }
 
+// Identifies the feedback-phase reasoning box so the scroll region can bring it
+// into view: it sits below the review, which on a short popup starts off-screen.
+const WHY_BOX_ID = "learn-why-box"
+
 // Popup geometry derives from the real terminal. A floor wider/taller than the
 // screen (phone over SSH at 44 cols) overflowed the popup and collapsed its
 // border, so the floors are only safe minimums and the terminal always wins.
@@ -68,7 +72,7 @@ export function popupSize(terminal: { width?: number; height?: number }, cap: nu
 export function QuizDialog(props: {
   api: Parameters<TuiPlugin>[0]
   request: QuizPending
-  onSubmit: (result: { answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string }) => void
+  onSubmit: (result: { answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string; why?: string }) => void
   onCancel: () => void
 }) {
   const theme = () => props.api.theme.current
@@ -82,10 +86,13 @@ export function QuizDialog(props: {
   const dontKnowIdx = () => options().length
   const submitIdx = () => isMulti() ? options().length + 1 : -1
 
-  const [focused, setFocused] = createSignal<"options" | "note">("options")
+  const [focused, setFocused] = createSignal<"options" | "note" | "why">("options")
   const [optionIndex, setOptionIndex] = createSignal(0)
   const [phase, setPhase] = createSignal<"select" | "feedback" | "classifying" | "classify_failed">("select")
   const [note, setNote] = createSignal("")
+  // Feedback-phase reasoning: separate from `note`, which the classifier maps
+  // onto an option. Never classified, never required.
+  const [why, setWhy] = createSignal("")
   const [dontKnow, setDontKnow] = createSignal(false)
   const [selected, setSelected] = createSignal<Map<string, { label: string; value: string; index: number }>>(new Map())
   const [feedback, setFeedback] = createSignal<{ correct: boolean; selectedIndices: number[] } | null>(null)
@@ -97,6 +104,9 @@ export function QuizDialog(props: {
   const canPick = () => phase() === "select" || phase() === "classify_failed"
 
   let noteInputEl: any
+  // Signal, not a plain ref: the feedback box mounts its input in the same
+  // batch that focuses it, so a one-shot read would miss the element.
+  const [whyInputEl, setWhyInputEl] = createSignal<any>(null)
   let scrollRef: any
   const [canScrollUp, setCanScrollUp] = createSignal(false)
   const [canScrollDown, setCanScrollDown] = createSignal(false)
@@ -121,9 +131,15 @@ export function QuizDialog(props: {
       try { noteInputEl.focus() } catch {}
     }
   })
+  createEffect(() => {
+    const el = whyInputEl()
+    if (focused() === "why" && el) {
+      try { el.focus() } catch {}
+    }
+  })
   // Keep indicators in sync on phase/dims/feedback changes
   createEffect(() => { phase(); feedback(); dims(); setTimeout(updateScrollIndicators, 40); setTimeout(updateScrollIndicators, 200) })
-  createEffect(() => { note(); setTimeout(updateScrollIndicators, 40) })
+  createEffect(() => { note(); why(); setTimeout(updateScrollIndicators, 40); setTimeout(revealWhy, 60) })
   createEffect(() => {
     if (phase() !== "feedback" && phase() !== "select") return
     const id = setInterval(updateScrollIndicators, 200)
@@ -155,6 +171,16 @@ export function QuizDialog(props: {
     setFocused("options")
     setPhase("classify_failed")
   }
+  // The reasoning box sits below the review, so on a short popup it starts out
+  // of view: bring it on screen or the focused input is invisible. Scrolling is
+  // relative (never an absolute position) so repeated calls settle instead of
+  // fighting each other.
+  const revealWhy = () => {
+    try { if (whyInputEl()) scrollRef?.scrollChildIntoView(WHY_BOX_ID) } catch {}
+  }
+  // Every route into feedback lands here: the review opens with the reasoning
+  // box focused, so "why did I pick this" can be said before Enter sends.
+  const showFeedback = () => { setFocused("why"); setPhase("feedback"); setTimeout(revealWhy, 40) }
   const startClassify = () => {
     if (!note().trim()) return
     setPhase("classifying")
@@ -226,7 +252,7 @@ export function QuizDialog(props: {
               setFeedback({ correct, selectedIndices: [] })
               if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
             }
-            setPhase("feedback")
+            showFeedback()
           }
         } catch {}
       }, 500)
@@ -246,7 +272,7 @@ export function QuizDialog(props: {
     }
     if (dontKnow()) {
       setFeedback({ correct: false, selectedIndices: [] })
-      setPhase("feedback")
+      showFeedback()
       return
     }
     const selectedIndices = Array.from(selMap.values()).map(v => v.index)
@@ -254,11 +280,11 @@ export function QuizDialog(props: {
       selectedIndices.every(i => correctSet.has(i)) &&
       props.request.correctIndices.every(i => selectedIndices.includes(i))
     setFeedback({ correct, selectedIndices })
-    setPhase("feedback")
+    showFeedback()
   }
   const confirmFeedback = () => {
     const sel = Array.from(selected().values())
-    props.onSubmit({ answers: dontKnow() ? [] : sel, dontKnow: dontKnow(), note: note().trim() || undefined })
+    props.onSubmit({ answers: dontKnow() ? [] : sel, dontKnow: dontKnow(), note: note().trim() || undefined, why: why().trim() || undefined })
   }
 
   const isPlainKey = (evt:any, want:string) => {
@@ -282,6 +308,17 @@ export function QuizDialog(props: {
     }
     // When in feedback, handle scroll first, then confirm
     if (phase() === "feedback") {
+      // "Why I picked this" box focused: it opens the review, so typing must
+      // reach the input instead of the scroll keys. Enter still sends, empty
+      // or not — this box is never a confirmation step.
+      if (focused() === "why") {
+        if (lower === "tab" || seq === "\t") { prevent(evt); setFocused("options"); return }
+        if (lower === "escape" || lower === "esc") { prevent(evt); setFocused("options"); return }
+        if (lower === "enter" || seq === "\r") { prevent(evt); confirmFeedback(); return }
+        // Allow typing to go to input; don't prevent
+        return
+      }
+      if (lower === "tab" || seq === "\t") { prevent(evt); setFocused("why"); return }
       if (isPlainKey(evt,"d") || seq === "\x04") { prevent(evt); try { scrollRef?.scrollBy(scrollAmount()); setTimeout(updateScrollIndicators, 30); setTimeout(updateScrollIndicators, 120) } catch {} return }
       if (isPlainKey(evt,"u") || seq === "\x15") { prevent(evt); try { scrollRef?.scrollBy(-scrollAmount()); setTimeout(updateScrollIndicators, 30); setTimeout(updateScrollIndicators, 120) } catch {} return }
       if (isPlainKey(evt,"j") || seq === "\x1b[B") { prevent(evt); try { scrollRef?.scrollBy(1); setTimeout(updateScrollIndicators, 30) } catch {} return }
@@ -493,6 +530,23 @@ export function QuizDialog(props: {
             <Show when={!dontKnow()}><text fg={feedback()?.correct ? theme().success : theme().error} bold>{feedback()?.correct ? "✓ Correct!  Well located." : "✗ Incorrect — nice try, let's fix the edge."}</text></Show>
             <text fg={theme().textMuted}>Correct: {props.request.correctIndices.map(i => `${i}. ${options()[i-1]?.label}`).join(", ")}</text>
             <Show when={note()}><text fg={theme().textMuted}>Your note: {note()}</text></Show>
+            <box id={WHY_BOX_ID} flexDirection="column" gap={0} paddingTop={1} onMouseOver={() => { if (phase() !== "feedback") return; if (focused()!=="why") setFocused("why") }} onMouseMove={() => { if (phase() !== "feedback") return; if (focused()!=="why") setFocused("why") }} onMouseUp={() => { if (phase() !== "feedback") return; setFocused("why") }}>
+              <box flexDirection="row" alignItems="center" gap={1}>
+                <text fg={focused() === "why" ? theme().accent : theme().textMuted} bold={focused() === "why"}>✎ Why I picked this (optional)</text>
+                <Show when={focused() === "why"}><text fg={theme().accent}>● editing</text></Show>
+              </box>
+              <box border={true} borderColor={focused() === "why" ? theme().accent : theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}>
+                <Show when={focused() === "why"} fallback={<text fg={why() ? theme().text : theme().textMuted} wrapMode="wrap">{why() || "Tab to edit · say why (reasoned, hunch, or a guess)"}</text>}>
+                  <input
+                    ref={(el: any) => setWhyInputEl(el)}
+                    value={why()}
+                    onInput={(value: any) => setWhy(typeof value === "string" ? value : value?.target?.value ?? value?.value ?? String(value ?? ""))}
+                    onSubmit={() => confirmFeedback()}
+                    placeholder="why this one? (Enter to send — optional)"
+                  />
+                </Show>
+              </box>
+            </box>
             <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}>
               <markdown syntaxStyle={syntax()} content={decodeQuizText(props.request.explanation)} fg={theme().text} bg={theme().backgroundPanel} />
             </box>
@@ -502,7 +556,8 @@ export function QuizDialog(props: {
         <box height={1} justifyContent="center">
           <text fg={theme().textMuted} wrapMode="wrap">
             {phase() === "feedback"
-              ? (canScrollUp() && canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter to continue</span></> : canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter to continue</span></> : canScrollUp() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter to continue</span></> : "↵ Enter / Esc to continue  →  next probe")
+              ? focused() === "why" ? "↵ Enter to continue (why is optional) · Tab/Esc leave the box"
+              : (canScrollUp() && canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter to continue</span></> : canScrollDown() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter to continue</span></> : canScrollUp() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter to continue</span></> : "↵ Enter / Esc to continue  →  next probe")
               : phase() === "classifying" ? "Classifying your note..."
               : (phase() as any) === "classify_failed" ? <><span style={{fg: theme.error, bold: true}}>r retry classify · m switch model</span><span style={{fg: theme().textMuted}}> · ↑↓ + Enter pick an option · Esc cancel</span></>
               : focused() === "note" ? "Enter submit note → classify · Tab/Esc back"
@@ -517,7 +572,7 @@ export function QuizDialog(props: {
 export function QuizBatchDialog(props: {
   api: Parameters<TuiPlugin>[0]
   request: QuizBatchPending
-  onSubmit: (result: { results: Array<{ answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string; correct: boolean }> }) => void
+  onSubmit: (result: { results: Array<{ answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string; why?: string; correct: boolean }> }) => void
   onCancel: () => void
 }) {
   const theme = () => props.api.theme.current
@@ -538,9 +593,11 @@ export function QuizBatchDialog(props: {
   const [dontKnow, setDontKnow] = createSignal(false)
   const [selected, setSelected] = createSignal<Map<string, any>>(new Map())
   const [note, setNote] = createSignal("")
-  const [focused, setFocused] = createSignal<"options" | "note">("options")
+  // Per-question reasoning, collected in this question's feedback phase.
+  const [why, setWhy] = createSignal("")
+  const [focused, setFocused] = createSignal<"options" | "note" | "why">("options")
   const [optionIndex, setOptionIndex] = createSignal(0)
-  const [results, setResults] = createSignal<Array<{ answers: any[]; dontKnow: boolean; note?: string; correct: boolean }>>([])
+  const [results, setResults] = createSignal<Array<{ answers: any[]; dontKnow: boolean; note?: string; why?: string; correct: boolean }>>([])
   const [classifyErrors, setClassifyErrors] = createSignal<string[]>([])
   const [modelHint, setModelHint] = createSignal(false)
   // In classify_failed the option list stays live so the learner can answer manually.
@@ -549,6 +606,7 @@ export function QuizBatchDialog(props: {
   const dontKnowIdx = () => cur().options.length
   const submitIdx = () => isMulti() ? cur().options.length + 1 : -1
   let noteEl: any
+  const [whyEl, setWhyEl] = createSignal<any>(null)
   let scrollRefBatch: any
   const [canScrollUpBatch, setCanScrollUpBatch] = createSignal(false)
   const [canScrollDownBatch, setCanScrollDownBatch] = createSignal(false)
@@ -569,8 +627,9 @@ export function QuizBatchDialog(props: {
   }
   const scrollAmountBatch = () => Math.max(1, Math.floor((scrollRefBatch?.height ?? popupHeight()) / 3))
   createEffect(() => { if (focused()==="note" && noteEl) try{noteEl.focus()}catch(e){ tlog("note focus failed", String(e)) } })
+  createEffect(() => { const el=whyEl(); if (focused()==="why" && el) try{el.focus()}catch(e){ tlog("why focus failed", String(e)) } })
   createEffect(() => { phase(); feedback(); dims(); idx(); setTimeout(updateScrollBatch, 40); setTimeout(updateScrollBatch, 200) })
-  createEffect(() => { note(); setTimeout(updateScrollBatch, 40) })
+  createEffect(() => { note(); why(); setTimeout(updateScrollBatch, 40); setTimeout(revealWhy, 60) })
   createEffect(() => {
     if (phase() !== "feedback" && phase() !== "select") return
     const id = setInterval(updateScrollBatch, 200)
@@ -592,12 +651,12 @@ export function QuizBatchDialog(props: {
       const correctSet = new Set(cur().correctIndices)
       const si = sel.map((a:any)=>a.index)
       const ok = !dk && si.length===cur().correctIndices.length && si.every((i:number)=>correctSet.has(i))
-      const entry = { answers: dk?[]:sel, dontKnow: dk, note: note().trim()||undefined, correct: ok }
+      const entry = { answers: dk?[]:sel, dontKnow: dk, note: note().trim()||undefined, why: why().trim()||undefined, correct: ok }
       const nextResults = [...results(), entry]
       tlog("QuizBatchDialog goNext", idx(), ok, JSON.stringify(entry).slice(0,200))
       setResults(nextResults)
       if (idx() + 1 < props.request.quizzes.length) {
-        setIdx(i=>i+1); setSelected(new Map()); setDontKnow(false); setNote(""); setOptionIndex(0); setFocused("options"); setPhase("select"); setFeedback(null)
+        setIdx(i=>i+1); setSelected(new Map()); setDontKnow(false); setNote(""); setWhy(""); setOptionIndex(0); setFocused("options"); setPhase("select"); setFeedback(null)
       } else {
         tlog("QuizBatchDialog done, submitting", nextResults.length)
         props.onSubmit({ results: nextResults })
@@ -609,6 +668,12 @@ export function QuizBatchDialog(props: {
     setFocused("options")
     setPhase("classify_failed")
   }
+  // Same contract as the single dialog: the review opens on the reasoning box,
+  // scoped to the question being answered right now.
+  const revealWhy = () => {
+    try { if (whyEl()) scrollRefBatch?.scrollChildIntoView(WHY_BOX_ID) } catch {}
+  }
+  const showFeedback = () => { setFocused("why"); setPhase("feedback"); setTimeout(revealWhy, 40) }
   const startClassifyBatch = () => {
     if (!note().trim()) return
     setPhase("classifying")
@@ -666,7 +731,7 @@ export function QuizBatchDialog(props: {
               setFeedback({ correct: ok2, selectedIndices: [] })
               if (reason) setNote(prev => prev ? `${prev} — ${reason}` : reason)
             }
-            setPhase("feedback")
+            showFeedback()
           }
         } catch {}
       }, 500)
@@ -691,7 +756,7 @@ export function QuizBatchDialog(props: {
       const ok = !dk && si.length===cur().correctIndices.length && si.every((i:number)=>correctSet.has(i))
       tlog("QuizBatchDialog submitSelect", idx(), sel.length, dk, ok)
       setFeedback({ correct: ok, selectedIndices: si })
-      setPhase("feedback")
+      showFeedback()
     } catch(e){ tlog("submitSelect failed", String(e)) }
   }
   const isPlainKeyBatch = (evt:any, want:string) => {
@@ -706,6 +771,13 @@ export function QuizBatchDialog(props: {
         if (isPlainKeyBatch(evt,"m")){ prevent(evt); setModelHint(v=>!v); return }
       }
       if(phase()==="feedback"){
+        if(focused()==="why"){
+          if(lower==="tab"||seq==="\t"){prevent(evt); setFocused("options"); return}
+          if(lower==="escape"||lower==="esc"){prevent(evt); setFocused("options"); return}
+          if(lower==="enter"||seq==="\r"){prevent(evt); goNext(); return}
+          return
+        }
+        if(lower==="tab"||seq==="\t"){prevent(evt); setFocused("why"); return}
         if (isPlainKeyBatch(evt,"d")||seq==="\x04"){ prevent(evt); try{scrollRefBatch?.scrollBy(scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
         if (isPlainKeyBatch(evt,"u")||seq==="\x15"){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30); setTimeout(updateScrollBatch,120)}catch{} return }
         if (lower==="pageup"||seq==="\x1b[5~"){ prevent(evt); try{scrollRefBatch?.scrollBy(-scrollAmountBatch()); setTimeout(updateScrollBatch,30)}catch{} return }
@@ -770,13 +842,14 @@ export function QuizBatchDialog(props: {
           <For each={cur().options}>{(opt:any,i:any)=>{const id=i()+1; const sel=()=>feedback()?.selectedIndices.includes(id)??false; const ok=()=>new Set(cur().correctIndices).has(id); let ic=" "; let fg=theme().textMuted; let bg:any=undefined; if(dontKnow()){ic=ok()?"✓":" "; fg=ok()?theme().background:theme().textMuted; bg=ok()?theme().success:undefined} else if(sel()&&ok()){ic="✓"; fg=theme().background; bg=theme().success} else if(sel()&&!ok()){ic="✗"; fg=theme().background; bg=theme().error} else if(!sel()&&ok()){ic="○"; fg=theme().background; bg=theme().warning} return <box flexDirection="row" gap={1} paddingLeft={1} backgroundColor={bg}><box width={2}><text fg={fg} bold>{ic}</text></box><box flexGrow={1}><text fg={fg} wrapMode="wrap">{id}. {opt.label}</text></box></box>}}</For>
           <text fg={feedback()?.correct?theme().success:theme().error} bold>{feedback()?.correct?"✓ Correct":"✗ Incorrect"}</text>
           <text fg={theme().textMuted}>Correct: {cur().correctIndices.map((i:number)=>`${i}. ${cur().options[i-1]?.label}`).join(", ")}</text>
+          <box id={WHY_BOX_ID} flexDirection="column" paddingTop={1} onMouseOver={() => { if (phase()!=="feedback") return; if (focused()!=="why") setFocused("why") }} onMouseMove={() => { if (phase()!=="feedback") return; if (focused()!=="why") setFocused("why") }} onMouseUp={() => { if (phase()!=="feedback") return; setFocused("why") }}><box flexDirection="row" alignItems="center" gap={1}><text fg={focused()==="why"?theme().accent:theme().textMuted} bold={focused()==="why"}>{"✎"} Why I picked this (optional)</text><Show when={focused()==="why"}><text fg={theme().accent}>{"●"} editing</text></Show></box><box border={true} borderColor={focused()==="why"?theme().accent:theme().borderSubtle} backgroundColor={theme().backgroundElement} paddingLeft={1} paddingRight={1}><Show when={focused()==="why"} fallback={<text fg={why()?theme().text:theme().textMuted} wrapMode="wrap">{why()||"Tab to edit · say why (reasoned, hunch, or a guess)"}</text>}><input ref={(el:any)=>setWhyEl(el)} value={why()} onInput={(v:any)=>setWhy(typeof v==="string"?v:v?.target?.value??"")} onSubmit={()=>goNext()} placeholder="why this one? (Enter to send — optional)" /></Show></box></box>
           <box border={true} borderColor={theme().borderSubtle} backgroundColor={theme().backgroundPanel} padding={1}><markdown syntaxStyle={syntax()} content={decodeQuizText(cur().explanation)} fg={theme().text} bg={theme().backgroundPanel} /></box>
         </box>
       </Show>
       </scrollbox>
       <box height={1} justifyContent="center">
         <text fg={theme().textMuted} wrapMode="wrap">
-          {phase()==="feedback" ? (canScrollUpBatch() && canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollUpBatch() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : (phase() as any)==="classify_failed" ? <><span style={{fg: theme.error, bold: true}}>r retry classify · m switch model</span><span style={{fg: theme().textMuted}}> · ↑↓ + Enter pick an option · Esc cancel</span></> : focused()==="note" ? "Enter submit note → classify · Tab/Esc back" : (canScrollUpBatch() || canScrollDownBatch()) ? <><span style={{fg: theme().textMuted}}>j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel</span><span style={{fg: theme.warning, bold: true}}> · d/u scroll</span></> : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
+          {phase()==="feedback" ? focused()==="why" ? `Enter → next (${idx()+1}/${props.request.quizzes.length}) · why optional · Tab/Esc leave the box` : (canScrollUpBatch() && canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▲ more above · ▼ more below</span><span style={{fg: theme().textMuted}}> — d/u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollDownBatch() ? <><span style={{fg: theme.warning, bold: true}}>▼ more below</span><span style={{fg: theme().textMuted}}> — d to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : canScrollUpBatch() ? <><span style={{fg: theme.accent, bold: true}}>▲ more above</span><span style={{fg: theme().textMuted}}> — u to scroll · Enter → next ({idx()+1}/{props.request.quizzes.length})</span></> : `Enter → next (${idx()+1}/${props.request.quizzes.length})`) : phase()==="classifying" ? "Classifying your note..." : (phase() as any)==="classify_failed" ? <><span style={{fg: theme.error, bold: true}}>r retry classify · m switch model</span><span style={{fg: theme().textMuted}}> · ↑↓ + Enter pick an option · Esc cancel</span></> : focused()==="note" ? "Enter submit note → classify · Tab/Esc back" : (canScrollUpBatch() || canScrollDownBatch()) ? <><span style={{fg: theme().textMuted}}>j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel</span><span style={{fg: theme.warning, bold: true}}> · d/u scroll</span></> : "j/k or ↑↓ move · Space toggle · Tab note · Enter submit · Esc cancel"}
         </text>
       </box>
     </box>

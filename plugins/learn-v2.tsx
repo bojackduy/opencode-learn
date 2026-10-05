@@ -180,7 +180,10 @@ export function V2QuizDialog(props: {
   // paint in v2 before.
   let noteStr = ""
   let noteReason = ""
-  let focusTarget: "options" | "note" = "options"
+  // Feedback-phase reasoning (separate from `note`, which the classifier maps
+  // onto an option). Hand-rolled editor, same as the note: no <input> here.
+  let whyStr = ""
+  let focusTarget: "options" | "note" | "why" = "options"
   let pollCancel: (() => void) | null = null
 
   let rootBox: any = null
@@ -204,6 +207,7 @@ export function V2QuizDialog(props: {
   const failedReasons: any[] = []
   let failedHint: any = null
   let noteTextFb: any = null
+  let fbFooterText: any = null
 
   const rowLabel = (index: number) => {
     const option = allRows[index]!
@@ -307,8 +311,10 @@ export function V2QuizDialog(props: {
     }
     scrollOff = 0
     phaseStr = "feedback"
+    focusTarget = "why"
     paintHeader()
     paintReview()
+    paintWhy()
     if (selectBox) selectBox.visible = false
     if (feedbackBox) feedbackBox.visible = true
   }
@@ -329,11 +335,29 @@ export function V2QuizDialog(props: {
       ? "Type · Enter classify with AI · Tab/Esc back to options"
       : (multi ? "UP/DOWN move  SPACE toggle  ENTER review  TAB note  ESC cancel" : "UP/DOWN move  ENTER review  TAB note  ESC cancel")
   }
+  // The reason has no row of its own: the v2 popup is height-capped, and one
+  // extra row squeezes the explanation box out of the frame. It rides the
+  // feedback footer line instead — same phase, same focus rules.
+  const paintWhy = () => {
+    const focusedWhy = focusTarget === "why"
+    if (fbFooterText) {
+      fbFooterText.content = whyStr
+        ? `Why I picked this: ${whyStr}${focusedWhy ? "▌" : ""}`
+        : focusedWhy
+          ? "Why I picked this (optional) — type why · ENTER sends · TAB/ESC back"
+          : "d/u scroll  ·  TAB why  ·  Enter send to AI  ·  Esc cancel"
+      fbFooterText.fg = whyStr ? props.theme.text : props.theme.textMuted
+    }
+  }
+  // The review opens on the reasoning box so "why did I pick this" can be said
+  // before Enter sends. Optional: Enter sends with it empty.
   const showFeedback = () => {
     scrollOff = 0
     phaseStr = "feedback"
+    focusTarget = "why"
     paintHeader()
     paintReview()
+    paintWhy()
     if (selectBox) selectBox.visible = false
     if (failedBox) failedBox.visible = false
     if (feedbackBox) feedbackBox.visible = true
@@ -411,11 +435,26 @@ export function V2QuizDialog(props: {
     const key = String(event.name || event.sequence || "").toLowerCase()
     const seq = event.sequence || ""
     if (phaseStr === "feedback") {
+      // Reasoning box focused: typing must reach the box, not the scroll keys.
+      // Enter still sends — the box is never a confirmation step.
+      if (focusTarget === "why") {
+        if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "options"; paintWhy(); return }
+        if (key === "escape" || key === "esc") { prevent(event); focusTarget = "options"; paintWhy(); return }
+        if (key === "enter" || key === "return" || seq === "\r") { prevent(event); finishSubmit(() => { if (pendingRes) { pendingRes.why = whyStr.trim() || undefined; props.onSubmit(pendingRes) } }); return }
+        if (key === "backspace" || seq === "\x7f" || seq === "\b") { prevent(event); whyStr = whyStr.slice(0, -1); paintWhy(); return }
+        if (!event.ctrl && !event.meta && seq.length === 1 && seq >= " ") {
+          prevent(event)
+          if (whyStr.length < 240) { whyStr += seq; paintWhy() }
+          return
+        }
+        return
+      }
+      if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "why"; paintWhy(); return }
       if (key === "d" || seq === "\x04" || key === "pagedown" || seq === "\x1b[6~") { prevent(event); scrollBy(4); return }
       if (key === "u" || seq === "\x15" || key === "pageup" || seq === "\x1b[5~") { prevent(event); scrollBy(-4); return }
       if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); scrollBy(1); return }
       if (key === "up" || key === "k" || seq === "\x1b[A") { prevent(event); scrollBy(-1); return }
-      if (key === "enter" || key === "return" || seq === "\r") { prevent(event); finishSubmit(() => { if (pendingRes) props.onSubmit(pendingRes) }); return }
+      if (key === "enter" || key === "return" || seq === "\r") { prevent(event); finishSubmit(() => { if (pendingRes) { pendingRes.why = whyStr.trim() || undefined; props.onSubmit(pendingRes) } }); return }
       if (key === "escape" || key === "esc") { prevent(event); finishCancel(); return }
       return
     }
@@ -544,7 +583,7 @@ export function V2QuizDialog(props: {
           <box backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}><text ref={(element: any) => scrollCueText = element} fg={props.theme.background} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text></box>
         </box>
         <text ref={(element: any) => noteTextFb = element} fg={props.theme.textMuted} wrapMode="wrap"> </text>
-        <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
+        <text ref={(element: any) => fbFooterText = element} fg={props.theme.textMuted}>d/u scroll  ·  TAB why  ·  Enter send to AI  ·  Esc cancel</text>
       </box>
     </box>
   )
@@ -575,7 +614,9 @@ export function V2QuizBatchDialog(props: {
   const canPick = () => phaseStr === "select" || phaseStr === "classify_failed"
   let noteStr = ""
   let noteReason = ""
-  let focusTarget: "options" | "note" = "options"
+  // Feedback-phase reasoning, scoped to the question being answered.
+  let whyStr = ""
+  let focusTarget: "options" | "note" | "why" = "options"
   let pollCancel: (() => void) | null = null
   let fb: { correct: boolean; selectedIndices: number[]; dontKnow: boolean } | null = null
   let pendingRes: QuizResult | null = null
@@ -607,6 +648,7 @@ export function V2QuizBatchDialog(props: {
   const failedReasons: any[] = []
   let failedHint: any = null
   let noteTextFb: any = null
+  let fbFooterText: any = null
 
   const cur = () => quizzes[qIdx]!
   const curMulti = () => !!cur().multiSelect
@@ -699,11 +741,24 @@ export function V2QuizBatchDialog(props: {
       ? "Type · Enter classify with AI · Tab/Esc back to options"
       : "UP/DOWN move  ENTER review  TAB note  ESC cancel"
   }
+  const paintWhyBatch = () => {
+    const focusedWhy = focusTarget === "why"
+    if (fbFooterText) {
+      fbFooterText.content = whyStr
+        ? `Why I picked this: ${whyStr}${focusedWhy ? "▌" : ""}`
+        : focusedWhy
+          ? "Why I picked this (optional) — type why · ENTER next · TAB/ESC back"
+          : "d/u scroll  ·  TAB why  ·  Enter next  ·  Esc cancel"
+      fbFooterText.fg = whyStr ? props.theme.text : props.theme.textMuted
+    }
+  }
   const showFeedbackBatch = () => {
     scrollOff = 0
     phaseStr = "feedback"
+    focusTarget = "why"
     paintHeader()
     paintReview()
+    paintWhyBatch()
     if (selectBox) selectBox.visible = false
     if (failedBox) failedBox.visible = false
     if (feedbackBox) feedbackBox.visible = true
@@ -777,6 +832,7 @@ export function V2QuizBatchDialog(props: {
     scrollOff = 0
     noteStr = ""
     noteReason = ""
+    whyStr = ""
     focusTarget = "options"
     stopBatchPoll()
     const q = cur()
@@ -817,8 +873,10 @@ export function V2QuizBatchDialog(props: {
     }
     scrollOff = 0
     phaseStr = "feedback"
+    focusTarget = "why"
     paintHeader()
     paintReview()
+    paintWhyBatch()
     if (selectBox) selectBox.visible = false
     if (feedbackBox) feedbackBox.visible = true
   }
@@ -827,7 +885,7 @@ export function V2QuizBatchDialog(props: {
     const q = cur()
     const sel = pendingRes.answers.map((a) => a.index)
     const correct = !pendingRes.dontKnow && sel.length === q.correctIndices.length && sel.every((n) => curCorrect().has(n))
-    results.push({ ...pendingRes, correct })
+    results.push({ ...pendingRes, correct, why: whyStr.trim() || undefined })
     // Terminal submit only: non-terminal confirms loadQuiz() into the next
     // question and must keep the keys. Detach here so chat works even if the
     // host never unmounts the dialog after clear().
@@ -849,6 +907,21 @@ export function V2QuizBatchDialog(props: {
     const key = String(event.name || event.sequence || "").toLowerCase()
     const seq = event.sequence || ""
     if (phaseStr === "feedback") {
+      // Reasoning box focused: typing must reach the box, not the scroll keys.
+      // Enter still sends — the box is never a confirmation step.
+      if (focusTarget === "why") {
+        if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "options"; paintWhyBatch(); return }
+        if (key === "escape" || key === "esc") { prevent(event); focusTarget = "options"; paintWhyBatch(); return }
+        if (key === "enter" || key === "return" || seq === "\r") { prevent(event); goNext(); return }
+        if (key === "backspace" || seq === "\x7f" || seq === "\b") { prevent(event); whyStr = whyStr.slice(0, -1); paintWhyBatch(); return }
+        if (!event.ctrl && !event.meta && seq.length === 1 && seq >= " ") {
+          prevent(event)
+          if (whyStr.length < 240) { whyStr += seq; paintWhyBatch() }
+          return
+        }
+        return
+      }
+      if (key === "tab" || seq === "\t") { prevent(event); focusTarget = "why"; paintWhyBatch(); return }
       if (key === "d" || seq === "\x04" || key === "pagedown" || seq === "\x1b[6~") { prevent(event); scrollBy(4); return }
       if (key === "u" || seq === "\x15" || key === "pageup" || seq === "\x1b[5~") { prevent(event); scrollBy(-4); return }
       if (key === "down" || key === "j" || seq === "\x1b[B") { prevent(event); scrollBy(1); return }
@@ -974,7 +1047,7 @@ export function V2QuizBatchDialog(props: {
           <box backgroundColor={props.theme.warning} paddingLeft={1} paddingRight={1}><text ref={(element: any) => scrollCueText = element} fg={props.theme.background} bold>{explLines.length <= visibleCount ? "Enter to send to AI  ·  Esc cancel" : `▼ more below (${explLines.length - visibleCount} lines) — d to scroll · Enter to send`}</text></box>
         </box>
         <text ref={(element: any) => noteTextFb = element} fg={props.theme.textMuted} wrapMode="wrap"> </text>
-        <text fg={props.theme.textMuted}>d/u scroll  ·  Enter send to AI  ·  Esc cancel</text>
+        <text ref={(element: any) => fbFooterText = element} fg={props.theme.textMuted}>d/u scroll  ·  TAB why  ·  Enter next  ·  Esc cancel</text>
       </box>
     </box>
   )

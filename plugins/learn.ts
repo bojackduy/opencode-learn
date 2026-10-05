@@ -228,7 +228,7 @@ function questionCallout(label: string, question: string, context: string | unde
   if (options.length > 0) { body.push(""); body.push(...optionsList(options)) }
   return callout("question", label, body)
 }
-function answerCalloutQuiz(details: any): string {
+export function answerCalloutQuiz(details: any): string {
   const status = details?.status
   if (status === "cancelled") return callout("warning", "Quiz — cancelled", ["(user skipped)"])
   if (status === "unavailable") return callout("warning", "Quiz — unavailable", [details?.message || ""])
@@ -242,6 +242,8 @@ function answerCalloutQuiz(details: any): string {
   const correctIndices: number[] = details?.correctIndices || []
   if (correctIndices.length) body.push(`Correct answer: ${correctIndices.map((i) => `${i}`).join(", ")}`)
   if (details?.note) { body.push(""); const noteLines = String(details.note).split("\n"); body.push(`Note: ${noteLines[0]}`); for (let i = 1; i < noteLines.length; i++) body.push(noteLines[i]) }
+  // Self-reported reasoning from the feedback phase — absent means nothing was typed.
+  if (details?.why) { body.push(""); const whyLines = String(details.why).split("\n"); body.push(`Why I picked this: ${whyLines[0]}`); for (let i = 1; i < whyLines.length; i++) body.push(whyLines[i]) }
   if (details?.explanation) { body.push(""); for (const line of String(details.explanation).split("\n")) body.push(line) }
   return callout(type, title, body)
 }
@@ -338,7 +340,7 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
                 const results: any[] = meta.results ?? []
                 const x = results[i] || {}
                 if (x && (x.answers || x.correct !== undefined)) {
-                  const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note }
+                  const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note, why: x.why }
                   blocks.push(answerCalloutQuiz(details))
                 }
               }
@@ -380,7 +382,7 @@ async function backfillMdLog(client: any, sessionID: string, directory: string, 
               }
             }
             if (toolName === "quiz") {
-              const details = { status: "completed", answers: meta.answers ?? [], correct: meta.correct, correctIndices: meta.correctIndices ?? [], explanation: meta.explanation ?? "", dontKnow: meta.dontKnow ?? false, note: meta.note }
+              const details = { status: "completed", answers: meta.answers ?? [], correct: meta.correct, correctIndices: meta.correctIndices ?? [], explanation: meta.explanation ?? "", dontKnow: meta.dontKnow ?? false, note: meta.note, why: meta.why }
               blocks.push(answerCalloutQuiz(details))
             } else {
               const details = { answers: meta.answers ?? [], status: "completed" }
@@ -1060,20 +1062,21 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                 const dk = !!r?.dontKnow
                 const ok = !dk && si.length === (j.correctIndices||[]).length && si.every((i:number)=>cs.has(i))
                 const note = r?.note ? `\nNote: ${r.note}` : ""
+                const why = r?.why ? `\nWhy I picked this: ${r.why}` : ""
                 if (getMdFile(j.sessionID)) {
-                  const details = { status: "completed" as const, answers: r?.answers || [], correct: ok, correctIndices: j.correctIndices || [], explanation: j.explanation, dontKnow: dk, note: r?.note }
+                  const details = { status: "completed" as const, answers: r?.answers || [], correct: ok, correctIndices: j.correctIndices || [], explanation: j.explanation, dontKnow: dk, note: r?.note, why: r?.why }
                   const sesJ = j.sessionID as string
                   const fJ = getMdFile(sesJ)!
                   void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details)))
                 }
-                return dk ? `[quiz answered] "${j.question}" -> I don't know.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}` : `[quiz answered] "${j.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}`
+                return dk ? `[quiz answered] "${j.question}" -> I don't know.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}${why}` : `[quiz answered] "${j.question}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${cstr}\nExplanation: ${j.explanation}${note}${why}`
               } else if (j.type === "quiz_batch") {
                 const results = (r as any)?.results || []
                 if (getMdFile(j.sessionID)) {
                   for (let i = 0; i < (j.quizzes||[]).length; i++) {
                     const qq = j.quizzes[i]
                     const x = results[i] || {}
-                    const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note }
+                    const details = { status: "completed" as const, answers: x.answers || [], correct: !!x.correct, correctIndices: qq.correctIndices || [], explanation: qq.explanation || "", dontKnow: !!x.dontKnow, note: x.note, why: x.why }
                     const sesJ = j.sessionID as string
                     const fJ = getMdFile(sesJ)!
                     void withMdFileLock(fJ, () => appendToMdLogForSession(sesJ, answerCalloutQuiz(details)))
@@ -1084,7 +1087,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                   const cs = (qq.correctIndices||[]).map((idx:number)=>`${idx}. ${qq.options[idx-1]?.label}`).join(", ")
                   const sel = x?.dontKnow ? "I don't know" : (x?.answers||[]).map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
                   const ok = x?.correct ? "CORRECT" : x?.dontKnow ? "GAP" : "INCORRECT"
-                  return `Q${i+1}: "${qq.question}" -> ${sel} = ${ok}. Correct: ${cs}`
+                  const why = x?.why ? ` Why I picked this: ${x.why}` : ""
+                  return `Q${i+1}: "${qq.question}" -> ${sel} = ${ok}. Correct: ${cs}${why}`
                 }).join("\n")
                 return `[quiz_batch answered] ${(j.quizzes||[]).length} quizzes\n` + lines
               } else {
@@ -1335,6 +1339,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               const si = (r?.answers || []).map((a: any) => a.index)
               const ok = !dk && si.length === correctIndices.length && si.every((i: number) => cs.has(i))
               const note = r?.note ? `\nNote: ${r.note}` : ""
+              const why = r?.why ? `\nWhy I picked this: ${r.why}` : ""
               const qf = quizSes ? getMdFile(quizSes) : undefined
               if (qf && quizSes) {
                 const details = {
@@ -1345,12 +1350,13 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                   explanation: eFixed,
                   dontKnow: dk,
                   note: r?.note,
+                  why: r?.why,
                 }
                 void withMdFileLock(qf, () => appendToMdLogForSession(quizSes, answerCalloutQuiz(details)))
               }
               return dk
-                ? `[quiz answered] "${qFixed}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}`
-                : `[quiz answered] "${qFixed}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}`
+                ? `[quiz answered] "${qFixed}" -> I don't know (genuine gap).\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}${why}`
+                : `[quiz answered] "${qFixed}" -> ${sel} = ${ok ? "CORRECT" : "INCORRECT"}.\nCorrect: ${correctStr}\nExplanation: ${eFixed}${note}${why}`
             })
           // Always mirror question with TRUE shuffled order (pi: tool_execution_update) — 1-1-1 gated
           {
@@ -1489,6 +1495,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                       explanation: q.explanation || "",
                       dontKnow: !!x.dontKnow,
                       note: x.note,
+                      why: x.why,
                     }
                     // Use same callout helper as single quiz but with batch label context
                     try {
@@ -1503,7 +1510,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
                 const cs = (q.correctIndices||[]).map((idx:number)=>`${idx}. ${q.options[idx-1]?.label}`).join(", ")
                 const sel = x?.dontKnow ? "I don't know" : (x?.answers||[]).map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
                 const ok = x?.correct ? "CORRECT" : x?.dontKnow ? "GAP" : "INCORRECT"
-                return `Q${i+1}: "${q.question}" -> ${sel} = ${ok}. Correct: ${cs}`
+                const why = x?.why ? ` Why I picked this: ${x.why}` : ""
+                return `Q${i+1}: "${q.question}" -> ${sel} = ${ok}. Correct: ${cs}${why}`
               }).join("\n")
               return `[quiz_batch answered] ${normalized.length} quizzes\n` + lines
             })

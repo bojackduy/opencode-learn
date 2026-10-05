@@ -63,6 +63,10 @@ export function prevent(e: any) { try { e.preventDefault?.(); e.stopPropagation?
 export type QuizResult = {
   answers: Array<{ label: string; value: string; index: number }>
   dontKnow: boolean
+  // note = free text the classifier maps onto an option; why = the learner's
+  // own reasoning for the pick, collected in the feedback phase.
+  note?: string
+  why?: string
 }
 
 // The only seam between this file and a host's UI layer: each host injects its
@@ -293,9 +297,10 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
           const selectedStr = dontKnow ? "I don't know" : (r.answers || []).map(a => `${a.index}. ${a.label}`).join(", ") || "(none)"
           const correctStr = qp.correctIndices.map(i => `${i}. ${qp.options[i-1]?.label}`).join(", ")
           const correct = dontKnow ? false : (selectedIndices.length === qp.correctIndices.length && selectedIndices.every(i => correctSet.has(i)) && qp.correctIndices.every(i => selectedIndices.includes(i)))
+          const why = r.why ? ` Why I picked this: ${r.why}` : ""
           injectText = dontKnow
-            ? `[quiz answer] You selected "I don't know" for: "${qp.question}" — genuine gap. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}`
-            : `[quiz answer] Question: "${qp.question}" — You selected: ${selectedStr} — ${correct ? "Correct ✓" : "Incorrect ✗"}. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}`
+            ? `[quiz answer] You selected "I don't know" for: "${qp.question}" — genuine gap. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}${why}`
+            : `[quiz answer] Question: "${qp.question}" — You selected: ${selectedStr} — ${correct ? "Correct ✓" : "Incorrect ✗"}. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}${why}`
         } else if ((data as any).type === "quiz_batch") {
           const batch = data as QuizBatchPending
           const results = (result as any).results ?? []
