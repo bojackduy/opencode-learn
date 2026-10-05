@@ -54,13 +54,14 @@ function syntaxStyle(theme:any){
 // Popup geometry derives from the real terminal. A floor wider/taller than the
 // screen (phone over SSH at 44 cols) overflowed the popup and collapsed its
 // border, so the floors are only safe minimums and the terminal always wins.
-// `ratio`/`cap` keep the existing desktop look for the two dialogs.
-export function popupSize(terminal: { width?: number; height?: number }, ratio: number, cap: number) {
+// The 2-col margin keeps one clear column each side so the border is visible;
+// `cap` keeps the existing desktop look for the two dialogs.
+export function popupSize(terminal: { width?: number; height?: number }, cap: number) {
   const w = Number.isFinite(terminal?.width) ? (terminal!.width as number) : 80
   const h = Number.isFinite(terminal?.height) ? (terminal!.height as number) : 24
   return {
-    width: Math.min(Math.max(20, Math.min(w - 8, Math.floor(w * ratio), cap)), w),
-    height: Math.min(Math.max(6, Math.min(h - 6, Math.floor(h * ratio), cap)), h),
+    width: Math.min(Math.max(20, Math.min(w - 2, cap)), w),
+    height: Math.min(Math.max(6, Math.min(h - 2, cap)), h),
   }
 }
 
@@ -73,8 +74,8 @@ export function QuizDialog(props: {
   const theme = () => props.api.theme.current
   const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
-  const popupWidth = () => popupSize(dims(), 0.80, 92).width
-  const popupHeight = () => popupSize(dims(), 0.62, 26).height
+  const popupWidth = () => popupSize(dims(), 92).width
+  const popupHeight = () => popupSize(dims(), 26).height
   const options = () => props.request.options
   const correctSet = new Set(props.request.correctIndices)
   const isMulti = () => !!props.request.multiSelect
@@ -522,8 +523,8 @@ export function QuizBatchDialog(props: {
   const theme = () => props.api.theme.current
   const syntax = () => syntaxStyle(theme())
   const dims = useTerminalDimensions()
-  const popupWidth = () => popupSize(dims(), 0.82, 96).width
-  const popupHeight = () => popupSize(dims(), 0.64, 28).height
+  const popupWidth = () => popupSize(dims(), 96).width
+  const popupHeight = () => popupSize(dims(), 28).height
   const [idx, setIdx] = createSignal(0)
   // Guard: if no quizzes, cancel
   if (!props.request.quizzes || props.request.quizzes.length === 0) {

@@ -122,7 +122,7 @@ const MAX_MODEL_REASONS = 4
 // 76 is kept as the cap so wide desktops wrap exactly as before.
 export function quizWrapWidth(terminalWidth: number | undefined): number {
   const w = Number.isFinite(terminalWidth) ? (terminalWidth as number) : 80
-  return Math.max(12, Math.min(76, w - 6))
+  return Math.max(12, Math.min(76, w - 2, w))
 }
 function wrapQuizLines(s: string, width = 76): string[] {
   const out: string[] = []

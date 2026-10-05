@@ -52,6 +52,20 @@ function widestRight(setup: any) {
   return { right, bottom }
 }
 
+// The scroll region is what decides how many question/option lines are visible
+// without scrolling, so it has to grow with the terminal height.
+function scrollBox(setup: any) {
+  let found: any
+  const walk = (node: any) => {
+    if (!node || found) return
+    if (node.constructor?.name === "ScrollBoxRenderable") { found = node; return }
+    for (const k of node.getChildren?.() ?? []) walk(k)
+  }
+  walk(setup.renderer.root)
+  if (!found) throw new Error("no scrollbox rendered")
+  return { height: found.height, scrollHeight: found.scrollHeight }
+}
+
 async function mount(render: () => any, width: number, height: number) {
   const setup = await testRender(render, { width, height })
   await setup.renderOnce()
@@ -114,7 +128,75 @@ describe("popup fits the terminal", () => {
       120, 40,
     )
     expect(popupBox(setup40).width).toBe(92)
-    expect(popupBox(setup40).height).toBe(24)
+    expect(popupBox(setup40).height).toBe(26)
+  }, 30000)
+
+  test("v1 uses the phone-landscape width (no wasted columns)", async () => {
+    // 60x24 is a phone in landscape: the popup used to render 48 wide (w-8 and
+    // 80%), so the options fell below the fold. It must now fill the width.
+    const setup = await mount(
+      () => <QuizDialog api={V1_API} request={question as any} onSubmit={() => {}} onCancel={() => {}} />,
+      60, 24,
+    )
+    try {
+      const box = popupBox(setup)
+      expect(box.width).toBeGreaterThanOrEqual(56)
+      expect(box.width).toBeLessThanOrEqual(60)
+      expect(box.right).toBeLessThanOrEqual(60)
+    } finally {
+      await setup.renderer.destroy?.()
+    }
+  }, 30000)
+
+  test("v1 at 44 cols uses the width too, and still fits", async () => {
+    const setup = await mount(
+      () => <QuizDialog api={V1_API} request={question as any} onSubmit={() => {}} onCancel={() => {}} />,
+      44, 20,
+    )
+    try {
+      const box = popupBox(setup)
+      expect(box.width).toBeGreaterThanOrEqual(40)
+      expect(box.width).toBeLessThanOrEqual(44)
+      expect(setup.captureCharFrame().split("\n").filter((l) => l.trim())[0]!.trimEnd().endsWith("┐")).toBe(true)
+    } finally {
+      await setup.renderer.destroy?.()
+    }
+  }, 30000)
+
+  test("v1 batch desktop sizes are unchanged (96/28 cap)", async () => {
+    const setup = await mount(
+      () => <QuizBatchDialog
+        api={V1_API}
+        request={{ id: "fitbatch", type: "quiz_batch", quizzes: [question], timestamp: Date.now() } as any}
+        onSubmit={() => {}}
+        onCancel={() => {}}
+      />,
+      120, 42,
+    )
+    try {
+      const box = popupBox(setup)
+      expect(box.width).toBe(96)
+      expect(box.height).toBe(28)
+    } finally {
+      await setup.renderer.destroy?.()
+    }
+  }, 30000)
+
+  test("a taller terminal gives the scroll region more visible lines", async () => {
+    const render = () => <QuizDialog api={V1_API} request={question as any} onSubmit={() => {}} onCancel={() => {}} />
+    const short = await mount(render, 60, 18)
+    const tall = await mount(render, 60, 30)
+    try {
+      const a = scrollBox(short)
+      const b = scrollBox(tall)
+      expect(b.height).toBeGreaterThan(a.height)
+      // Same content, so a taller viewport means fewer lines are cut off.
+      expect(b.scrollHeight).toBe(a.scrollHeight)
+      expect(b.scrollHeight - b.height).toBeLessThan(a.scrollHeight - a.height)
+    } finally {
+      await short.renderer.destroy?.()
+      await tall.renderer.destroy?.()
+    }
   }, 30000)
 
   // v2 sizes its box to content, so the horizontal contract is the one that
@@ -162,22 +244,49 @@ describe("popup fits the terminal", () => {
   test("quizWrapWidth keeps 76 on desktop and clamps on phones", () => {
     expect(quizWrapWidth(120)).toBe(76)
     expect(quizWrapWidth(100)).toBe(76)
-    expect(quizWrapWidth(44)).toBe(38)
-    expect(quizWrapWidth(40)).toBe(34)
-    expect(quizWrapWidth(20)).toBe(14)
-    expect(quizWrapWidth(undefined)).toBe(74)
+    expect(quizWrapWidth(44)).toBe(42)
+    expect(quizWrapWidth(40)).toBe(38)
+    expect(quizWrapWidth(20)).toBe(18)
+    expect(quizWrapWidth(undefined)).toBe(76)
+  })
+
+  test("popupSize uses the available width on a phone in landscape", () => {
+    // 60x24 is a phone in landscape. The old w-8/ratio margins left 12 columns
+    // of the screen unused and pushed the options below the fold.
+    expect(popupSize({ width: 60, height: 24 }, 92).width).toBe(58)
+    expect(popupSize({ width: 44, height: 20 }, 92).width).toBe(42)
+    expect(popupSize({ width: 40, height: 16 }, 96).width).toBe(38)
+    for (const w of [40, 44, 60]) {
+      expect(popupSize({ width: w, height: 24 }, 92).width).toBeGreaterThanOrEqual(w - 4)
+      expect(popupSize({ width: w, height: 24 }, 92).width).toBeLessThanOrEqual(w)
+    }
+  })
+
+  test("popupSize gives the popup the full terminal height, capped on desktop", () => {
+    expect(popupSize({ width: 60, height: 24 }, 26).height).toBe(22)
+    expect(popupSize({ width: 44, height: 20 }, 26).height).toBe(18)
+    // Desktop caps still win over the taller terminal.
+    expect(popupSize({ width: 120, height: 42 }, 26).height).toBe(26)
+    expect(popupSize({ width: 120, height: 60 }, 28).height).toBe(28)
   })
 
   test("popupSize never exceeds the terminal it is given", () => {
     for (const w of [20, 30, 40, 44, 60, 80, 100, 120, 200]) {
-      const s = popupSize({ width: w, height: 24 }, 0.80, 92)
+      const s = popupSize({ width: w, height: 24 }, 92)
       expect(s.width).toBeLessThanOrEqual(w)
       expect(s.width).toBeGreaterThanOrEqual(Math.min(20, w))
     }
     for (const h of [6, 10, 14, 20, 24, 40, 60]) {
-      const s = popupSize({ width: 120, height: h }, 0.62, 26)
+      const s = popupSize({ width: 120, height: h }, 26)
       expect(s.height).toBeLessThanOrEqual(h)
       expect(s.height).toBeGreaterThanOrEqual(Math.min(6, h))
+    }
+    for (const w of [20, 30, 44, 60, 80, 120, 200]) {
+      for (const h of [6, 12, 20, 30, 50]) {
+        const s = popupSize({ width: w, height: h }, 92)
+        expect(s.width).toBeLessThanOrEqual(w)
+        expect(s.height).toBeLessThanOrEqual(h)
+      }
     }
   })
 })
