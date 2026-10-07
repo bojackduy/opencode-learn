@@ -1335,6 +1335,52 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
     }
   } catch {}
 
+  // Shared md_log link/unlink/status core — used by BOTH the agent-callable tools
+  // (md_log/md_unlog/md_log_status) and the direct user commands (/md-log, /md-unlog
+  // via command.execute.before), so the two paths can never diverge.
+  async function linkMdSession(sessionID: string | undefined, filepath: string, baseDir: string): Promise<string> {
+    if (!sessionID) return `md_log error: no sessionID in context — cannot establish 1-1-1 link`
+    const resolved = path.isAbsolute(filepath) ? filepath : path.resolve(baseDir, filepath)
+    if (!fs.existsSync(resolved)) return `File does not exist: ${resolved}`
+    if (!fs.statSync(resolved).isFile()) return `Not a file: ${resolved}`
+    // Enforce 1-1-1: one file linked to at most one session. The check runs over the
+    // canonical (user-level) store, so it holds across worktrees/launch directories.
+    for (const [ses, meta] of mdLinks) {
+      if (meta.file === resolved && ses !== sessionID) {
+        return `File already linked to session ${ses.slice(0,8)} — 1-1-1 violation. Copy to a new file or md_unlog that session first.`
+      }
+    }
+    // Re-linking the SAME file for this session (e.g. md_log called again after a
+    // restart/reconnect) must preserve the backfill watermark. It is only a fast
+    // path now — backfillMdLog still diffs identities against the file itself, so a
+    // re-link can restore anything missing without ever duplicating what is present.
+    const existingMeta = mdLinks.get(sessionID)
+    const preservedWatermark = existingMeta?.file === resolved ? existingMeta.backfilledUntil : undefined
+    mdLinks.set(sessionID, { file: resolved, directory, linkedAt: Date.now(), backfilledUntil: preservedWatermark })
+    saveMdLinks(directory)
+    // Backfill history for this session only
+    let backfilled = 0
+    try { backfilled = await backfillMdLog(client, sessionID, directory) } catch (e) { slog("backfill error", String(e)) }
+    await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved, backfilled, sessionID } } })
+    return `Linked: ${resolved} to session ${sessionID.slice(0,8)} — ${backfilled ? `${backfilled} entries backfilled — ` : ""}future messages for THIS session will be mirrored. Other sessions stay silent.`
+  }
+  async function unlinkMdSession(sessionID: string | undefined): Promise<string> {
+    if (!sessionID) return "No session in context"
+    const meta = mdLinks.get(sessionID)
+    if (!meta) return "No file linked for this session"
+    const name = path.basename(meta.file)
+    mdLinks.delete(sessionID)
+    saveMdLinks(directory)
+    await client.app.log({ body: { service: "learn", level: "info", message: `md-log unlinked: ${name}`, extra: { sessionID } } })
+    return `Unlinked: ${name} from session ${sessionID.slice(0,8)} (other sessions unaffected)`
+  }
+  function mdLinkStatusText(sessionID: string | undefined): string {
+    const own = sessionID ? mdLinks.get(sessionID) : undefined
+    let countDir = 0
+    for (const [, meta] of mdLinks) if (meta.directory === directory) countDir++
+    return `session ${sessionID?.slice(0,8) ?? "(none)"} -> ${own?.file ?? "(no link)"} | links in this directory: ${countDir} | links across all worktrees: ${mdLinks.size} | store: ${canonicalMdLinkStorePath()}`
+  }
+
   return {
     // Inject agents if not already present via config hook
     config: async (output) => {
@@ -1368,7 +1414,53 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         }
         ;(output as any).command = commands
       }
+      // /md-log and /md-unlog are handled directly by command.execute.before below:
+      // the user types them in the chat box, the plugin links/unlinks, and the agent
+      // never sees the command. The template is only a fallback for a host that does
+      // not run the hook — it routes back to the equivalent agent-callable tool.
+      if (!commands["md-log"]) {
+        commands["md-log"] = {
+          template: [
+            "Mirror THIS session to a markdown file. Call the `md_log` tool with filepath=\"$ARGUMENTS\".",
+            "If the input is empty, call `md_log_status` instead and report it.",
+            "Report the tool's output briefly. Do not call any other tool.",
+          ].join("\n"),
+          description: "Mirror this session to a markdown file — /md-log <filepath>",
+        }
+        ;(output as any).command = commands
+      }
+      if (!commands["md-unlog"]) {
+        commands["md-unlog"] = {
+          template: "Stop mirroring THIS session. Call the `md_unlog` tool and report its output briefly. Do not call any other tool.",
+          description: "Stop mirroring this session — /md-unlog",
+        }
+        ;(output as any).command = commands
+      }
       await client.app.log({ body: { service: "learn", level: "info", message: "learn plugin initialized", extra: { directory } } })
+    },
+
+    // Direct user commands (the opencode-pty pattern): the user types /md-log or
+    // /md-unlog in the chat box, the side effect runs here in plugin code, and the
+    // throw aborts the command before the agent's prompt runs — so the agent is
+    // never engaged, never narrates, and burns no context. Feedback goes back via
+    // a noReply session message, which renders without triggering a reply.
+    "command.execute.before": async (input) => {
+      const name = (input as any)?.command as string | undefined
+      if (name !== "md-log" && name !== "md-unlog") return
+      const sessionID = (input as any)?.sessionID as string | undefined
+      if (!sessionID) return // no session to link — let the command fall through
+      const rawArgs = String((input as any)?.arguments ?? "").trim()
+      const arg = rawArgs.replace(/^["'](.*)["']$/, "$1").trim()
+      let text: string
+      if (name === "md-log") {
+        text = arg ? await linkMdSession(sessionID, arg, directory) : mdLinkStatusText(sessionID)
+      } else {
+        text = await unlinkMdSession(sessionID)
+      }
+      try {
+        await client.session.prompt({ path: { id: sessionID }, body: { noReply: true, parts: [{ type: "text", text }] } })
+      } catch {}
+      throw new Error("Command handled by learn plugin")
     },
 
     "chat.message": async (input, output) => {
@@ -1774,31 +1866,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           filepath: tool.schema.string().describe("Existing markdown file to link (relative to worktree or absolute). Must exist."),
         },
         async execute(args, ctx) {
-          const sessionID = (ctx as any).sessionID as string | undefined
-          if (!sessionID) return `md_log error: no sessionID in context — cannot establish 1-1-1 link`
-          const resolved = path.isAbsolute(args.filepath) ? args.filepath : path.resolve(ctx.directory, args.filepath)
-          if (!fs.existsSync(resolved)) return `File does not exist: ${resolved}`
-          if (!fs.statSync(resolved).isFile()) return `Not a file: ${resolved}`
-          // Enforce 1-1-1: one file linked to at most one session. The check runs over the
-          // canonical (user-level) store, so it holds across worktrees/launch directories.
-          for (const [ses, meta] of mdLinks) {
-            if (meta.file === resolved && ses !== sessionID) {
-              return `File already linked to session ${ses.slice(0,8)} — 1-1-1 violation. Copy to a new file or md_unlog that session first.`
-            }
-          }
-          // Re-linking the SAME file for this session (e.g. md_log called again after a
-          // restart/reconnect) must preserve the backfill watermark. It is only a fast
-          // path now — backfillMdLog still diffs identities against the file itself, so a
-          // re-link can restore anything missing without ever duplicating what is present.
-          const existingMeta = mdLinks.get(sessionID)
-          const preservedWatermark = existingMeta?.file === resolved ? existingMeta.backfilledUntil : undefined
-          mdLinks.set(sessionID, { file: resolved, directory, linkedAt: Date.now(), backfilledUntil: preservedWatermark })
-          saveMdLinks(directory)
-          // Backfill history for this session only
-          let backfilled = 0
-          try { backfilled = await backfillMdLog(client, sessionID, directory) } catch (e) { slog("backfill error", String(e)) }
-          await client.app.log({ body: { service: "learn", level: "info", message: `md-log linked: ${resolved}`, extra: { file: resolved, backfilled, sessionID } } })
-          return `Linked: ${resolved} to session ${sessionID.slice(0,8)} — ${backfilled ? `${backfilled} entries backfilled — ` : ""}future messages for THIS session will be mirrored. Other sessions stay silent.`
+          return linkMdSession((ctx as any).sessionID as string | undefined, args.filepath, ctx.directory)
         },
       }),
 
@@ -1806,11 +1874,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         description: "Show md-log link status for this session and directory.",
         args: {},
         async execute(_args, ctx) {
-          const sessionID = (ctx as any).sessionID as string | undefined
-          const own = sessionID ? mdLinks.get(sessionID) : undefined
-          let countDir = 0
-          for (const [, meta] of mdLinks) if (meta.directory === directory) countDir++
-          return `session ${sessionID?.slice(0,8) ?? "(none)"} -> ${own?.file ?? "(no link)"} | links in this directory: ${countDir} | links across all worktrees: ${mdLinks.size} | store: ${canonicalMdLinkStorePath()}`
+          return mdLinkStatusText((ctx as any).sessionID as string | undefined)
         },
       }),
 
@@ -1818,15 +1882,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
         description: "Stop mirroring THIS session to its markdown file (other sessions unaffected).",
         args: {},
         async execute(_args, ctx) {
-          const sessionID = (ctx as any).sessionID as string | undefined
-          if (!sessionID) return "No session in context"
-          const meta = mdLinks.get(sessionID)
-          if (!meta) return "No file linked for this session"
-          const name = path.basename(meta.file)
-          mdLinks.delete(sessionID)
-          saveMdLinks(directory)
-          await client.app.log({ body: { service: "learn", level: "info", message: `md-log unlinked: ${name}`, extra: { sessionID } } })
-          return `Unlinked: ${name} from session ${sessionID.slice(0,8)} (other sessions unaffected)`
+          return unlinkMdSession((ctx as any).sessionID as string | undefined)
         },
       }),
 
