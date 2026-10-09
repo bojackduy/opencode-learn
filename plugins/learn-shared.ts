@@ -107,6 +107,23 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
   api.lifecycle.onDispose(() => clearInterval(hbTimer))
 
   const currentBySession = new Map<string, { id: string; type: string }>()
+  let disposed = false
+  const timeouts = new Set<ReturnType<typeof setTimeout>>()
+  const schedule = (callback: () => void, ms: number) => {
+    if (disposed) return
+    const timer = setTimeout(() => {
+      timeouts.delete(timer)
+      if (!disposed) callback()
+    }, ms)
+    timeouts.add(timer)
+  }
+  api.lifecycle.onDispose(() => {
+    disposed = true
+    for (const timer of timeouts) clearTimeout(timer)
+    timeouts.clear()
+    for (const current of currentBySession.values()) releasePopupClaim((current as any).dir || pendingDir, current.id)
+    currentBySession.clear()
+  })
   let watcher: ReturnType<typeof watch> | undefined
   let pollTimer: ReturnType<typeof setInterval> | undefined
 
@@ -181,6 +198,7 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     if (s !== lastWhy) { lastWhy = s; tlog("processPending", s) }
   }
   const processPending = () => {
+    if (disposed) return
     const curSid = getCurrentSessionID()
     if (!curSid) { why("no-session"); return }
     let current = currentBySession.get(curSid) as { id: string; type: string; dir: string } | undefined
@@ -279,6 +297,7 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     current = { id: data.id, type: data.type, dir: pickDir }
     currentBySession.set(curSid, current)
     const done = async (result: any) => {
+      if (disposed) return
       const respPath = path.join(pickDir, `response-${data!.id}.json`)
       const answerId = data!.id
       tlog("learn-tui answered", (data as any).type, answerId, JSON.stringify(result).slice(0, 160))
@@ -347,10 +366,10 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
       releasePopupClaim(pickDir, answerId)
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
-      setTimeout(processPending, 150)
+      schedule(processPending, 150)
       // Watchdog: if the response is still unconsumed (server didn't fire) after 8s, re-touch to retrigger the watch + log loudly.
       // Safe: server claims via atomic rename, so a rewrite can never cause double-inject.
-      setTimeout(() => {
+      schedule(() => {
         try {
           if (fs.existsSync(respPath)) {
             tlog("learn-tui response NOT consumed, re-touching", answerId)
@@ -360,6 +379,7 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
       }, 8000)
     }
     const cancel = async () => {
+      if (disposed) return
       const respPath = path.join(pickDir, `response-${data!.id}.json`)
       tlog("learn-tui cancelled", (data as any).type, data!.id)
       writeJsonAtomic(respPath, { id: data!.id, type: data!.type, cancelled: true, sessionID: (data as any).sessionID, at: Date.now() })
@@ -382,7 +402,7 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
       releasePopupClaim(pickDir, data!.id)
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
-      setTimeout(processPending, 150)
+      schedule(processPending, 150)
     }
     if (data.type === "quiz") {
       tlog("processPending quiz", data.id)
@@ -396,11 +416,11 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     try { api.ui.dialog.setSize("large") } catch {}
   }
 
-  try { watcher = watch(pendingDir, () => setTimeout(processPending, 50)); api.lifecycle.onDispose(() => watcher?.close()) } catch {}
+  try { watcher = watch(pendingDir, () => schedule(processPending, 50)); api.lifecycle.onDispose(() => watcher?.close()) } catch {}
   pollTimer = setInterval(processPending, 700)
   api.lifecycle.onDispose(() => clearInterval(pollTimer!))
-  const off = api.event.on("session.status", () => setTimeout(processPending, 100))
+  const off = api.event.on("session.status", () => schedule(processPending, 100))
   api.lifecycle.onDispose(off)
-  setTimeout(processPending, 300)
+  schedule(processPending, 300)
   api.ui.toast({ message: "learn TUI ready — beautiful quiz + question", variant: "info", duration: 2200 })
 }

@@ -801,8 +801,7 @@ export function parseModelList(s: unknown): ModelRef[] {
 }
 
 // Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
-const activeWatchers = new Map<string, () => void>()
-function watchAndInject(client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
+function watchAndInject(activeWatchers: Map<string, () => void>, client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
   slog("watchAndInject start", id, sessionID)
   if (!sessionID) { slog("watchAndInject no sessionID", id); return }
   activeWatchers.get(id)?.()
@@ -866,6 +865,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
     const sdkCall = async (method: any, ...argsList: any[]) => {
       let firstErr: any
       for (const args of argsList) {
+        if (closed) throw new Error("learn watcher disposed")
         if (args === undefined) continue
         try {
           const res = await method(args)
@@ -901,6 +901,7 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
       try { fs.renameSync(claimPath, respPath) } catch {
         try { fs.renameSync(claimPath, path.join(dir, `response-${id}.failed-${Date.now()}.json`)) } catch {}
       }
+      if (closed) return
       try {
         await client.app.log({ body: { service: "learn", level: "error", message: `inject FAILED for ${effectiveSessionID} (orig ${sessionID}), will retry`, extra: { id } } })
       } catch {}
@@ -937,6 +938,20 @@ function watchAndInject(client: any, directory: string, id: string, sessionID: s
 // Plugin definition
 // ────────────────────────────────────────────────────────────────────────────
 const server: Plugin = async ({ client, directory }) => {
+  const activeWatchers = new Map<string, () => void>()
+  const lifecycle = new AbortController()
+  let classifyWatcher: fs.FSWatcher | undefined
+  const disposed = () => lifecycle.signal.aborted
+  const delay = (ms: number) => new Promise<void>((resolve) => {
+    if (disposed()) { resolve(); return }
+    const done = () => {
+      clearTimeout(timer)
+      lifecycle.signal.removeEventListener("abort", done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    lifecycle.signal.addEventListener("abort", done, { once: true })
+  })
   // 1-1-1: restore session->file links. The canonical store is user-level so the binding
   // survives launching from a different worktree; this directory's legacy store is merged in.
   try {
@@ -1001,10 +1016,12 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
     // (quota/auth error or no parseable JSON in 12s) so the caller can move on
     // to the next entry of the chain instead of degrading silently.
     const classifyWithModel = async (ref: ModelRef | null, label: string): Promise<{ inferred: number[]; semanticCorrect?: boolean; reason?: string; sessionID?: string; isIDK?: boolean } | null> => {
+      if (disposed()) return null
       const title = `classify: ${question ? question.slice(0, 30) : note.slice(0, 20)}`
       const body: any = { title }
       if (parentSessionID) body.parentID = parentSessionID
       const created: any = await client.session.create({ body, query: { directory } })
+      if (disposed()) return null
       const sid = created?.data?.id || created?.id || created?.data?.sessionID
       if (!sid) throw new Error("no sid")
       const createdSession = created?.data || created
@@ -1015,11 +1032,14 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       const promptBody: any = { parts: [{ type: "text", text: prompt }], agent: "classify" }
       if (ref) promptBody.model = { providerID: ref.providerID, modelID: ref.modelID }
       await client.session.prompt({ path: { id: sid }, body: promptBody })
+      if (disposed()) return null
       // Poll for assistant response up to 12s
       for (let i = 0; i < 24; i++) {
-        await new Promise(r => setTimeout(r, 500))
+        await delay(500)
+        if (disposed()) return null
         try {
           const msgs: any = await client.session.messages({ path: { id: sid } })
+          if (disposed()) return null
           const data = msgs?.data || msgs
           const arr = Array.isArray(data) ? data : []
           for (let j = arr.length - 1; j >= 0; j--) {
@@ -1094,6 +1114,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
     const chain = classifyModelChain(directory)
     const errors: string[] = []
     for (const entry of chain) {
+      if (disposed()) return { inferred: [], failed: true, errors }
       try {
         const res = await classifyWithModel(entry.ref, entry.label)
         if (res) {
@@ -1121,6 +1142,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
     const isClaim = (f: string) => f.startsWith("classify-") && !f.startsWith("classify-response-") && f.includes(".claim-")
     const isRequest = (f: string) => f.startsWith("classify-") && !f.startsWith("classify-response-") && !f.includes(".claim-")
     const processClassify = async (filename: string) => {
+      if (disposed()) return
       if (!isRequest(filename)) return
       const fp = path.join(dir, filename)
       if (!fs.existsSync(fp)) return
@@ -1140,6 +1162,12 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       let isIDK: boolean | undefined
       const multi = !!data.multiSelect
       const llmRes = await llmClassify(client, directory, data.note, data.options, data.question, data.sessionID, multi)
+      const preserveOnDispose = () => {
+        if (!disposed()) return false
+        try { fs.renameSync(claimPath, fp) } catch {}
+        return true
+      }
+      if (preserveOnDispose()) return
       isIDK = (llmRes as any).isIDK
       // Direct IDK keyword fallback if LLM didn't flag (covers heuristic-only path)
       if (!isIDK) {
@@ -1182,7 +1210,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       }
       // Ensure minimal classify time so UI doesn't feel instant-wrong (at least 1200ms)
       const elapsed = Date.now() - start
-      if (elapsed < 1200) await new Promise(r => setTimeout(r, 1200 - elapsed))
+      if (elapsed < 1200) await delay(1200 - elapsed)
+      if (preserveOnDispose()) return
       // Final fallback if still empty (respects single-select)
       if (!inferred.length && data.note) {
         const n = data.note.toLowerCase()
@@ -1213,6 +1242,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       try { fs.unlinkSync(claimPath) } catch {}
     }
     const sweep = () => {
+      if (disposed()) return
       try {
         // A process that died mid-classify leaves its claim behind; requeue it
         // once it is clearly stale so the TUI's pending note is not lost.
@@ -1235,9 +1265,8 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       // Re-scan on ANY directory event rather than trusting the reported filename — atomic tmp+rename
       // writes (used by the TUI) can report a different filename (or none) on some fs.watch backends
       // (notably macOS FSEvents), which would otherwise silently drop classify requests.
-      const w = fs.watch(dir, () => sweep())
-      w.on("error", () => {})
-      // Keep watcher alive; store to avoid GC? No need.
+      classifyWatcher = fs.watch(dir, () => sweep())
+      classifyWatcher.on("error", () => {})
     } catch {}
   }
   startClassifyWatcher(client, directory)
@@ -1272,7 +1301,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
           if (isPendingExpired(j)) { archiveExpiredPending(dir, f); continue }
           if (j?.id && j?.sessionID) {
-            watchAndInject(client, directory, j.id, j.sessionID, (r: any) => {
+            watchAndInject(activeWatchers, client, directory, j.id, j.sessionID, (r: any) => {
               if (j.type === "quiz") {
                 const cs = new Set(j.correctIndices || [])
                 const si = (r?.answers || []).map((a:any)=>a.index)
@@ -1382,6 +1411,15 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
   }
 
   return {
+    dispose: async () => {
+      if (disposed()) return
+      lifecycle.abort()
+      try { classifyWatcher?.close() } catch {}
+      for (const close of [...activeWatchers.values()]) close()
+      loggedTextPartIds.clear()
+      loggedToolCallIds.clear()
+      messageIdToRole.clear()
+    },
     // Inject agents if not already present via config hook
     config: async (output) => {
       const agents = (output as any).agent ?? {}
@@ -1652,7 +1690,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           try { fs.writeFileSync(pendingPath, JSON.stringify(payload), "utf8"); slog("quiz wrote durably", pendingPath, "alive", tuiAlive) } catch (e) { slog("quiz write failed", String(e)) }
           try { await (ctx as any).metadata?.({ title: `Quiz: ${qFixed.slice(0, 40)}`, metadata: { pendingId: id } }) } catch {}
           const quizSes = (ctx as any).sessionID as string | undefined
-          watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
+          watchAndInject(activeWatchers, client, directory, id, (ctx as any).sessionID, (r: any) => {
               const dk = !!r?.dontKnow
               const sel = (r?.answers || []).map((a: any) => `${a.index}. ${a.label}`).join(", ") || "(none)"
               const cs = new Set(correctIndices)
@@ -1798,7 +1836,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
               }
             }
           }
-          watchAndInject(client, directory, id, (ctx as any).sessionID, (r: any) => {
+          watchAndInject(activeWatchers, client, directory, id, (ctx as any).sessionID, (r: any) => {
               const results = r?.results || []
               // Mirror each answer as a beautiful callout (like single quiz) — not just plain text
               {
