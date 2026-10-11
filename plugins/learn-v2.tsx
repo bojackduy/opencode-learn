@@ -1249,6 +1249,16 @@ export const setup: TuiV2.Definition["setup"] = async (ctx) => {
         },
       },
     },
+    command: {
+      register: (commands: () => any[]) => {
+        let active = true
+        ctx.keymap.layer(() => ({ enabled: () => active, commands: commands().map(command => ({
+          id: command.value, title: command.title, palette: true as const, slash: command.slash,
+          run: () => command.onSelect?.(),
+        })) }))
+        return () => { active = false }
+      },
+    },
     ui: {
       dialog: {
         get open() {

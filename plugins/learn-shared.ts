@@ -12,6 +12,7 @@
 import * as fs from "node:fs"
 import * as path from "node:path"
 import { watch } from "node:fs"
+import { createHash } from "node:crypto"
 export const PENDING_DIR = ".opencode/learn-pending"
 import { tmpdir } from "node:os"
 const TUI_LOG = path.join(tmpdir(), "learn-tui.log")
@@ -19,11 +20,11 @@ export function tlog(...a: any[]) { try { fs.appendFileSync(TUI_LOG, `[${new Dat
 export function ensureDir(dir: string) { try { fs.mkdirSync(dir, { recursive: true }) } catch {} }
 export function writeJsonAtomic(filePath: string, data: any) {
   // Atomic handoff: readers never observe partial JSON (tmp + rename is atomic on POSIX)
+  const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
   try {
-    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`
     fs.writeFileSync(tmp, JSON.stringify(data), "utf8")
     fs.renameSync(tmp, filePath)
-  } catch { try { fs.writeFileSync(filePath, JSON.stringify(data), "utf8") } catch {} }
+  } finally { try { fs.unlinkSync(tmp) } catch {} }
 }
 export function decodeQuizText(s: string): string {
   if (!s || typeof s !== "string") return s
@@ -191,6 +192,45 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     return dirs
   }
 
+  const shownStates = new Map<string, string>()
+  const showDeliveryStatus = (sessionID: string, dirs: string[]) => {
+    for (const d of dirs) {
+      try {
+        for (const f of fs.readdirSync(d).filter(f => /^delivery-.+\.json$/.test(f)).slice(0, 128)) {
+          const receipt = JSON.parse(fs.readFileSync(path.join(d, f), "utf8"))
+          if (receipt.sessionID !== sessionID) continue
+          const key = `${d}:${receipt.id}`
+          if (shownStates.get(key) === receipt.state) continue
+          if (receipt.state === "waiting" && shownStates.has(key)) continue
+          if (shownStates.size >= 128) shownStates.delete(shownStates.keys().next().value)
+          shownStates.set(key, receipt.state)
+          const delivered = receipt.state === "delivered"
+          api.ui.toast({ message: delivered ? "Quiz answer delivered · saved in original session" :
+            `${receipt.reason || "Quiz answer saved; waiting for delivery"} · /quiz-retry to retry`,
+            variant: delivered ? "success" : receipt.state === "failed" ? "warning" : "info", duration: 6000 })
+        }
+      } catch {}
+    }
+  }
+  const retrySaved = () => {
+    const sid = getCurrentSessionID()
+    if (!sid) return
+    let count = 0
+    for (const d of watchDirs(sid)) {
+      try {
+        for (const f of fs.readdirSync(d).filter(f => /^(quiz|quiz_batch)-.+\.json$/.test(f))) {
+          const quiz = JSON.parse(fs.readFileSync(path.join(d, f), "utf8"))
+          if (quiz.sessionID !== sid || !hasAnswerArtifact(d, quiz.id)) continue
+          writeJsonAtomic(path.join(d, `retry-${quiz.id}.json`), { sessionID: sid })
+          count++
+        }
+      } catch {}
+    }
+    api.ui.toast({ message: count ? "Saved quiz delivery retry requested" : "No saved quiz answers waiting in this session", variant: "info", duration: 4000 })
+  }
+  const unregisterRetry = api.command?.register?.(() => [{ title: "Retry saved quiz answers", value: "learn.quiz.retry", slash: { name: "quiz-retry" }, onSelect: retrySaved }])
+  if (unregisterRetry) api.lifecycle.onDispose(unregisterRetry)
+
   // One-line-why logging: silent early-returns are what make "no popup"
   // undiagnosable. Log only when the reason CHANGES to avoid spam.
   let lastWhy = ""
@@ -224,7 +264,16 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     }
     if (api.ui.dialog.open) { why("open-external"); return }
     const dirs = watchDirs(curSid)
-    const isQuizFile = (f: string) => f.endsWith(".json") && !f.startsWith("response-") && !f.startsWith(".") && !f.startsWith("classify")
+    for (const d of dirs) {
+      if (d !== pendingDir) {
+        const sourceDirectory = path.dirname(path.dirname(d))
+        const key = createHash("sha256").update(sourceDirectory).digest("hex").slice(0, 16)
+        const hintPath = path.join(pendingDir, `supervise-${key}.json`)
+        try { if (!fs.existsSync(hintPath)) writeJsonAtomic(hintPath, { directory: sourceDirectory }) } catch {}
+      }
+    }
+    showDeliveryStatus(curSid, dirs)
+    const isQuizFile = (f: string) => /^(quiz|quiz_batch)-.+\.json$/.test(f)
     let files: Array<{ f: string; dir: string }> = []
     try {
       for (const d of dirs) {
@@ -241,7 +290,7 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
         try {
           const j = JSON.parse(fs.readFileSync(path.join(d, f), "utf8")) as any
           const ts = j?.timestamp
-          if (typeof ts === "number" && Date.now() - ts > 24 * 60 * 60 * 1000) {
+          if (typeof ts === "number" && Date.now() - ts > 24 * 60 * 60 * 1000 && !hasAnswerArtifact(d, j.id)) {
             const expDir = path.join(d, "expired")
             try { fs.mkdirSync(expDir, { recursive: true }) } catch {}
             fs.renameSync(path.join(d, f), path.join(expDir, `${Date.now()}-${f}`))
@@ -276,18 +325,7 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     let data: Pending | null = null
     try { data = JSON.parse(fs.readFileSync(full, "utf8")) as Pending } catch { try { fs.unlinkSync(full) } catch {}; return }
     if (!data || !data.id) { try { fs.unlinkSync(full) } catch {}; return }
-    if (!(data as any).sessionID) (data as any).sessionID = curSid
-    // If pending was from a previous session that no longer exists, rebind to current session so inject still wakes you (like loop guardLoopOwnedUserMessage)
-    try {
-      const cur = (api.route as any)?.current
-      const curSid = cur?.params?.sessionID || cur?.sessionID
-      if (curSid && (data as any).sessionID && (data as any).sessionID !== curSid) {
-        // Check if old session still exists
-        const anyState: any = api.state as any
-        const exists = anyState.session?.get ? anyState.session.get((data as any).sessionID) : undefined
-        if (!exists) (data as any).sessionID = curSid
-      }
-    } catch {}
+    if (!(data as any).sessionID) { why("missing-original-session"); return }
     if (!tryClaimPopup(pickDir, data.id)) {
       // Another opencode window (same session open elsewhere) already owns this popup —
       // don't show a second copy of it here, and don't answer it from this process.
@@ -296,108 +334,37 @@ export async function runPendingLoop(api: any, renderers: QuizRenderers) {
     }
     current = { id: data.id, type: data.type, dir: pickDir }
     currentBySession.set(curSid, current)
+    const saveAnswer = (answer: any): boolean => {
+      try {
+        writeJsonAtomic(path.join(pickDir, `response-${data!.id}.json`), answer)
+        return true
+      } catch {
+        api.ui.toast({ message: "Quiz answer could not be saved · restore disk access and retry the quiz", variant: "error", duration: 8000 })
+        releasePopupClaim(pickDir, data!.id)
+        api.ui.dialog.clear()
+        currentBySession.delete(curSid)
+        schedule(processPending, 1000)
+        return false
+      }
+    }
     const done = async (result: any) => {
       if (disposed) return
-      const respPath = path.join(pickDir, `response-${data!.id}.json`)
       const answerId = data!.id
-      tlog("learn-tui answered", (data as any).type, answerId, JSON.stringify(result).slice(0, 160))
-      writeJsonAtomic(respPath, { id: data!.id, type: data!.type, result, sessionID: (data as any).sessionID, at: Date.now() })
-      // Non-blocking wake: inject answer as new user prompt so agent continues (no timeout, no polling waste)
-      try {
-        const sessionID = (data as any).sessionID
-        // Build injected text with grading for quiz
-        let injectText = ""
-        if (data.type === "quiz") {
-          const qp = data as QuizPending
-          const r = result as { answers: Array<{ label: string; value: string; index: number }>; dontKnow: boolean; note?: string }
-          const dontKnow = !!r.dontKnow
-          const correctSet = new Set(qp.correctIndices)
-          const selectedIndices = (r.answers || []).map(a => a.index)
-          const selectedStr = dontKnow ? "I don't know" : (r.answers || []).map(a => `${a.index}. ${a.label}`).join(", ") || "(none)"
-          const correctStr = qp.correctIndices.map(i => `${i}. ${qp.options[i-1]?.label}`).join(", ")
-          const correct = dontKnow ? false : (selectedIndices.length === qp.correctIndices.length && selectedIndices.every(i => correctSet.has(i)) && qp.correctIndices.every(i => selectedIndices.includes(i)))
-          const why = r.why ? ` Why I picked this: ${r.why}` : ""
-          injectText = dontKnow
-            ? `[quiz answer] You selected "I don't know" for: "${qp.question}" — genuine gap. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}${why}`
-            : `[quiz answer] Question: "${qp.question}" — You selected: ${selectedStr} — ${correct ? "Correct ✓" : "Incorrect ✗"}. Correct: ${correctStr}. Explanation: ${qp.explanation}${r.note ? ` Note: ${r.note}` : ""}${why}`
-        } else if ((data as any).type === "quiz_batch") {
-          const batch = data as QuizBatchPending
-          const results = (result as any).results ?? []
-          const lines = batch.quizzes.map((qq, i) => {
-            const x = results[i] || {}
-            const cs = (qq.correctIndices||[]).map((idx:number)=>`${idx}. ${qq.options[idx-1]?.label}`).join(", ")
-            const sel = x?.dontKnow ? "I don't know" : (x?.answers||[]).map((a:any)=>`${a.index}. ${a.label}`).join(", ") || "(none)"
-            const ok = x?.correct ? "CORRECT" : x?.dontKnow ? "GAP" : "INCORRECT"
-            return `Q${i+1}: "${qq.question}" -> ${sel} = ${ok}. Correct: ${cs}`
-          }).join("\n")
-          injectText = `[quiz_batch answered] ${batch.quizzes.length} quizzes\n` + lines
-        }
-        // Try v2 SDK then v1 fallback
-        const anyClient = api.client as any
-        const sidToUse = ""  // server (learn.ts watchAndInject) owns injection — loopd pattern
-        if (sidToUse && injectText) {
-          try { api.ui.toast({ message: `inject ${sidToUse.slice(0,6)}`, variant: "info", duration: 1200 }) } catch {}
-          try {
-            if (anyClient.session?.prompt) {
-              // Try v2 shape first: { path: { sessionID }, body: { prompt: { text } } }
-              try {
-                await anyClient.session.prompt({ path: { sessionID: sidToUse }, body: { prompt: { text: injectText } } })
-              } catch {
-                // Fallback v1 shape: { path: { sessionID }, body: { parts: [...] } }
-                await anyClient.session.prompt({ path: { sessionID: sidToUse }, body: { parts: [{ type: "text", text: injectText }] } as any })
-              }
-            } else if (anyClient.tui?.submitPrompt) {
-              await anyClient.tui.submitPrompt({ text: injectText })
-            }
-            // Fallback fetch
-            try {
-              const base = (api as any).serverUrl || "http://127.0.0.1:4096"
-              await fetch(`${String(base).replace(/\/$/, "")}/api/session/${sidToUse}/prompt`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt: { text: injectText } }) })
-            } catch {}
-
-          } catch (e) {
-            // If injection fails, rely on response file for blocking fallback
-            try { console.error("learn-tui inject failed", e) } catch {}
-          }
-        }
-      } catch {}
+      tlog("learn-tui answer saved", (data as any).type, answerId)
+      if (!saveAnswer({ id: data!.id, type: data!.type, result, sessionID: (data as any).sessionID, at: Date.now() })) return
+      api.ui.toast({ message: "Quiz answer saved · waiting for delivery", variant: "info", duration: 4000 })
       // Keep the pending payload until the server confirms injection. It is the recovery context
       // needed to rebuild the prompt if either process exits after the answer is written.
       releasePopupClaim(pickDir, answerId)
       api.ui.dialog.clear()
       currentBySession.delete(curSid)
       schedule(processPending, 150)
-      // Watchdog: if the response is still unconsumed (server didn't fire) after 8s, re-touch to retrigger the watch + log loudly.
-      // Safe: server claims via atomic rename, so a rewrite can never cause double-inject.
-      schedule(() => {
-        try {
-          if (fs.existsSync(respPath)) {
-            tlog("learn-tui response NOT consumed, re-touching", answerId)
-            try { writeJsonAtomic(respPath, JSON.parse(fs.readFileSync(respPath, "utf8"))) } catch {}
-          }
-        } catch {}
-      }, 8000)
     }
     const cancel = async () => {
       if (disposed) return
-      const respPath = path.join(pickDir, `response-${data!.id}.json`)
       tlog("learn-tui cancelled", (data as any).type, data!.id)
-      writeJsonAtomic(respPath, { id: data!.id, type: data!.type, cancelled: true, sessionID: (data as any).sessionID, at: Date.now() })
-      try {
-        const sid = (data as any).sessionID
-        if (sid) {
-          const anyClient = api.client as any
-          const injectText = (data as any).type === "quiz_batch"
-            ? `[quiz_batch cancelled] ${(data as QuizBatchPending).quizzes.length} quizzes — user cancelled`
-            : `[quiz cancelled] Question: "${(data as QuizPending).question}" — user cancelled`
-          try {
-            if (anyClient.session?.prompt) {
-              try { await anyClient.session.prompt({ path: { sessionID: sid }, body: { prompt: { text: injectText } } }) }
-              catch { await anyClient.session.prompt({ path: { sessionID: sid }, body: { parts: [{ type: "text", text: injectText }] } as any }) }
-            }
-          } catch {}
-        }
-      } catch {}
+      if (!saveAnswer({ id: data!.id, type: data!.type, cancelled: true, sessionID: (data as any).sessionID, at: Date.now() })) return
+      api.ui.toast({ message: "Quiz cancellation saved · waiting for delivery", variant: "info", duration: 4000 })
       // Keep the pending payload until the server consumes the cancellation response.
       releasePopupClaim(pickDir, data!.id)
       api.ui.dialog.clear()

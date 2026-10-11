@@ -65,6 +65,86 @@ async function init(dir: string, client: any = { app: { log: async () => ({}) } 
 }
 
 describe("server resource ownership", () => {
+  test("a dead claim created after startup is recovered by the live server timer", async () => {
+    const p = pending(directory, "late")
+    let stored: any
+    let calls = 0
+    await init(directory, { session: {
+      message: async () => stored ? { data: stored } : { error: {}, response: { status: 404 } },
+      promptAsync: async (input: any) => {
+        calls++
+        stored = { info: { id: input.body.messageID, sessionID: "fake", role: "user" }, parts: input.body.parts }
+        return { response: { status: 204 } }
+      },
+    } })
+    fs.writeFileSync(path.join(p, "response-late.json"), JSON.stringify({ sessionID: "fake", at: Date.now(), cancelled: true }))
+    const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "quiz-delivery.fixture.ts"), directory, "claim-exit", "late"], {
+      cwd: directory, env: { ...process.env, HOME: directory, TMPDIR: directory, LEARN_MD_LOG_STORE: path.join(directory, "links.json") }, stdout: "pipe", stderr: "pipe",
+    })
+    expect(await child.exited).toBe(0)
+    expect(fs.readdirSync(p).some(file => file.includes(".claim-"))).toBe(true)
+    for (const timer of [...intervals]) timer.callback()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls).toBe(1)
+    expect(fs.existsSync(path.join(p, "quiz-late.json"))).toBe(false)
+  })
+
+  test("disposal during answer send preserves recovery and reconciliation avoids resending", async () => {
+    const p = pending(directory)
+    const response = path.join(p, "response-shared-id.json")
+    fs.writeFileSync(response, JSON.stringify({ sessionID: "fake", at: Date.now(), result: { answers: [{ index: 1, label: "A" }] } }))
+    let started!: () => void
+    const sending = new Promise<void>(resolve => { started = resolve })
+    let release!: () => void
+    let stored: any
+    let calls = 0
+    const client = { session: {
+      message: async () => stored ? { data: stored } : { error: {}, response: { status: 404 } },
+      promptAsync: (input: any) => {
+        calls++
+        stored = { info: { id: input.body.messageID, sessionID: "fake", role: "user" }, parts: input.body.parts }
+        started()
+        return new Promise(resolve => { release = () => resolve({ response: { status: 204 } }) })
+      },
+    } }
+    const first = await init(directory, client)
+    await sending
+    await first.dispose()
+    release()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(fs.existsSync(response)).toBe(true)
+    expect(fs.existsSync(path.join(p, "quiz-shared-id.json"))).toBe(true)
+    await init(directory, client)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(calls).toBe(1)
+    expect(fs.existsSync(response)).toBe(false)
+    expect(JSON.parse(fs.readFileSync(path.join(p, "delivery-shared-id.json"), "utf8")).state).toBe("delivered")
+  })
+
+  test("delayed periodic discovery supervises a second recovered answer without filesystem events", async () => {
+    const messages = new Map<string, any>()
+    let calls = 0
+    const h = await init(directory, { session: {
+      message: async (input: any) => messages.has(input.path.messageID) ? { data: messages.get(input.path.messageID) } : { error: {}, response: { status: 404 } },
+      promptAsync: async (input: any) => {
+        calls++
+        messages.set(input.body.messageID, { info: { id: input.body.messageID, sessionID: "fake", role: "user" }, parts: input.body.parts })
+        return { response: { status: 204 } }
+      },
+    } })
+    for (const id of ["first", "second"]) {
+      const p = pending(directory, id)
+      fs.writeFileSync(path.join(p, `response-${id}.json`), JSON.stringify({ sessionID: "fake", at: Date.now(), cancelled: id === "second", result: { answers: [{ index: 1, label: "A" }] } }))
+      // No fs.watch callback; simulate the next delayed timer after sleep.
+      for (const timer of [...intervals]) timer.callback()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fs.existsSync(path.join(p, `quiz-${id}.json`))).toBe(false)
+    }
+    expect(calls).toBe(2)
+    await h.dispose()
+    expect(intervals.size).toBe(0)
+  })
+
   test("repeated initialize/dispose closes classify and pending watchers and intervals", async () => {
     const p = pending(directory)
     for (let i = 0; i < 6; i++) {
@@ -84,9 +164,10 @@ describe("server resource ownership", () => {
     const second = path.join(directory, "second")
     pending(second)
     const b = await init(second)
-    expect(watchers.filter(w => !w.closed)).toHaveLength(4)
-    await a.dispose()
     expect(watchers.filter(w => !w.closed)).toHaveLength(2)
+    await a.dispose()
+    expect(watchers.filter(w => !w.closed)).toHaveLength(1)
+    // Only discovery is needed until an answer arrives.
     expect(intervals.size).toBe(1)
     await b.dispose()
     expect(watchers.filter(w => !w.closed)).toHaveLength(0)

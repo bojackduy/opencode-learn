@@ -1,2 +1,2 @@
 [test]
-preload = ["@opentui/solid/preload"]
+preload = ["./scripts/test-isolation.ts", "@opentui/solid/preload"]

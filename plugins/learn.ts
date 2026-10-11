@@ -5,6 +5,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { homedir, tmpdir } from "node:os"
 import { spawn } from "node:child_process"
+import { atomicJson, deliverAnswer, deliverV2Answer, recoverDeadClaims } from "./quiz-delivery"
 
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers shared across visual-tools (ported from .pi/extensions/visual-tools)
@@ -800,11 +801,13 @@ export function parseModelList(s: unknown): ModelRef[] {
   return String(s ?? "").split(",").map((x) => x.trim()).filter(Boolean).map(parseModelRef).filter((m: ModelRef | null): m is ModelRef => !!m)
 }
 
-// Server-side inject (loopd pattern: host-adapter.ts:100 promptAsync + path.id + body.parts)
+// Only the server sends answers. Saved files are consumed after history confirms
+// the stable user-message identity and exact text, never on an async 204 alone.
 function watchAndInject(activeWatchers: Map<string, () => void>, client: any, directory: string, id: string, sessionID: string, buildText: (result: any) => string) {
-  slog("watchAndInject start", id, sessionID)
-  if (!sessionID) { slog("watchAndInject no sessionID", id); return }
-  activeWatchers.get(id)?.()
+  if (!sessionID) return
+  const key = `${directory}:${id}`
+  if (activeWatchers.has(key)) return
+  if (activeWatchers.size >= 128) return // discovery retries overflow as completed watches free slots
   const dir = pendingDir(directory)
   const respPath = path.join(dir, `response-${id}.json`)
   const claimPath = path.join(dir, `response-${id}.claim-${process.pid}.json`)
@@ -812,126 +815,90 @@ function watchAndInject(activeWatchers: Map<string, () => void>, client: any, di
   let watcher: fs.FSWatcher | undefined
   let pollTimer: ReturnType<typeof setInterval> | undefined
   let closed = false
-  // Consecutive inject-failure backoff: never hot-loop the SDK while preserving the answer.
-  // A rewritten response file (TUI watchdog re-touch) resets the streak for an early retry.
+  let running = false
+  const armedAt = Date.now()
+  let request: AbortController | undefined
   let failCount = 0
   let nextAllowedAt = 0
-  let lastSeenMtime = 0
+  const statusPath = path.join(dir, `delivery-${id}.json`)
+  const status = (state: string, reason?: string) => {
+    try { atomicJson(statusPath, { id, sessionID, state, reason, at: Date.now(), retryAt: nextAllowedAt }) } catch {}
+  }
   const closeWatcher = () => {
     if (closed) return
     closed = true
+    request?.abort()
     try { watcher?.close() } catch {}
     if (pollTimer) clearInterval(pollTimer)
-    if (activeWatchers.get(id) === closeWatcher) activeWatchers.delete(id)
+    if (activeWatchers.get(key) === closeWatcher) activeWatchers.delete(key)
   }
-  activeWatchers.set(id, closeWatcher)
-  const fire = async (attempt = 0): Promise<void> => {
-    if (closed) return
+  activeWatchers.set(key, closeWatcher)
+  const fire = async (): Promise<void> => {
+    if (closed || running) return
+    try { recoverDeadClaims(dir, id) } catch {}
+    const retryPath = path.join(dir, `retry-${id}.json`)
     try {
-      const mtime = fs.statSync(respPath).mtimeMs
-      if (mtime !== lastSeenMtime) { lastSeenMtime = mtime; failCount = 0; nextAllowedAt = 0 }
-    } catch { return } // no answer yet
-    if (Date.now() < nextAllowedAt) return // backing off after inject failure; response stays put
-    // Atomic single-consumer claim: exactly one process proceeds (fixes double-inject across processes)
-    try { fs.renameSync(respPath, claimPath) } catch { return } // another process claimed it first
-    let data: any
+      if (JSON.parse(fs.readFileSync(retryPath, "utf8")).sessionID === sessionID) nextAllowedAt = 0
+      fs.unlinkSync(retryPath)
+    } catch {}
+    if (Date.now() < nextAllowedAt) return
+    try { fs.renameSync(respPath, claimPath) } catch { return }
+    running = true
+    request = new AbortController()
+    const timeout = setTimeout(() => request?.abort(), 10000)
     try {
-      data = JSON.parse(fs.readFileSync(claimPath, "utf8"))
-    } catch (e) {
-      if (attempt < 5) {
-        await new Promise(r => setTimeout(r, 120))
-        try { fs.renameSync(claimPath, respPath) } catch {}
-        await new Promise(r => setTimeout(r, 60))
-        return fire(attempt + 1)
+      const data = JSON.parse(fs.readFileSync(claimPath, "utf8"))
+      if (data.sessionID && data.sessionID !== sessionID) throw new Error("Original session mismatch; answer remains saved")
+      // Freeze the generated text before sending. Restart/live paths can format
+      // differently, and retries must reconcile the SAME durable message.
+      if (!data.delivery) {
+        data.delivery = {
+          text: data.cancelled ? `[cancelled] user dismissed the popup for ${id}` : buildText(data.result),
+          createdAt: typeof data.at === "number" ? data.at : Date.now(),
+        }
+        atomicJson(claimPath, data)
       }
-      slog("watchAndInject UNREADABLE response, parked", id, String(e).slice(0,160))
-      try { fs.renameSync(claimPath, path.join(dir, `response-${id}.poisoned-${Date.now()}.json`)) } catch {}
+      status("waiting", "Answer saved; verifying session persistence")
+      const acknowledged = await deliverAnswer(client, directory, sessionID, id, data.delivery.text, request.signal, data.delivery.createdAt)
+      if (!acknowledged) throw new Error("Answer saved; persistence not yet confirmed")
+      // Keep receipt for the TUI; delivery means persisted, not agent completed.
+      status("delivered", "Answer saved in original session")
+      for (const p of pendingCandidates) try { fs.unlinkSync(p) } catch {}
+      try { fs.unlinkSync(claimPath) } catch {}
       closeWatcher()
-      return
-    }
-    let text: string
-    let effectiveSessionID: string
-    try {
-      slog("watchAndInject fire", id, JSON.stringify(data).slice(0,400))
-      effectiveSessionID = (data as any)?.sessionID || sessionID
-      text = data?.cancelled ? `[cancelled] user dismissed the popup for ${id}` : buildText(data.result)
-    } catch (e) {
-      slog("watchAndInject buildText ERROR, parked", id, String(e).slice(0,200))
-      try { fs.renameSync(claimPath, path.join(dir, `response-${id}.poisoned-${Date.now()}.json`)) } catch {}
-      closeWatcher()
-      return
-    }
-    // opencode-loop sdk.js:24 — SDK returns {data,error}, it does NOT throw. Must inspect .error.
-    const sdkCall = async (method: any, ...argsList: any[]) => {
-      let firstErr: any
-      for (const args of argsList) {
-        if (closed) throw new Error("learn watcher disposed")
-        if (args === undefined) continue
-        try {
-          const res = await method(args)
-          const err = res && typeof res === "object" ? (res as any).error : undefined
-          if (!err) return res
-          firstErr = firstErr || err
-        } catch (e) { firstErr = firstErr || e }
-      }
-      throw firstErr || new Error("SDK call failed")
-    }
-    const parts = [{ type: "text", text }]
-    const shapes = [
-      { path: { id: effectiveSessionID }, body: { parts } },
-      { path: { sessionID: effectiveSessionID }, body: { parts } },
-      { sessionID: effectiveSessionID, parts },
-    ]
-    slog("watchAndInject injecting", id, effectiveSessionID, text.slice(0,300))
-    let ok = false
-    let firstErr: any
-    // loopd host-adapter.ts:100 — promptAsync wakes the session (fire-and-forget turn)
-    if (client?.session?.promptAsync) {
-      try { await sdkCall(client.session.promptAsync.bind(client.session), ...shapes); ok = true } catch (e) { firstErr = e }
-    }
-    if (!ok && client?.session?.prompt) {
-      try { await sdkCall(client.session.prompt.bind(client.session), ...shapes); ok = true } catch (e) { firstErr = firstErr || e }
-    }
-    if (!ok) {
-      // NEVER abandon: keep supervising so a later retry (or another live process) delivers.
-      // Closing the watcher here used to strand the preserved response with nobody watching.
+      slog("quiz answer persisted", id, sessionID)
+    } catch (error) {
       failCount++
       nextAllowedAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(failCount, 5))
-      slog("watchAndInject inject FAILED, preserved", id, effectiveSessionID, `retry in ~${Math.round((nextAllowedAt - Date.now()) / 1000)}s`, String(firstErr).slice(0,200))
-      try { fs.renameSync(claimPath, respPath) } catch {
-        try { fs.renameSync(claimPath, path.join(dir, `response-${id}.failed-${Date.now()}.json`)) } catch {}
-      }
-      if (closed) return
-      try {
-        await client.app.log({ body: { service: "learn", level: "error", message: `inject FAILED for ${effectiveSessionID} (orig ${sessionID}), will retry`, extra: { id } } })
-      } catch {}
-      return
+      status("failed", error instanceof Error && error.message.startsWith("Original session") ? error.message : "Answer remains saved; retrying delivery automatically")
+    } finally {
+      clearTimeout(timeout)
+      request = undefined
+      // Disposal aborts the request but never discards recovery state.
+      if (fs.existsSync(claimPath)) try { fs.renameSync(claimPath, respPath) } catch {}
+      running = false
     }
-    // Success: consume claim + defensively try pending too (TUI is the primary owner of pending deletion)
-    try { fs.unlinkSync(claimPath) } catch {}
-    for (const p of pendingCandidates) try { fs.unlinkSync(p) } catch {}
-    closeWatcher()
-    slog("watchAndInject consumed", id, effectiveSessionID)
-    try {
-      await client.app.log({ body: { service: "learn", level: "info", message: `injected into ${effectiveSessionID}`, extra: { id } } })
-    } catch {}
   }
   try {
-    // Fire on ANY directory event, not just exact filename match — atomic tmp+rename writes can report
-    // a different filename (or no filename) on some fs.watch backends (notably macOS FSEvents). The claim
-    // rename inside fire() makes this safe to call spuriously: if respPath doesn't exist yet, it just no-ops.
     watcher = fs.watch(dir, () => { void fire() })
     watcher.on("error", () => {})
   } catch {}
-  // fs.watch is lossy by design. Polling keeps persisted answers moving after a TUI/server restart
-  // even when the filesystem event is dropped.
   pollTimer = setInterval(() => {
-    if (closed) return
-    if (fs.existsSync(respPath)) { void fire(); return }
-    if (!pendingCandidates.some((p) => fs.existsSync(p)) && !fs.existsSync(claimPath)) closeWatcher()
+    try {
+      if (!running && !pendingCandidates.some(p => fs.existsSync(p)) && !fs.readdirSync(dir).some(f => f.startsWith(`response-${id}`))) {
+        closeWatcher()
+        return
+      }
+      // Idle popups need no per-answer resources: discovery will re-arm them
+      // once an answer arrives. This frees slots for saved answer backlogs.
+      if (!running && Date.now() - armedAt > 10000 && !fs.readdirSync(dir).some(f => f.startsWith(`response-${id}`))) {
+        closeWatcher()
+        return
+      }
+    } catch {}
+    void fire()
   }, 500)
-  // Recheck after arming to close the event gap (claim makes double-fire safe)
-  if (fs.existsSync(respPath)) { slog("watchAndInject fast-path", id); void fire(); return }
+  void fire()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1244,12 +1211,12 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
     const sweep = () => {
       if (disposed()) return
       try {
-        // A process that died mid-classify leaves its claim behind; requeue it
-        // once it is clearly stale so the TUI's pending note is not lost.
+        // Periodic rescans must not steal a live, slow classifier's claim.
         for (const f of fs.readdirSync(dir).filter(isClaim)) {
           try {
-            const age = Date.now() - fs.statSync(path.join(dir, f)).mtimeMs
-            if (age < 30000) continue
+            const owner = f.match(/\.claim-(\d+)\.json$/)?.[1]
+            if (!owner) continue
+            try { process.kill(Number(owner), 0); continue } catch (error: any) { if (error?.code !== "ESRCH") continue }
             fs.renameSync(path.join(dir, f), path.join(dir, f.replace(/\.claim-.*\.json$/, ".json")))
             slog("classify claim requeued", f)
           } catch {}
@@ -1268,40 +1235,50 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       classifyWatcher = fs.watch(dir, () => sweep())
       classifyWatcher.on("error", () => {})
     } catch {}
+    return sweep
   }
-  startClassifyWatcher(client, directory)
+  const sweepClassify = startClassifyWatcher(client, directory)
 
-  // Durability: on (re)start, re-watch any pending quizzes left from a crash/exit
+  // Periodic discovery also recovers claims after sleep/owner death while this
+  // server stays alive. The TUI can request supervision of its session's directory.
+  function discoverPending(sourceDirectory: string) {
   try {
-    const dir = pendingDir(directory)
+    const dir = pendingDir(sourceDirectory)
     if (fs.existsSync(dir)) {
+      // Receipts are UI status, not recovery journals. Bound delivered receipts;
+      // never age out saved answers or failed/waiting deliveries.
+      const receipts: Array<{ file: string; at: number }> = []
+      for (const file of fs.readdirSync(dir).filter(f => /^delivery-.+\.json$/.test(f))) {
+        try {
+          const receipt = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"))
+          if (receipt.state === "delivered") receipts.push({ file, at: receipt.at || 0 })
+        } catch {}
+      }
+      receipts.sort((a, b) => b.at - a.at)
+      for (const receipt of receipts.slice(128)) try { fs.unlinkSync(path.join(dir, receipt.file)) } catch {}
       // 0) Retired mechanism cleanup: owner-*.lock files belong to the removed owner-lock
       // gate (single-consumer arbitration is the atomic claim rename now). Delete them so a
       // dead owner's leftovers can never confuse future logic.
       for (const f of fs.readdirSync(dir).filter(x => x.startsWith("owner-") && x.endsWith(".lock"))) {
         try { fs.unlinkSync(path.join(dir, f)) } catch {}
       }
-      // 1) Requeue stale claims from consumers that died mid-flight (>30s old, no live response)
+      // 1) Requeue claims only from owners proven dead; a slow live call is safe.
       for (const f of fs.readdirSync(dir).filter(x => x.includes(".claim-") && x.endsWith(".json"))) {
         try {
           const m = f.match(/^response-(.+)\.claim-.*\.json$/)
           if (!m) continue
           const rid = m[1]!
-          const target = path.join(dir, `response-${rid}.json`)
-          const age = Date.now() - fs.statSync(path.join(dir, f)).mtimeMs
-          if (age > 30000 && !fs.existsSync(target)) {
-            fs.renameSync(path.join(dir, f), target)
-            slog("watchAndInject requeued stale claim", rid)
-          }
+          recoverDeadClaims(dir, rid)
         } catch {}
       }
       // 2) Re-arm pending quizzes (fast-path inside watchAndInject consumes any waiting response)
-      for (const f of fs.readdirSync(dir).filter(x => x.endsWith(".json") && !x.startsWith("response-") && !x.startsWith(".") && !x.startsWith("classify"))) {
+      for (const f of fs.readdirSync(dir).filter(x => /^(quiz|quiz_batch)-.+\.json$/.test(x))) {
         try {
           const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
-          if (isPendingExpired(j)) { archiveExpiredPending(dir, f); continue }
-          if (j?.id && j?.sessionID) {
-            watchAndInject(activeWatchers, client, directory, j.id, j.sessionID, (r: any) => {
+          const answered = fs.readdirSync(dir).some(file => file === `response-${j.id}.json` || file.startsWith(`response-${j.id}.claim-`))
+          if (isPendingExpired(j) && !answered) { archiveExpiredPending(dir, f); continue }
+          if (answered && j?.id && j?.sessionID) {
+            watchAndInject(activeWatchers, client, sourceDirectory, j.id, j.sessionID, (r: any) => {
               if (j.type === "quiz") {
                 const cs = new Set(j.correctIndices || [])
                 const si = (r?.answers || []).map((a:any)=>a.index)
@@ -1356,6 +1333,13 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
           const rid = m[1]!
           const hasPending = fs.existsSync(path.join(dir, `quiz-${rid}.json`)) || fs.existsSync(path.join(dir, `quiz_batch-${rid}.json`))
           if (!hasPending) {
+            const answer = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
+            // Crash between verified persistence and pending/answer cleanup:
+            // frozen text is sufficient to reconcile even without the quiz.
+            if (answer.delivery?.text && answer.sessionID) {
+              watchAndInject(activeWatchers, client, sourceDirectory, rid, answer.sessionID, () => answer.delivery.text)
+              continue
+            }
             fs.renameSync(path.join(dir, f), path.join(dir, `response-${rid}.orphaned-${Date.now()}.json`))
             slog("watchAndInject orphaned response parked (no pending context)", rid)
           }
@@ -1363,6 +1347,30 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
       }
     }
   } catch {}
+  }
+  let hintOffset = 0
+  const discover = () => {
+    if (disposed()) return
+    sweepClassify()
+    discoverPending(directory)
+    // Hints contain directory/session routing only, never learner text. Bound
+    // the scan so old attached sessions cannot create unbounded live resources.
+    try {
+      const dir = pendingDir(directory)
+      const hints = fs.readdirSync(dir).filter(f => f.startsWith("supervise-") && f.endsWith(".json"))
+      if (hintOffset >= hints.length) hintOffset = 0
+      for (const f of hints.slice(hintOffset, hintOffset + 32)) {
+        try {
+          const hint = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"))
+          if (typeof hint.directory === "string" && path.isAbsolute(hint.directory) && hint.directory !== directory) discoverPending(hint.directory)
+        } catch {}
+      }
+      hintOffset += 32
+    } catch {}
+  }
+  discover()
+  const discoveryTimer = setInterval(discover, 2000)
+  lifecycle.signal.addEventListener("abort", () => clearInterval(discoveryTimer), { once: true })
 
   // Shared md_log link/unlink/status core — used by BOTH the agent-callable tools
   // (md_log/md_unlog/md_log_status) and the direct user commands (/md-log, /md-unlog
@@ -2100,6 +2108,7 @@ Return ONLY JSON: {"inferred":[2],"semanticCorrect":false,"reason":"...","isIDK"
 //   replay may be lossy in v2. Live hooks capture going forward regardless.
 
 type V2ShimSession = {
+  persistQuizAnswer: (input: Parameters<typeof deliverV2Answer>[1]) => Promise<boolean>
   messages: (input: any) => Promise<{ data: Array<{ info: any; parts: any[] }> }>
   create: (input: any) => Promise<{ data: { id: string } }>
   prompt: (input: any) => Promise<{ data: Record<string, never> }>
@@ -2139,6 +2148,7 @@ function toV1Entries(messages: any[]): Array<{ info: any; parts: any[] }> {
 
 function createV2ClientShim(context: V2Plugin.Context) {
   const session: V2ShimSession = {
+    persistQuizAnswer: (input) => deliverV2Answer(context.session, input),
     async messages(input: any) {
       const sessionID = input?.path?.id ?? input?.path?.sessionID ?? input?.sessionID
       const list = await context.session.context({ sessionID })

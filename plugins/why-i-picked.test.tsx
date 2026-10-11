@@ -301,10 +301,19 @@ function tmpProject(prefix: string) {
 }
 
 const injected: string[] = []
+const savedMessages = new Map<string, any>()
 const fakeClient = {
   app: { log: async () => {} },
   session: {
     messages: async () => ({ data: [] }),
+    message: async (input: any) => savedMessages.has(input.path.messageID)
+      ? { data: savedMessages.get(input.path.messageID) }
+      : { error: {}, response: { status: 404 } },
+    promptAsync: async (input: any) => {
+      injected.push(input?.body?.parts?.[0]?.text ?? "")
+      savedMessages.set(input.body.messageID, { info: { id: input.body.messageID, sessionID: input.path.id, role: "user" }, parts: input.body.parts })
+      return { data: undefined, response: { status: 204 } }
+    },
     prompt: async (input: any) => {
       injected.push(input?.body?.parts?.[0]?.text ?? "")
       return { data: {} }
